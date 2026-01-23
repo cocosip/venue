@@ -1,0 +1,82 @@
+metadataDirectory: ./venue-data/metadata
+quotaDirectory: ./venue-data/quota
+fileWatcherConfigurationDirectory: ./venue-data/watchers
+autoCreateTenants: true
+defaultTenantQuota: 0
+enableDatabaseHealthCheck: true
+retryPolicy:
+    maxRetryCount: 3
+    initialRetryDelay: 5s
+    useExponentialBackoff: true
+    maxRetryDelay: 5m0s
+volumes:
+    - volumeId: vol-001
+      mountPath: ./venue-data/storage/volume-1
+      volumeType: LocalFileSystem
+      shardingDepth: 2
+    - volumeId: vol-002
+      mountPath: ./venue-data/storage/volume-2
+      volumeType: LocalFileSystem
+      shardingDepth: 2
+tenants:
+    - tenantId: tenant-001
+      enabled: true
+      quota: 10000000
+    - tenantId: tenant-002
+      enabled: true
+      quota: null
+    - tenantId: tenant-disabled
+      enabled: false
+      quota: null
+fileWatchers:
+    - watcherId: watcher-vip-tenant-001
+      tenantId: tenant-001
+      multiTenantMode: false
+      autoCreateTenantDirectories: false
+      watchPath: ./venue-data/watch/vip/tenant-001
+      enabled: true
+      includeSubdirectories: true
+      filePatterns:
+        - '*.pdf'
+        - '*.docx'
+        - '*.xlsx'
+      postImportAction: Delete
+      moveToDirectory: ""
+      pollingInterval: 10s
+      maxFileSizeBytes: 104857600
+      minFileAge: 3s
+      maxConcurrentImports: 16
+    - watcherId: watcher-all-regular-tenants
+      tenantId: ""
+      multiTenantMode: true
+      autoCreateTenantDirectories: true
+      watchPath: ./venue-data/watch/shared
+      enabled: true
+      includeSubdirectories: true
+      filePatterns:
+        - '*.*'
+      postImportAction: Delete
+      moveToDirectory: ""
+      pollingInterval: 30s
+      maxFileSizeBytes: 0
+      minFileAge: 5s
+      maxConcurrentImports: 8
+enableBackgroundCleanup: true
+cleanupOptions:
+    cleanupInterval: 1h0m0s
+    initialDelay: 1m0s
+    cleanupEmptyDirectories: true
+    cleanupTimedOutFiles: true
+    processingTimeout: 30m0s
+    cleanupPermanentlyFailedFiles: true
+    failedFileRetentionPeriod: 168h0m0s
+    cleanupCompletedRecords: false
+    completedRecordRetentionPeriod: 720h0m0s
+    optimizeDatabases: true
+    databaseOptimizationInterval: 24h0m0s
+databaseHealthCheckOptions:
+    initialDelay: 2s
+    maxRetries: 3
+    retryDelay: 1s
+    checkOnStartupOnly: true
+    periodicCheckInterval: 1h0m0s

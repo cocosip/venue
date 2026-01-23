@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+!README.md
+doc/
+examples/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Test files
+*_test.go
+test/
+coverage.txt
+coverage.out
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CI/CD
+.github/workflows/
+
+# Local config and data
+*.local
+*.env
+data/
+config/*
+!config/*.example

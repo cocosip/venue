@@ -1,0 +1,155 @@
+# Venue Configuration Example
+# This file demonstrates all available configuration options
+
+venue:
+  # Directory for metadata databases
+  metadataDirectory: ./venue-data/metadata
+
+  # Directory for quota databases
+  quotaDirectory: ./venue-data/quota
+
+  # Directory for file watcher state/configuration
+  fileWatcherConfigurationDirectory: ./venue-data/watchers
+
+  # Automatically create tenants when referenced
+  autoCreateTenants: true
+
+  # Default quota for new tenants (0 = unlimited, in bytes)
+  defaultTenantQuota: 0
+
+  # Enable database health checking on startup
+  enableDatabaseHealthCheck: true
+
+  # Retry policy for failed file operations
+  retryPolicy:
+    maxRetryCount: 3
+    initialRetryDelay: 5s
+    useExponentialBackoff: true
+    maxRetryDelay: 5m
+
+  # Tenant manager configuration
+  tenantManagerOptions:
+    # Directory for tenant metadata files (empty = use metadataDirectory/.locus/tenants)
+    metadataPath: ""
+    # Cache time-to-live for tenant information
+    cacheTTL: 5m
+
+  # Metadata repository configuration
+  metadataOptions:
+    # Cache time-to-live for metadata
+    cacheTTL: 5m
+
+  # BadgerDB database configuration (applies to all BadgerDB databases)
+  badgerDBOptions:
+    # Garbage collection interval
+    gcInterval: 10m
+    # Garbage collection discard ratio (0.0 - 1.0)
+    gcDiscardRatio: 0.5
+
+  # Storage volumes configuration
+  volumes:
+    - volumeId: vol-001
+      mountPath: ./venue-data/storage/volume-1
+      volumeType: LocalFileSystem
+      shardingDepth: 2
+
+    - volumeId: vol-002
+      mountPath: ./venue-data/storage/volume-2
+      volumeType: LocalFileSystem
+      shardingDepth: 2
+
+  # Tenant configurations
+  tenants:
+    # VIP tenant with specific quota
+    - tenantId: tenant-001
+      enabled: true
+      quota: 10000000  # 10MB
+
+    # Regular tenant with default quota
+    - tenantId: tenant-002
+      enabled: true
+      quota: null  # Will use defaultTenantQuota
+
+    # Disabled tenant
+    - tenantId: tenant-disabled
+      enabled: false
+      quota: null
+
+  # File watcher configurations
+  fileWatchers:
+    # VIP tenant dedicated watcher
+    - watcherId: watcher-vip-tenant-001
+      tenantId: tenant-001
+      multiTenantMode: false
+      autoCreateTenantDirectories: false
+      watchPath: ./venue-data/watch/vip/tenant-001
+      enabled: true
+      includeSubdirectories: true
+      filePatterns:
+        - "*.pdf"
+        - "*.docx"
+        - "*.xlsx"
+      postImportAction: Delete
+      moveToDirectory: ""
+      pollingInterval: 10s
+      maxFileSizeBytes: 104857600  # 100MB
+      minFileAge: 3s
+      maxConcurrentImports: 16
+
+    # Shared watcher for all regular tenants
+    - watcherId: watcher-all-regular-tenants
+      tenantId: ""  # Empty for multi-tenant mode
+      multiTenantMode: true
+      autoCreateTenantDirectories: true  # Auto-create subdirectories for all tenants
+      watchPath: ./venue-data/watch/shared
+      enabled: true
+      includeSubdirectories: true
+      filePatterns:
+        - "*.*"  # All files
+      postImportAction: Delete
+      moveToDirectory: ""
+      pollingInterval: 30s
+      maxFileSizeBytes: 0  # No limit
+      minFileAge: 5s
+      maxConcurrentImports: 8
+
+  # Enable background cleanup service
+  enableBackgroundCleanup: true
+
+  # Cleanup service options
+  cleanupOptions:
+    # Cleanup interval
+    cleanupInterval: 1h
+    # Initial delay before first cleanup
+    initialDelay: 1m
+    # Cleanup empty directories
+    cleanupEmptyDirectories: true
+    # Cleanup timed-out files (reset to pending status)
+    cleanupTimedOutFiles: true
+    # Processing timeout threshold
+    processingTimeout: 30m
+    # Cleanup permanently failed files
+    cleanupPermanentlyFailedFiles: true
+    # Retention period for failed files
+    failedFileRetentionPeriod: 168h  # 7 days
+    # Cleanup completed file records
+    cleanupCompletedRecords: false
+    # Retention period for completed records
+    completedRecordRetentionPeriod: 720h  # 30 days
+    # Optimize databases to reclaim space
+    optimizeDatabases: true
+    # Database optimization interval
+    databaseOptimizationInterval: 24h
+
+  # Database health check options
+  databaseHealthCheckOptions:
+    # Initial delay before first health check
+    initialDelay: 2s
+    # Maximum number of health check retries
+    maxRetries: 3
+    # Delay between health check retries
+    retryDelay: 1s
+    # Only check on startup (not periodically)
+    checkOnStartupOnly: true
+    # Periodic check interval (if not startup-only)
+    periodicCheckInterval: 1h
