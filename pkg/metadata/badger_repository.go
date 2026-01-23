@@ -89,11 +89,12 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 		WithLogger(nil). // Disable BadgerDB logging
 		WithMemTableSize(1 << 20).                    // 1MB memtable (default is 64MB)
 		WithValueLogFileSize(1 << 20).                // 1MB value log files (default is 1GB)
-		WithNumMemtables(1).                          // Reduce number of memtables
-		WithNumLevelZeroTables(1).                    // Reduce L0 tables
-		WithNumLevelZeroTablesStall(2).               // Reduce L0 stall threshold
+		WithNumMemtables(2).                          // Keep at least 2 memtables for smoother operation
+		WithNumLevelZeroTables(2).                    // Keep at least 2 L0 tables
+		WithNumLevelZeroTablesStall(4).               // Reasonable stall threshold
 		WithValueThreshold(1 << 10).                  // 1KB threshold for value log
 		WithCompression(0)                            // Disable compression for better performance
+		// Note: Must keep conflict detection enabled for concurrent file allocation
 
 	db, err := badger.Open(badgerOpts)
 	if err != nil {
@@ -596,12 +597,25 @@ func (r *BadgerMetadataRepository) Close() error {
 	close(r.gcStopCh)
 	r.gcWg.Wait()
 
-	// Close BadgerDB
-	if err := r.db.Close(); err != nil {
-		return fmt.Errorf("failed to close BadgerDB: %w", err)
-	}
+	// Close BadgerDB with timeout to prevent indefinite hangs
+	// Use a channel to implement timeout
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- r.db.Close()
+	}()
 
-	return nil
+	// Wait for close with 30 second timeout
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			return fmt.Errorf("failed to close BadgerDB: %w", err)
+		}
+		return nil
+	case <-time.After(30 * time.Second):
+		// Force return after timeout
+		// Note: This may leak goroutines, but prevents test hangs
+		return fmt.Errorf("BadgerDB close timed out after 30 seconds")
+	}
 }
 
 // buildKey builds a BadgerDB key for a file key.
