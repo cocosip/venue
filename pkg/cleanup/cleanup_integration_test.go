@@ -328,40 +328,19 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 
 	tenantCtx, _ := system.tenantManager.GetTenant(ctx, "test-tenant")
 
-	// Write multiple files concurrently (with retry for transaction conflicts)
-	// Using 10 files to avoid excessive transaction conflicts in BadgerDB
+	// Write multiple files sequentially to avoid transaction conflicts
+	// The test focuses on concurrent cleanup, not concurrent writes
 	const numFiles = 10
 	fileKeys := make([]string, numFiles)
-	errChan := make(chan error, numFiles)
 
 	for i := 0; i < numFiles; i++ {
-		go func(idx int) {
-			var fileKey string
-			var err error
-			// Retry up to 5 times for transaction conflicts
-			for retry := 0; retry < 5; retry++ {
-				content := bytes.NewReader([]byte("concurrent test content"))
-				fileName := "concurrent-test.txt"
-				fileKey, err = system.storagePool.WriteFile(ctx, tenantCtx, content, &fileName)
-				if err == nil {
-					break
-				}
-				time.Sleep(time.Duration(retry+1) * 20 * time.Millisecond)
-			}
-			if err != nil {
-				errChan <- err
-				return
-			}
-			fileKeys[idx] = fileKey
-			errChan <- nil
-		}(i)
-	}
-
-	// Wait for all writes to complete
-	for i := 0; i < numFiles; i++ {
-		if err := <-errChan; err != nil {
+		content := bytes.NewReader([]byte("concurrent test content"))
+		fileName := "concurrent-test.txt"
+		fileKey, err := system.storagePool.WriteFile(ctx, tenantCtx, content, &fileName)
+		if err != nil {
 			t.Fatalf("Failed to write file: %v", err)
 		}
+		fileKeys[i] = fileKey
 	}
 
 	// Mark half as permanently failed

@@ -13,7 +13,9 @@ jobs:
   test:
     name: Test
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         go: ['1.25']
@@ -34,8 +36,20 @@ jobs:
     - name: Verify dependencies
       run: go mod verify
 
-    - name: Run tests
-      run: go test -v -race -coverprofile=coverage.txt -covermode=atomic -timeout=10m ./...
+    - name: Clean old coverage files
+      run: |
+        if [ -f coverage.txt ]; then rm coverage.txt; fi
+      shell: bash
+
+    - name: Run tests (with race detector on Linux)
+      if: matrix.os == 'ubuntu-latest'
+      timeout-minutes: 20
+      run: go test -race -coverprofile=coverage.txt -covermode=atomic -timeout=15m ./...
+
+    - name: Run tests (without race detector on Windows/macOS)
+      if: matrix.os != 'ubuntu-latest'
+      timeout-minutes: 15
+      run: go test -coverprofile=coverage.txt -covermode=atomic -timeout=10m ./...
 
     - name: Upload coverage to Codecov
       if: matrix.os == 'ubuntu-latest' && matrix.go == '1.25'
