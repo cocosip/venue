@@ -14,8 +14,8 @@ import (
 func main() {
 	// Clean up old data
 	dataDir := "./venue-data"
-	os.RemoveAll(dataDir)
-	defer os.RemoveAll(dataDir)
+	_ = os.RemoveAll(dataDir)
+	defer func() { _ = os.RemoveAll(dataDir) }()
 
 	fmt.Println("=== Simple Venue Usage Example ===")
 	fmt.Println()
@@ -52,7 +52,7 @@ func main() {
 	if err := v.Start(); err != nil {
 		log.Fatalf("Failed to start venue: %v", err)
 	}
-	defer v.Stop()
+	defer func() { _ = v.Stop() }()
 
 	fmt.Println("✓ Venue services started")
 	fmt.Println()
@@ -93,7 +93,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to read file: %v", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	fmt.Println("   ✓ File read successfully")
 	fmt.Println()

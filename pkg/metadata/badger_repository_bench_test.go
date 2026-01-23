@@ -14,8 +14,8 @@ import (
 func BenchmarkAddOrUpdate(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -31,14 +31,14 @@ func BenchmarkAddOrUpdate(b *testing.B) {
 func BenchmarkGet(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with test data
 	const numFiles = 1000
 	for i := 0; i < numFiles; i++ {
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -55,13 +55,13 @@ func BenchmarkGet(b *testing.B) {
 func BenchmarkGetCached(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Add a single file and ensure it's cached
 	metadata := createTestMetadata("cached-file", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, metadata)
-	repo.Get(ctx, "cached-file") // Warm up cache
+	_ = repo.AddOrUpdate(ctx, metadata)
+	_, _ = repo.Get(ctx, "cached-file") // Warm up cache
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -76,14 +76,14 @@ func BenchmarkGetCached(b *testing.B) {
 func BenchmarkGetUncached(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with completed files (not cached)
 	const numFiles = 1000
 	for i := 0; i < numFiles; i++ {
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusCompleted)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -100,14 +100,14 @@ func BenchmarkGetUncached(b *testing.B) {
 func BenchmarkUpdateStatus(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with test data
 	const numFiles = 1000
 	for i := 0; i < numFiles; i++ {
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -128,19 +128,22 @@ func BenchmarkUpdateStatus(b *testing.B) {
 func BenchmarkGetByStatus(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with mixed status files
 	for i := 0; i < 1000; i++ {
-		status := core.FileStatusPending
-		if i%3 == 0 {
+		var status core.FileProcessingStatus
+		switch i % 3 {
+		case 0:
 			status = core.FileStatusProcessing
-		} else if i%3 == 1 {
+		case 1:
 			status = core.FileStatusCompleted
+		default:
+			status = core.FileStatusPending
 		}
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), status)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -156,13 +159,13 @@ func BenchmarkGetByStatus(b *testing.B) {
 func BenchmarkGetPendingFiles(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with pending files
 	for i := 0; i < 1000; i++ {
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -178,13 +181,13 @@ func BenchmarkGetPendingFiles(b *testing.B) {
 func BenchmarkDelete(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with test data
 	for i := 0; i < b.N; i++ {
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -201,8 +204,8 @@ func BenchmarkDelete(b *testing.B) {
 func BenchmarkConcurrentWrites(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -222,14 +225,14 @@ func BenchmarkConcurrentWrites(b *testing.B) {
 func BenchmarkConcurrentReads(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with test data
 	const numFiles = 1000
 	for i := 0; i < numFiles; i++ {
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -250,13 +253,13 @@ func BenchmarkConcurrentReads(b *testing.B) {
 func BenchmarkMixedOperations(b *testing.B) {
 	ctx := context.Background()
 	repo, tmpDir := createBenchRepository(b)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Pre-populate with test data
 	for i := 0; i < 100; i++ {
 		metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 	}
 
 	b.ResetTimer()
@@ -268,14 +271,14 @@ func BenchmarkMixedOperations(b *testing.B) {
 
 			switch operation {
 			case 0: // Read
-				repo.Get(ctx, fileKey)
+				_, _ = repo.Get(ctx, fileKey)
 			case 1: // Write
 				metadata := createTestMetadata(fileKey, core.FileStatusPending)
-				repo.AddOrUpdate(ctx, metadata)
+				_ = repo.AddOrUpdate(ctx, metadata)
 			case 2: // Update status
-				repo.UpdateStatus(ctx, fileKey, core.FileStatusProcessing)
+				_ = repo.UpdateStatus(ctx, fileKey, core.FileStatusProcessing)
 			case 3: // Query
-				repo.GetByStatus(ctx, "test-tenant", core.FileStatusPending, 10)
+				_, _ = repo.GetByStatus(ctx, "test-tenant", core.FileStatusPending, 10)
 			}
 			i++
 		}
@@ -299,7 +302,7 @@ func createBenchRepository(b *testing.B) (core.MetadataRepository, string) {
 
 	repo, err := NewBadgerMetadataRepository(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		b.Fatalf("Failed to create repository: %v", err)
 	}
 

@@ -29,7 +29,7 @@ func BenchmarkTenantManager_CreateTenant(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		manager.CreateTenant(ctx, tenantID)
+		_ = manager.CreateTenant(ctx, tenantID)
 	}
 }
 
@@ -38,14 +38,14 @@ func BenchmarkTenantManager_GetTenant_CacheHit(b *testing.B) {
 	ctx := context.Background()
 
 	// Create a tenant
-	manager.CreateTenant(ctx, "tenant-001")
+	_ = manager.CreateTenant(ctx, "tenant-001")
 
 	// Warm up cache
-	manager.GetTenant(ctx, "tenant-001")
+	_, _ = manager.GetTenant(ctx, "tenant-001")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		manager.GetTenant(ctx, "tenant-001")
+		_, _ = manager.GetTenant(ctx, "tenant-001")
 	}
 }
 
@@ -56,7 +56,7 @@ func BenchmarkTenantManager_GetTenant_CacheMiss(b *testing.B) {
 	// Create tenants
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		manager.CreateTenant(ctx, tenantID)
+		_ = manager.CreateTenant(ctx, tenantID)
 	}
 
 	// Invalidate all caches (type assertion for testing)
@@ -69,7 +69,7 @@ func BenchmarkTenantManager_GetTenant_CacheMiss(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		manager.GetTenant(ctx, tenantID)
+		_, _ = manager.GetTenant(ctx, tenantID)
 	}
 }
 
@@ -77,12 +77,12 @@ func BenchmarkTenantManager_IsTenantEnabled_CacheHit(b *testing.B) {
 	manager := setupBenchManager(b)
 	ctx := context.Background()
 
-	manager.CreateTenant(ctx, "tenant-001")
-	manager.GetTenant(ctx, "tenant-001") // Warm cache
+	_ = manager.CreateTenant(ctx, "tenant-001")
+	_, _ = manager.GetTenant(ctx, "tenant-001") // Warm cache
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		manager.IsTenantEnabled(ctx, "tenant-001")
+		_, _ = manager.IsTenantEnabled(ctx, "tenant-001")
 	}
 }
 
@@ -93,13 +93,13 @@ func BenchmarkTenantManager_DisableTenant(b *testing.B) {
 	// Create tenants
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		manager.CreateTenant(ctx, tenantID)
+		_ = manager.CreateTenant(ctx, tenantID)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		manager.DisableTenant(ctx, tenantID)
+		_ = manager.DisableTenant(ctx, tenantID)
 	}
 }
 
@@ -110,14 +110,14 @@ func BenchmarkTenantManager_EnableTenant(b *testing.B) {
 	// Create and disable tenants
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		manager.CreateTenant(ctx, tenantID)
-		manager.DisableTenant(ctx, tenantID)
+		_ = manager.CreateTenant(ctx, tenantID)
+		_ = manager.DisableTenant(ctx, tenantID)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		manager.EnableTenant(ctx, tenantID)
+		_ = manager.EnableTenant(ctx, tenantID)
 	}
 }
 
@@ -126,12 +126,12 @@ func BenchmarkTenantManager_ConcurrentGetTenant(b *testing.B) {
 	ctx := context.Background()
 
 	// Create a tenant
-	manager.CreateTenant(ctx, "tenant-001")
+	_ = manager.CreateTenant(ctx, "tenant-001")
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			manager.GetTenant(ctx, "tenant-001")
+			_, _ = manager.GetTenant(ctx, "tenant-001")
 		}
 	})
 }
@@ -144,7 +144,7 @@ func BenchmarkMetadataStore_Save(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
 		metadata := createDefaultMetadata(tenantID, "/storage")
-		store.Save(metadata)
+		_ = store.Save(metadata)
 	}
 }
 
@@ -156,13 +156,13 @@ func BenchmarkMetadataStore_Load(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
 		metadata := createDefaultMetadata(tenantID, "/storage")
-		store.Save(metadata)
+		_ = store.Save(metadata)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
-		store.Load(tenantID)
+		_, _ = store.Load(tenantID)
 	}
 }
 
@@ -174,12 +174,12 @@ func BenchmarkMetadataStore_Exists(b *testing.B) {
 	for i := 0; i < 100; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i)
 		metadata := createDefaultMetadata(tenantID, "/storage")
-		store.Save(metadata)
+		_ = store.Save(metadata)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tenantID := fmt.Sprintf("tenant-%d", i%100)
-		store.Exists(tenantID)
+		_, _ = store.Exists(tenantID)
 	}
 }

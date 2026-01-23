@@ -53,7 +53,7 @@ func setupBenchmarkSystem(b *testing.B) *BenchmarkSystem {
 	})
 
 	tenantID := "bench-tenant"
-	tenantMgr.CreateTenant(ctx, tenantID)
+	_ = tenantMgr.CreateTenant(ctx, tenantID)
 	tenantCtx, _ := tenantMgr.GetTenant(ctx, tenantID)
 
 	// Storage volume
@@ -120,7 +120,7 @@ func setupBenchmarkSystem(b *testing.B) *BenchmarkSystem {
 
 // cleanup cleans up benchmark system resources
 func (s *BenchmarkSystem) cleanup() {
-	os.RemoveAll(s.dataDir)
+	_ = os.RemoveAll(s.dataDir)
 }
 
 // BenchmarkWriteFile benchmarks file upload performance
@@ -187,7 +187,7 @@ func BenchmarkReadFile(b *testing.B) {
 		if err != nil {
 			b.Fatalf("ReadFile failed: %v", err)
 		}
-		reader.Close()
+		_ = reader.Close()
 	}
 }
 
@@ -202,7 +202,7 @@ func BenchmarkGetNextFileForProcessing(b *testing.B) {
 	for i := 0; i < 100; i++ {
 		content := []byte(fmt.Sprintf("file %d", i))
 		fileName := fmt.Sprintf("file-%d.txt", i)
-		sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
+		_, _ = sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
 	}
 
 	b.ResetTimer()
@@ -214,7 +214,7 @@ func BenchmarkGetNextFileForProcessing(b *testing.B) {
 			// No more files, upload more
 			content := []byte("replenish")
 			fileName := "replenish.txt"
-			sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
+			_, _ = sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
 		}
 	}
 }
@@ -279,18 +279,18 @@ func BenchmarkMetadataOperations(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			meta.FileKey = fmt.Sprintf("key-%d", i)
-			sys.metadataRepo.AddOrUpdate(ctx, meta)
+			_ = sys.metadataRepo.AddOrUpdate(ctx, meta)
 		}
 	})
 
 	b.Run("Get", func(b *testing.B) {
 		// Add one file
-		sys.metadataRepo.AddOrUpdate(ctx, meta)
+		_ = sys.metadataRepo.AddOrUpdate(ctx, meta)
 
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			sys.metadataRepo.Get(ctx, meta.FileKey)
+			_, _ = sys.metadataRepo.Get(ctx, meta.FileKey)
 		}
 	})
 
@@ -299,13 +299,13 @@ func BenchmarkMetadataOperations(b *testing.B) {
 		for i := 0; i < 10; i++ {
 			m := *meta
 			m.FileKey = fmt.Sprintf("pending-%d", i)
-			sys.metadataRepo.AddOrUpdate(ctx, &m)
+			_ = sys.metadataRepo.AddOrUpdate(ctx, &m)
 		}
 
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			sys.metadataRepo.GetPendingFiles(ctx, "bench-tenant", 10)
+			_, _ = sys.metadataRepo.GetPendingFiles(ctx, "bench-tenant", 10)
 		}
 	})
 }
@@ -321,27 +321,27 @@ func BenchmarkQuotaOperations(b *testing.B) {
 	b.Run("IncrementFileCount", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			tenantQuotaMgr.IncrementFileCount(ctx, "bench-tenant")
+			_ = tenantQuotaMgr.IncrementFileCount(ctx, "bench-tenant")
 		}
 	})
 
 	b.Run("DecrementFileCount", func(b *testing.B) {
 		// Pre-increment
 		for i := 0; i < b.N; i++ {
-			tenantQuotaMgr.IncrementFileCount(ctx, "bench-tenant")
+			_ = tenantQuotaMgr.IncrementFileCount(ctx, "bench-tenant")
 		}
 
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			tenantQuotaMgr.DecrementFileCount(ctx, "bench-tenant")
+			_ = tenantQuotaMgr.DecrementFileCount(ctx, "bench-tenant")
 		}
 	})
 
 	b.Run("GetFileCount", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			tenantQuotaMgr.GetFileCount(ctx, "bench-tenant")
+			_, _ = tenantQuotaMgr.GetFileCount(ctx, "bench-tenant")
 		}
 	})
 }
@@ -357,7 +357,7 @@ func BenchmarkConcurrentProcessing(b *testing.B) {
 	for i := 0; i < 1000; i++ {
 		content := []byte(fmt.Sprintf("file %d", i))
 		fileName := fmt.Sprintf("concurrent-%d.txt", i)
-		sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
+		_, _ = sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
 	}
 
 	b.ResetTimer()
@@ -372,10 +372,10 @@ func BenchmarkConcurrentProcessing(b *testing.B) {
 
 			// Simulate processing
 			reader, _ := sys.storagePool.ReadFile(ctx, sys.tenantCtx, location.FileKey)
-			reader.Close()
+			_ = reader.Close()
 
 			// Mark as completed
-			sys.storagePool.MarkAsCompleted(ctx, location.FileKey)
+			_ = sys.storagePool.MarkAsCompleted(ctx, location.FileKey)
 		}
 	})
 }

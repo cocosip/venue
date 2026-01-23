@@ -96,27 +96,6 @@ func (c *metadataCache) listByStatus(status core.FileProcessingStatus) []*core.F
 	return results
 }
 
-// cleanup removes all expired entries from the cache.
-func (c *metadataCache) cleanup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	now := time.Now()
-	for key, entry := range c.entries {
-		if entry.expiresAt.Before(now) {
-			delete(c.entries, key)
-		}
-	}
-}
-
-// clear removes all entries from the cache.
-func (c *metadataCache) clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.entries = make(map[string]*cacheEntry)
-}
-
 // getStats returns cache statistics for monitoring.
 func (c *metadataCache) getStats() map[string]interface{} {
 	c.mu.RLock()

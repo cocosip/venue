@@ -20,7 +20,7 @@ func TestIntegration_CompleteWorkflow(t *testing.T) {
 	// Setup components
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -69,7 +69,7 @@ func TestIntegration_CompleteWorkflow(t *testing.T) {
 		}
 
 		readContent, _ := io.ReadAll(reader)
-		reader.Close()
+		_ = reader.Close()
 
 		if string(readContent) != testContent {
 			t.Errorf("Expected content '%s', got '%s'", testContent, string(readContent))
@@ -96,7 +96,7 @@ func TestIntegration_FailedFileRetry(t *testing.T) {
 	// Setup components with custom retry policy
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -170,7 +170,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 	// Setup components
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -190,7 +190,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 	// Write 10 files
 	for i := 0; i < 10; i++ {
 		content := bytes.NewReader([]byte("test content"))
-		pool.WriteFile(ctx, tenant, content, nil)
+		_, _ = pool.WriteFile(ctx, tenant, content, nil)
 	}
 
 	// Get batch of 5 files
@@ -205,7 +205,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 
 	// Mark all as completed
 	for _, location := range batch {
-		pool.MarkAsCompleted(ctx, location.FileKey)
+		_ = pool.MarkAsCompleted(ctx, location.FileKey)
 	}
 
 	// Get another batch (remaining 5)
@@ -226,7 +226,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 	// Setup components
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -246,7 +246,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 	// Write 30 files
 	for i := 0; i < 30; i++ {
 		content := bytes.NewReader([]byte("test content"))
-		pool.WriteFile(ctx, tenant, content, nil)
+		_, _ = pool.WriteFile(ctx, tenant, content, nil)
 	}
 
 	// Simulate 5 concurrent workers
@@ -282,7 +282,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 				time.Sleep(5 * time.Millisecond)
 
 				// Mark as completed
-				pool.MarkAsCompleted(ctx, location.FileKey)
+				_ = pool.MarkAsCompleted(ctx, location.FileKey)
 			}
 		}(workerID)
 	}
@@ -308,7 +308,7 @@ func TestIntegration_MultiTenantIsolation(t *testing.T) {
 	// Setup components
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -371,7 +371,7 @@ func TestIntegration_PathGeneration(t *testing.T) {
 
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)

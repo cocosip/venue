@@ -19,8 +19,8 @@ import (
 func TestNewCleanupService(t *testing.T) {
 	t.Run("Valid configuration", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer repo.Close()
-		defer os.RemoveAll(tmpDir)
+		defer func() { _ = repo.Close() }()
+		defer func() { _ = os.RemoveAll(tmpDir) }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -72,8 +72,8 @@ func TestCleanupTimedOutProcessingFiles(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer repo.Close()
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = repo.Close() }()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -94,13 +94,13 @@ func TestCleanupTimedOutProcessingFiles(t *testing.T) {
 		longAgo := time.Now().Add(-2 * time.Hour)
 		file := createTestFileMetadata("file1", core.FileStatusProcessing)
 		file.ProcessingStartTime = &longAgo
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Add a recent processing file
 		recent := time.Now().Add(-5 * time.Minute)
 		file2 := createTestFileMetadata("file2", core.FileStatusProcessing)
 		file2.ProcessingStartTime = &recent
-		repo.AddOrUpdate(ctx, file2)
+		_ = repo.AddOrUpdate(ctx, file2)
 
 		// Cleanup with 1 hour timeout
 		stats, err := service.CleanupTimedOutProcessingFiles(ctx, 1*time.Hour)
@@ -131,8 +131,8 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer repo.Close()
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = repo.Close() }()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -141,8 +141,8 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 
 	tenantQuotaMgr := quota.NewTenantQuotaManager()
 	dirQuotaRepo, tmpDir2 := createTestDirQuotaRepository(t)
-	defer dirQuotaRepo.Close()
-	defer os.RemoveAll(tmpDir2)
+	defer func() { _ = dirQuotaRepo.Close() }()
+	defer func() { _ = os.RemoveAll(tmpDir2) }()
 	dirQuotaMgr, _ := quota.NewDirectoryQuotaManager(dirQuotaRepo)
 
 	opts := &CleanupServiceOptions{
@@ -160,17 +160,17 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 		vol := volumes["test-volume"]
 		content := bytes.NewReader([]byte("test content"))
 		relativePath := "tenant1/failed-file.txt"
-		vol.WriteFile(ctx, relativePath, content)
+		_, _ = vol.WriteFile(ctx, relativePath, content)
 
 		// Add metadata for permanently failed file
 		file := createTestFileMetadata("failed1", core.FileStatusPermanentlyFailed)
 		file.PhysicalPath = relativePath
 		file.FileSize = 12
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Set quotas
-		tenantQuotaMgr.SetQuota(ctx, "test-tenant", 100)
-		tenantQuotaMgr.IncrementFileCount(ctx, "test-tenant")
+		_ = tenantQuotaMgr.SetQuota(ctx, "test-tenant", 100)
+		_ = tenantQuotaMgr.IncrementFileCount(ctx, "test-tenant")
 
 		// Cleanup
 		stats, err := service.CleanupPermanentlyFailedFiles(ctx)
@@ -205,8 +205,8 @@ func TestCleanupOrphanedMetadata(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer repo.Close()
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = repo.Close() }()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -228,11 +228,11 @@ func TestCleanupOrphanedMetadata(t *testing.T) {
 		// Add metadata for non-existent file
 		file := createTestFileMetadata("orphan1", core.FileStatusPending)
 		file.PhysicalPath = "tenant1/nonexistent.txt"
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Set quota
-		tenantQuotaMgr.SetQuota(ctx, "test-tenant", 100)
-		tenantQuotaMgr.IncrementFileCount(ctx, "test-tenant")
+		_ = tenantQuotaMgr.SetQuota(ctx, "test-tenant", 100)
+		_ = tenantQuotaMgr.IncrementFileCount(ctx, "test-tenant")
 
 		// Cleanup
 		stats, err := service.CleanupOrphanedMetadata(ctx)
@@ -257,8 +257,8 @@ func TestCleanupEmptyDirectories(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer repo.Close()
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = repo.Close() }()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -279,13 +279,13 @@ func TestCleanupEmptyDirectories(t *testing.T) {
 		emptyDir1 := filepath.Join(vol.MountPath(), "tenant1", "empty1")
 		emptyDir2 := filepath.Join(vol.MountPath(), "tenant1", "empty2")
 
-		os.MkdirAll(emptyDir1, 0755)
-		os.MkdirAll(emptyDir2, 0755)
+		_ = os.MkdirAll(emptyDir1, 0755)
+		_ = os.MkdirAll(emptyDir2, 0755)
 
 		// Create a non-empty directory
 		nonEmptyDir := filepath.Join(vol.MountPath(), "tenant1", "nonempty")
-		os.MkdirAll(nonEmptyDir, 0755)
-		os.WriteFile(filepath.Join(nonEmptyDir, "file.txt"), []byte("content"), 0644)
+		_ = os.MkdirAll(nonEmptyDir, 0755)
+		_ = os.WriteFile(filepath.Join(nonEmptyDir, "file.txt"), []byte("content"), 0644)
 
 		// Cleanup
 		stats, err := service.CleanupEmptyDirectories(ctx)
@@ -335,7 +335,7 @@ func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 
 	repo, err := metadata.NewBadgerMetadataRepository(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create repository: %v", err)
 	}
 
@@ -356,7 +356,7 @@ func createTestDirQuotaRepository(t *testing.T) (core.DirectoryQuotaRepository, 
 
 	repo, err := quota.NewBadgerDirectoryQuotaRepository(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create directory quota repository: %v", err)
 	}
 
@@ -376,7 +376,7 @@ func createTestVolumes(t *testing.T) map[string]core.StorageVolume {
 
 	vol, err := volume.NewLocalFileSystemVolume(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create volume: %v", err)
 	}
 
@@ -387,7 +387,7 @@ func createTestVolumes(t *testing.T) map[string]core.StorageVolume {
 
 func cleanupVolumes(volumes map[string]core.StorageVolume) {
 	for _, vol := range volumes {
-		os.RemoveAll(vol.MountPath())
+		_ = os.RemoveAll(vol.MountPath())
 	}
 }
 

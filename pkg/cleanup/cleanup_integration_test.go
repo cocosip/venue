@@ -60,7 +60,7 @@ func TestCleanupServiceIntegration(t *testing.T) {
 		meta, _ := system.metadataRepo.Get(ctx, fileKey)
 		oldTime := time.Now().Add(-2 * time.Hour)
 		meta.ProcessingStartTime = &oldTime
-		system.metadataRepo.AddOrUpdate(ctx, meta)
+		_ = system.metadataRepo.AddOrUpdate(ctx, meta)
 
 		// Run cleanup with 1 hour timeout
 		stats, err := system.cleanupService.CleanupTimedOutProcessingFiles(ctx, 1*time.Hour)
@@ -168,7 +168,7 @@ func TestCleanupServiceIntegration(t *testing.T) {
 
 		// Manually delete the physical file to create orphaned metadata
 		volume := system.volumes[location.VolumeID]
-		volume.DeleteFile(ctx, location.PhysicalPath)
+		_ = volume.DeleteFile(ctx, location.PhysicalPath)
 
 		// Verify physical file is gone
 		exists, _ := volume.FileExists(ctx, location.PhysicalPath)
@@ -224,8 +224,8 @@ func TestCleanupServiceIntegration(t *testing.T) {
 
 		// Create a non-empty directory
 		nonEmptyDir := filepath.Join(vol.MountPath(), "tenant1", "non-empty-dir")
-		os.MkdirAll(nonEmptyDir, 0755)
-		os.WriteFile(filepath.Join(nonEmptyDir, "file.txt"), []byte("content"), 0644)
+		_ = os.MkdirAll(nonEmptyDir, 0755)
+		_ = os.WriteFile(filepath.Join(nonEmptyDir, "file.txt"), []byte("content"), 0644)
 
 		// Verify directories exist
 		_, err1 := os.Stat(emptyDir1)
@@ -265,8 +265,8 @@ func TestCleanupServiceIntegration(t *testing.T) {
 	t.Run("Complete workflow with quota management", func(t *testing.T) {
 		// Create a new tenant with quota
 		tenantID := "quota-test-tenant"
-		system.tenantManager.CreateTenant(ctx, tenantID)
-		system.tenantQuotaMgr.SetQuota(ctx, tenantID, 5) // Max 5 files
+		_ = system.tenantManager.CreateTenant(ctx, tenantID)
+		_ = system.tenantQuotaMgr.SetQuota(ctx, tenantID, 5) // Max 5 files
 
 		tenantCtx, _ := system.tenantManager.GetTenant(ctx, tenantID)
 
@@ -290,7 +290,7 @@ func TestCleanupServiceIntegration(t *testing.T) {
 
 		// Mark one file as permanently failed and clean it up
 		for i := 0; i < 6; i++ {
-			system.storagePool.MarkAsFailed(ctx, fileKeys[0], "Test error")
+			_ = system.storagePool.MarkAsFailed(ctx, fileKeys[0], "Test error")
 		}
 
 		stats, err := system.cleanupService.CleanupPermanentlyFailedFiles(ctx)
@@ -367,13 +367,13 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 	// Mark half as permanently failed
 	for i := 0; i < numFiles/2; i++ {
 		for j := 0; j < 6; j++ {
-			system.storagePool.MarkAsFailed(ctx, fileKeys[i], "Test error")
+			_ = system.storagePool.MarkAsFailed(ctx, fileKeys[i], "Test error")
 		}
 	}
 
 	// Get the other half for processing (to set them to Processing status)
 	for i := numFiles / 2; i < numFiles; i++ {
-		system.storagePool.GetNextFileForProcessing(ctx, tenantCtx)
+		_, _ = system.storagePool.GetNextFileForProcessing(ctx, tenantCtx)
 	}
 
 	// Simulate timeout by updating processing start times
@@ -381,24 +381,24 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 		meta, _ := system.metadataRepo.Get(ctx, fileKeys[i])
 		oldTime := time.Now().Add(-2 * time.Hour)
 		meta.ProcessingStartTime = &oldTime
-		system.metadataRepo.AddOrUpdate(ctx, meta)
+		_ = system.metadataRepo.AddOrUpdate(ctx, meta)
 	}
 
 	// Run all cleanup operations concurrently
 	done := make(chan bool, 3)
 
 	go func() {
-		system.cleanupService.CleanupPermanentlyFailedFiles(ctx)
+		_, _ = system.cleanupService.CleanupPermanentlyFailedFiles(ctx)
 		done <- true
 	}()
 
 	go func() {
-		system.cleanupService.CleanupTimedOutProcessingFiles(ctx, 1*time.Hour)
+		_, _ = system.cleanupService.CleanupTimedOutProcessingFiles(ctx, 1*time.Hour)
 		done <- true
 	}()
 
 	go func() {
-		system.cleanupService.CleanupEmptyDirectories(ctx)
+		_, _ = system.cleanupService.CleanupEmptyDirectories(ctx)
 		done <- true
 	}()
 
@@ -456,11 +456,11 @@ func setupFullSystem(t *testing.T) *System {
 		EnableAutoCreate: false,
 	})
 	if err != nil {
-		os.RemoveAll(tmpRootDir)
+		_ = os.RemoveAll(tmpRootDir)
 		t.Fatalf("Failed to create tenant manager: %v", err)
 	}
 
-	tenantMgr.CreateTenant(ctx, "test-tenant")
+	_ = tenantMgr.CreateTenant(ctx, "test-tenant")
 
 	// Create metadata repository
 	tmpDir1, err := os.MkdirTemp("", "integration-metadata-*")
@@ -478,14 +478,14 @@ func setupFullSystem(t *testing.T) *System {
 
 	metadataRepo, err := metadata.NewBadgerMetadataRepository(metaOpts)
 	if err != nil {
-		os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir1)
 		t.Fatalf("Failed to create metadata repository: %v", err)
 	}
 
 	// Create storage volume
 	tmpDir2, err := os.MkdirTemp("", "integration-volume-*")
 	if err != nil {
-		os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir1)
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
@@ -496,8 +496,8 @@ func setupFullSystem(t *testing.T) *System {
 
 	vol, err := volume.NewLocalFileSystemVolume(volOpts)
 	if err != nil {
-		os.RemoveAll(tmpDir1)
-		os.RemoveAll(tmpDir2)
+		_ = os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir2)
 		t.Fatalf("Failed to create volume: %v", err)
 	}
 
@@ -510,8 +510,8 @@ func setupFullSystem(t *testing.T) *System {
 
 	tmpDir3, err := os.MkdirTemp("", "integration-dirquota-*")
 	if err != nil {
-		os.RemoveAll(tmpDir1)
-		os.RemoveAll(tmpDir2)
+		_ = os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir2)
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
@@ -523,17 +523,17 @@ func setupFullSystem(t *testing.T) *System {
 
 	dirQuotaRepo, err := quota.NewBadgerDirectoryQuotaRepository(dirQuotaOpts)
 	if err != nil {
-		os.RemoveAll(tmpDir1)
-		os.RemoveAll(tmpDir2)
-		os.RemoveAll(tmpDir3)
+		_ = os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir2)
+		_ = os.RemoveAll(tmpDir3)
 		t.Fatalf("Failed to create directory quota repository: %v", err)
 	}
 
 	dirQuotaMgr, err := quota.NewDirectoryQuotaManager(dirQuotaRepo)
 	if err != nil {
-		os.RemoveAll(tmpDir1)
-		os.RemoveAll(tmpDir2)
-		os.RemoveAll(tmpDir3)
+		_ = os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir2)
+		_ = os.RemoveAll(tmpDir3)
 		t.Fatalf("Failed to create directory quota manager: %v", err)
 	}
 
@@ -545,9 +545,9 @@ func setupFullSystem(t *testing.T) *System {
 
 	fileScheduler, err := scheduler.NewFileScheduler(metadataRepo, volumes, schedOpts)
 	if err != nil {
-		os.RemoveAll(tmpDir1)
-		os.RemoveAll(tmpDir2)
-		os.RemoveAll(tmpDir3)
+		_ = os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir2)
+		_ = os.RemoveAll(tmpDir3)
 		t.Fatalf("Failed to create file scheduler: %v", err)
 	}
 
@@ -563,9 +563,9 @@ func setupFullSystem(t *testing.T) *System {
 
 	storagePool, err := pool.NewStoragePool(poolOpts)
 	if err != nil {
-		os.RemoveAll(tmpDir1)
-		os.RemoveAll(tmpDir2)
-		os.RemoveAll(tmpDir3)
+		_ = os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir2)
+		_ = os.RemoveAll(tmpDir3)
 		t.Fatalf("Failed to create storage pool: %v", err)
 	}
 
@@ -581,9 +581,9 @@ func setupFullSystem(t *testing.T) *System {
 
 	cleanupService, err := NewCleanupService(cleanupOpts)
 	if err != nil {
-		os.RemoveAll(tmpDir1)
-		os.RemoveAll(tmpDir2)
-		os.RemoveAll(tmpDir3)
+		_ = os.RemoveAll(tmpDir1)
+		_ = os.RemoveAll(tmpDir2)
+		_ = os.RemoveAll(tmpDir3)
 		t.Fatalf("Failed to create cleanup service: %v", err)
 	}
 
@@ -605,17 +605,17 @@ func setupFullSystem(t *testing.T) *System {
 func cleanupSystem(system *System) {
 	// Close databases first (must be done before RemoveAll)
 	if system.metadataRepo != nil {
-		system.metadataRepo.Close()
+		_ = system.metadataRepo.Close()
 	}
 	if system.dirQuotaRepo != nil {
-		system.dirQuotaRepo.Close()
+		_ = system.dirQuotaRepo.Close()
 	}
 
 	// Then remove directories
 	for _, dir := range system.tempDirs {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 	}
 	for _, vol := range system.volumes {
-		os.RemoveAll(vol.MountPath())
+		_ = os.RemoveAll(vol.MountPath())
 	}
 }

@@ -17,7 +17,7 @@ func TestDirectoryQuotaRepository(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	opts := &BadgerDirectoryQuotaRepositoryOptions{
 		DataPath:       tmpDir,
@@ -106,8 +106,8 @@ func TestDirectoryQuotaRepository(t *testing.T) {
 
 	t.Run("DecrementCount", func(t *testing.T) {
 		// Setup: increment first
-		repo.IncrementCount(ctx, "/path/to/decrement")
-		repo.IncrementCount(ctx, "/path/to/decrement")
+		_ = repo.IncrementCount(ctx, "/path/to/decrement")
+		_ = repo.IncrementCount(ctx, "/path/to/decrement")
 
 		quota, _ := repo.GetOrCreate(ctx, "/path/to/decrement")
 		initialCount := quota.CurrentCount
@@ -134,7 +134,7 @@ func TestDirectoryQuotaManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	opts := &BadgerDirectoryQuotaRepositoryOptions{
 		DataPath:       tmpDir,
@@ -183,9 +183,9 @@ func TestDirectoryQuotaManager(t *testing.T) {
 
 	t.Run("GetFileCount", func(t *testing.T) {
 		// Add some files
-		manager.IncrementFileCount(ctx, "tenant1", "/count/dir")
-		manager.IncrementFileCount(ctx, "tenant1", "/count/dir")
-		manager.IncrementFileCount(ctx, "tenant1", "/count/dir")
+		_ = manager.IncrementFileCount(ctx, "tenant1", "/count/dir")
+		_ = manager.IncrementFileCount(ctx, "tenant1", "/count/dir")
+		_ = manager.IncrementFileCount(ctx, "tenant1", "/count/dir")
 
 		count, err := manager.GetFileCount(ctx, "tenant1", "/count/dir")
 		if err != nil {
@@ -199,8 +199,8 @@ func TestDirectoryQuotaManager(t *testing.T) {
 
 	t.Run("DecrementFileCount", func(t *testing.T) {
 		// Add files first
-		manager.IncrementFileCount(ctx, "tenant1", "/decr/dir")
-		manager.IncrementFileCount(ctx, "tenant1", "/decr/dir")
+		_ = manager.IncrementFileCount(ctx, "tenant1", "/decr/dir")
+		_ = manager.IncrementFileCount(ctx, "tenant1", "/decr/dir")
 
 		initialCount, _ := manager.GetFileCount(ctx, "tenant1", "/decr/dir")
 
@@ -218,7 +218,7 @@ func TestDirectoryQuotaManager(t *testing.T) {
 
 	t.Run("GetQuota", func(t *testing.T) {
 		// Set quota
-		manager.SetQuota(ctx, "tenant1", "/get/dir", 50)
+		_ = manager.SetQuota(ctx, "tenant1", "/get/dir", 50)
 
 		quota, err := manager.GetQuota(ctx, "tenant1", "/get/dir")
 		if err != nil {
@@ -275,9 +275,9 @@ func TestTenantQuotaManager(t *testing.T) {
 
 	t.Run("GetFileCount", func(t *testing.T) {
 		// Clear tenant3 first by creating new manager or using a new tenant
-		manager.IncrementFileCount(ctx, "tenant3")
-		manager.IncrementFileCount(ctx, "tenant3")
-		manager.IncrementFileCount(ctx, "tenant3")
+		_ = manager.IncrementFileCount(ctx, "tenant3")
+		_ = manager.IncrementFileCount(ctx, "tenant3")
+		_ = manager.IncrementFileCount(ctx, "tenant3")
 
 		count, err := manager.GetFileCount(ctx, "tenant3")
 		if err != nil {
@@ -290,8 +290,8 @@ func TestTenantQuotaManager(t *testing.T) {
 	})
 
 	t.Run("DecrementFileCount", func(t *testing.T) {
-		manager.IncrementFileCount(ctx, "tenant4")
-		manager.IncrementFileCount(ctx, "tenant4")
+		_ = manager.IncrementFileCount(ctx, "tenant4")
+		_ = manager.IncrementFileCount(ctx, "tenant4")
 
 		initialCount, _ := manager.GetFileCount(ctx, "tenant4")
 
@@ -308,16 +308,16 @@ func TestTenantQuotaManager(t *testing.T) {
 
 	t.Run("Multiple tenants isolated", func(t *testing.T) {
 		// Set different quotas for different tenants
-		manager.SetQuota(ctx, "tenant-a", 10)
-		manager.SetQuota(ctx, "tenant-b", 20)
+		_ = manager.SetQuota(ctx, "tenant-a", 10)
+		_ = manager.SetQuota(ctx, "tenant-b", 20)
 
 		// Add files to each
-		manager.IncrementFileCount(ctx, "tenant-a")
-		manager.IncrementFileCount(ctx, "tenant-a")
+		_ = manager.IncrementFileCount(ctx, "tenant-a")
+		_ = manager.IncrementFileCount(ctx, "tenant-a")
 
-		manager.IncrementFileCount(ctx, "tenant-b")
-		manager.IncrementFileCount(ctx, "tenant-b")
-		manager.IncrementFileCount(ctx, "tenant-b")
+		_ = manager.IncrementFileCount(ctx, "tenant-b")
+		_ = manager.IncrementFileCount(ctx, "tenant-b")
+		_ = manager.IncrementFileCount(ctx, "tenant-b")
 
 		// Check counts are independent
 		countA, _ := manager.GetFileCount(ctx, "tenant-a")

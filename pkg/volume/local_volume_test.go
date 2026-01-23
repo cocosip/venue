@@ -200,7 +200,7 @@ func TestLocalFileSystemVolume_IsHealthy(t *testing.T) {
 		volume, tempDir := createTestVolume(t, 0)
 
 		// Remove the mount path
-		os.RemoveAll(tempDir)
+		_ = os.RemoveAll(tempDir)
 
 		if volume.IsHealthy(ctx) {
 			t.Error("Expected volume to be unhealthy after mount path deletion")
@@ -333,7 +333,7 @@ func TestLocalFileSystemVolume_ReadFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
-		defer readCloser.Close()
+		defer func() { _ = readCloser.Close() }()
 
 		content, err := io.ReadAll(readCloser)
 		if err != nil {
@@ -589,7 +589,7 @@ func TestLocalFileSystemVolume_GetFileSize(t *testing.T) {
 			}
 
 			// Clean up
-			volume.DeleteFile(ctx, relativePath)
+			_ = volume.DeleteFile(ctx, relativePath)
 		})
 	}
 
@@ -657,7 +657,7 @@ func TestLocalFileSystemVolume_ShardedFileOperations(t *testing.T) {
 			}
 
 			content, err := io.ReadAll(readCloser)
-			readCloser.Close() // Close before deletion on Windows
+			_ = readCloser.Close() // Close before deletion on Windows
 			if err != nil {
 				t.Fatalf("Failed to read content: %v", err)
 			}

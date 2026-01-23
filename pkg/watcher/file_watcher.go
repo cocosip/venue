@@ -428,7 +428,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Get file info
 	fileInfo, err := file.Stat()

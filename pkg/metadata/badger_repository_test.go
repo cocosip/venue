@@ -103,7 +103,7 @@ func TestNewBadgerMetadataRepository(t *testing.T) {
 
 				// Clean up
 				if closer, ok := repo.(*BadgerMetadataRepository); ok {
-					closer.Close()
+					_ = closer.Close()
 				}
 			}
 		})
@@ -114,7 +114,7 @@ func TestNewBadgerMetadataRepository(t *testing.T) {
 func TestBadgerRepository_AddOrUpdate(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	t.Run("Add new metadata", func(t *testing.T) {
 		metadata := createTestMetadata("file1", core.FileStatusPending)
@@ -175,11 +175,11 @@ func TestBadgerRepository_AddOrUpdate(t *testing.T) {
 func TestBadgerRepository_Get(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Add test data
 	metadata := createTestMetadata("file1", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, metadata)
+	_ = repo.AddOrUpdate(ctx, metadata)
 
 	t.Run("Get existing file", func(t *testing.T) {
 		retrieved, err := repo.Get(ctx, "file1")
@@ -214,11 +214,11 @@ func TestBadgerRepository_Get(t *testing.T) {
 func TestBadgerRepository_Delete(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Add test data
 	metadata := createTestMetadata("file1", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, metadata)
+	_ = repo.AddOrUpdate(ctx, metadata)
 
 	t.Run("Delete existing file", func(t *testing.T) {
 		err := repo.Delete(ctx, "file1")
@@ -253,14 +253,14 @@ func TestBadgerRepository_Delete(t *testing.T) {
 func TestBadgerRepository_GetByStatus(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Add test data with different statuses
-	repo.AddOrUpdate(ctx, createTestMetadata("pending1", core.FileStatusPending))
-	repo.AddOrUpdate(ctx, createTestMetadata("pending2", core.FileStatusPending))
-	repo.AddOrUpdate(ctx, createTestMetadata("processing1", core.FileStatusProcessing))
-	repo.AddOrUpdate(ctx, createTestMetadata("completed1", core.FileStatusCompleted))
-	repo.AddOrUpdate(ctx, createTestMetadata("failed1", core.FileStatusFailed))
+	_ = repo.AddOrUpdate(ctx, createTestMetadata("pending1", core.FileStatusPending))
+	_ = repo.AddOrUpdate(ctx, createTestMetadata("pending2", core.FileStatusPending))
+	_ = repo.AddOrUpdate(ctx, createTestMetadata("processing1", core.FileStatusProcessing))
+	_ = repo.AddOrUpdate(ctx, createTestMetadata("completed1", core.FileStatusCompleted))
+	_ = repo.AddOrUpdate(ctx, createTestMetadata("failed1", core.FileStatusFailed))
 
 	t.Run("Get pending files", func(t *testing.T) {
 		results, err := repo.GetByStatus(ctx, "test-tenant", core.FileStatusPending, 0)
@@ -300,7 +300,7 @@ func TestBadgerRepository_GetByStatus(t *testing.T) {
 func TestBadgerRepository_GetPendingFiles(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	now := time.Now()
 	future := now.Add(1 * time.Hour)
@@ -309,18 +309,18 @@ func TestBadgerRepository_GetPendingFiles(t *testing.T) {
 	// Add files with different availability times
 	file1 := createTestMetadata("available-now", core.FileStatusPending)
 	file1.AvailableForProcessingAt = nil // Available immediately
-	repo.AddOrUpdate(ctx, file1)
+	_ = repo.AddOrUpdate(ctx, file1)
 
 	file2 := createTestMetadata("available-past", core.FileStatusPending)
 	file2.AvailableForProcessingAt = &past
-	repo.AddOrUpdate(ctx, file2)
+	_ = repo.AddOrUpdate(ctx, file2)
 
 	file3 := createTestMetadata("not-available-yet", core.FileStatusPending)
 	file3.AvailableForProcessingAt = &future
-	repo.AddOrUpdate(ctx, file3)
+	_ = repo.AddOrUpdate(ctx, file3)
 
 	file4 := createTestMetadata("processing", core.FileStatusProcessing)
-	repo.AddOrUpdate(ctx, file4)
+	_ = repo.AddOrUpdate(ctx, file4)
 
 	t.Run("Get available pending files", func(t *testing.T) {
 		results, err := repo.GetPendingFiles(ctx, "test-tenant", 0)
@@ -350,11 +350,11 @@ func TestBadgerRepository_GetPendingFiles(t *testing.T) {
 func TestBadgerRepository_UpdateStatus(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	// Add test data
 	metadata := createTestMetadata("file1", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, metadata)
+	_ = repo.AddOrUpdate(ctx, metadata)
 
 	t.Run("Update to processing", func(t *testing.T) {
 		err := repo.UpdateStatus(ctx, "file1", core.FileStatusProcessing)
@@ -391,7 +391,7 @@ func TestBadgerRepository_UpdateStatus(t *testing.T) {
 func TestBadgerRepository_GetTimedOutProcessingFiles(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	now := time.Now()
 	longAgo := now.Add(-2 * time.Hour)
@@ -400,14 +400,14 @@ func TestBadgerRepository_GetTimedOutProcessingFiles(t *testing.T) {
 	// Add files with different processing start times
 	file1 := createTestMetadata("timed-out", core.FileStatusProcessing)
 	file1.ProcessingStartTime = &longAgo
-	repo.AddOrUpdate(ctx, file1)
+	_ = repo.AddOrUpdate(ctx, file1)
 
 	file2 := createTestMetadata("still-processing", core.FileStatusProcessing)
 	file2.ProcessingStartTime = &recent
-	repo.AddOrUpdate(ctx, file2)
+	_ = repo.AddOrUpdate(ctx, file2)
 
 	file3 := createTestMetadata("pending", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, file3)
+	_ = repo.AddOrUpdate(ctx, file3)
 
 	t.Run("Get timed out files", func(t *testing.T) {
 		timeout := 1 * time.Hour
@@ -444,15 +444,15 @@ func TestBadgerRepository_GetTimedOutProcessingFiles(t *testing.T) {
 func TestBadgerRepository_Cache(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	t.Run("Active files are cached", func(t *testing.T) {
 		// Add a pending file
 		metadata := createTestMetadata("cached-file", core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 
 		// First get - should cache it
-		repo.Get(ctx, "cached-file")
+		_, _ = repo.Get(ctx, "cached-file")
 
 		// Check cache stats
 		concreteRepo := repo.(*BadgerMetadataRepository)
@@ -467,10 +467,10 @@ func TestBadgerRepository_Cache(t *testing.T) {
 	t.Run("Completed files are not cached", func(t *testing.T) {
 		// Add a completed file
 		metadata := createTestMetadata("completed-file", core.FileStatusCompleted)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 
 		// Get it
-		repo.Get(ctx, "completed-file")
+		_, _ = repo.Get(ctx, "completed-file")
 
 		// It should not be in cache (only active files)
 		concreteRepo := repo.(*BadgerMetadataRepository)
@@ -483,10 +483,10 @@ func TestBadgerRepository_Cache(t *testing.T) {
 	t.Run("Cache expires", func(t *testing.T) {
 		// Add a pending file
 		metadata := createTestMetadata("expiring-file", core.FileStatusPending)
-		repo.AddOrUpdate(ctx, metadata)
+		_ = repo.AddOrUpdate(ctx, metadata)
 
 		// Get it to cache
-		repo.Get(ctx, "expiring-file")
+		_, _ = repo.Get(ctx, "expiring-file")
 
 		// Wait for cache to expire (TTL is 1 second in test)
 		time.Sleep(1500 * time.Millisecond)
@@ -504,7 +504,7 @@ func TestBadgerRepository_Cache(t *testing.T) {
 func TestBadgerRepository_ConcurrentAccess(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := createTestRepository(t)
-	defer repo.(*BadgerMetadataRepository).Close()
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	const numGoroutines = 10
 	done := make(chan bool, numGoroutines)
@@ -516,7 +516,7 @@ func TestBadgerRepository_ConcurrentAccess(t *testing.T) {
 				fmt.Sprintf("concurrent-file-%d", id),
 				core.FileStatusPending,
 			)
-			repo.AddOrUpdate(ctx, metadata)
+			_ = repo.AddOrUpdate(ctx, metadata)
 			done <- true
 		}(i)
 	}
@@ -544,7 +544,7 @@ func TestBadgerRepository_Close(t *testing.T) {
 
 	// Add some data
 	metadata := createTestMetadata("file1", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, metadata)
+	_ = repo.AddOrUpdate(ctx, metadata)
 
 	// Close the repository
 	concreteRepo := repo.(*BadgerMetadataRepository)
@@ -560,5 +560,5 @@ func TestBadgerRepository_Close(t *testing.T) {
 	}
 
 	// Clean up temp directory
-	os.RemoveAll(tempDir)
+	_ = os.RemoveAll(tempDir)
 }

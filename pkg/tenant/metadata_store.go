@@ -51,7 +51,7 @@ func (s *MetadataStore) Save(metadata *core.TenantMetadata) error {
 
 	// Atomic rename
 	if err := os.Rename(tmpPath, filePath); err != nil {
-		os.Remove(tmpPath) // Cleanup
+		_ = os.Remove(tmpPath) // Cleanup
 		return fmt.Errorf("failed to rename tenant metadata: %w", err)
 	}
 

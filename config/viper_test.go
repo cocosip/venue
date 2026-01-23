@@ -16,7 +16,7 @@ func TestLoadFromFileWithViperNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	t.Run("Load YAML from venue node", func(t *testing.T) {
 		configPath := filepath.Join(tmpDir, "viper-venue-node.yaml")
@@ -242,7 +242,9 @@ venue:
       volumeType: LocalFileSystem
       shardingDepth: 2
 `
-		v.ReadConfig(strings.NewReader(appConfig))
+		if err := v.ReadConfig(strings.NewReader(appConfig)); err != nil {
+			t.Fatalf("Failed to read config: %v", err)
+		}
 
 		// Load venue section
 		config, err := LoadVenueSectionWithViper(v, "venue")
@@ -268,7 +270,9 @@ app:
   name: TestApp
   port: 8080
 `
-		v.ReadConfig(strings.NewReader(appConfig))
+		if err := v.ReadConfig(strings.NewReader(appConfig)); err != nil {
+			t.Fatalf("Failed to read config: %v", err)
+		}
 
 		// Try to load non-existent section
 		_, err := LoadVenueSectionWithViper(v, "venue")

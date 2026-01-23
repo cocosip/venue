@@ -3,7 +3,6 @@ package scheduler
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
@@ -33,7 +32,6 @@ type fileScheduler struct {
 	volumes           map[string]core.StorageVolume
 	retryPolicy       *core.FileRetryPolicy
 	processingTimeout time.Duration
-	mu                sync.RWMutex
 }
 
 // NewFileScheduler creates a new file scheduler.
@@ -200,11 +198,8 @@ func (s *fileScheduler) MarkAsCompleted(ctx context.Context, fileKey string) err
 		return fmt.Errorf("storage volume %s not found", metadata.VolumeID)
 	}
 
-	// Delete the physical file
-	if err := volume.DeleteFile(ctx, metadata.PhysicalPath); err != nil {
-		// Log error but continue to delete metadata
-		// (file might already be deleted)
-	}
+	// Delete the physical file (ignore errors as file might already be deleted)
+	_ = volume.DeleteFile(ctx, metadata.PhysicalPath)
 
 	// Delete metadata
 	if err := s.metadataRepo.Delete(ctx, fileKey); err != nil {

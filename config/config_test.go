@@ -124,7 +124,7 @@ func TestConfigLoadSave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	t.Run("JSON format", func(t *testing.T) {
 		configPath := filepath.Join(tmpDir, "config.json")
@@ -317,7 +317,7 @@ func TestLoadFromFileWithNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	t.Run("Load YAML from venue node", func(t *testing.T) {
 		configPath := filepath.Join(tmpDir, "config-with-node.yaml")

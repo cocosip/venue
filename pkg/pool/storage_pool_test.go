@@ -19,7 +19,7 @@ func TestNewStoragePool(t *testing.T) {
 	t.Run("Valid configuration", func(t *testing.T) {
 		tenantMgr := &mockTenantManager{}
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
+		defer func() { _ = os.RemoveAll(tmpDir) }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -52,7 +52,7 @@ func TestNewStoragePool(t *testing.T) {
 
 	t.Run("Nil tenant manager", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
+		defer func() { _ = os.RemoveAll(tmpDir) }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -97,7 +97,7 @@ func TestWriteFile(t *testing.T) {
 
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -185,7 +185,7 @@ func TestReadFile(t *testing.T) {
 
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -218,7 +218,7 @@ func TestReadFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		// Verify content
 		readContent, _ := io.ReadAll(reader)
@@ -265,7 +265,7 @@ func TestGetFileInfo(t *testing.T) {
 
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -314,7 +314,7 @@ func TestGetFileLocation(t *testing.T) {
 
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -367,7 +367,7 @@ func TestCapacity(t *testing.T) {
 
 	tenantMgr := &mockTenantManager{}
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -454,7 +454,7 @@ func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 
 	repo, err := metadata.NewBadgerMetadataRepository(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create repository: %v", err)
 	}
 
@@ -474,7 +474,7 @@ func createTestVolumes(t *testing.T) map[string]core.StorageVolume {
 
 	vol, err := volume.NewLocalFileSystemVolume(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create volume: %v", err)
 	}
 
@@ -485,7 +485,7 @@ func createTestVolumes(t *testing.T) map[string]core.StorageVolume {
 
 func cleanupVolumes(volumes map[string]core.StorageVolume) {
 	for _, vol := range volumes {
-		os.RemoveAll(vol.MountPath())
+		_ = os.RemoveAll(vol.MountPath())
 	}
 }
 

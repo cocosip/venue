@@ -15,7 +15,7 @@ func TestIntegration_FileLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -26,7 +26,7 @@ func TestIntegration_FileLifecycle(t *testing.T) {
 	t.Run("Successful processing lifecycle", func(t *testing.T) {
 		// 1. Add a pending file
 		file := createTestFileMetadata("lifecycle-file", core.FileStatusPending)
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// 2. Get file for processing
 		location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
@@ -57,7 +57,7 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -77,7 +77,7 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 
 	// Add a pending file
 	file := createTestFileMetadata("retry-file", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, file)
+	_ = repo.AddOrUpdate(ctx, file)
 
 	// First attempt
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
@@ -133,7 +133,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -144,7 +144,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 	// Add 20 pending files
 	for i := 0; i < 20; i++ {
 		file := createTestFileMetadata(string(rune('a'+i)), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 	}
 
 	// Simulate 5 concurrent workers
@@ -180,7 +180,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 
 				// Mark as completed
-				scheduler.MarkAsCompleted(ctx, location.FileKey)
+				_ = scheduler.MarkAsCompleted(ctx, location.FileKey)
 			}
 		}(workerID)
 	}
@@ -204,7 +204,7 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -214,7 +214,7 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 
 	// Add a pending file
 	file := createTestFileMetadata("timeout-file", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, file)
+	_ = repo.AddOrUpdate(ctx, file)
 
 	// Get file for processing
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
@@ -223,7 +223,7 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 	metadata, _ := repo.Get(ctx, location.FileKey)
 	longAgo := time.Now().Add(-2 * time.Hour)
 	metadata.ProcessingStartTime = &longAgo
-	repo.AddOrUpdate(ctx, metadata)
+	_ = repo.AddOrUpdate(ctx, metadata)
 
 	// Reset timed out files
 	count, err := scheduler.ResetTimedOutFiles(ctx, 1*time.Hour)
@@ -261,7 +261,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -272,7 +272,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 	// Add 15 pending files
 	for i := 0; i < 15; i++ {
 		file := createTestFileMetadata(string(rune('a'+i)), core.FileStatusPending)
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 	}
 
 	// Get first batch of 5
@@ -330,7 +330,7 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -350,11 +350,11 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 
 	// Add a pending file
 	file := createTestFileMetadata("backoff-file", core.FileStatusPending)
-	repo.AddOrUpdate(ctx, file)
+	_ = repo.AddOrUpdate(ctx, file)
 
 	// Get and fail the file
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
-	scheduler.MarkAsFailed(ctx, location.FileKey, "Test error")
+	_ = scheduler.MarkAsFailed(ctx, location.FileKey, "Test error")
 
 	// Check retry delay after first failure (should be 1 second)
 	metadata, _ := repo.Get(ctx, location.FileKey)
@@ -362,7 +362,7 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 		t.Fatal("Expected AvailableForProcessingAt to be set")
 	}
 
-	delay1 := metadata.AvailableForProcessingAt.Sub(time.Now())
+	delay1 := time.Until(*metadata.AvailableForProcessingAt)
 	if delay1 < 900*time.Millisecond || delay1 > 1100*time.Millisecond {
 		t.Errorf("Expected delay ~1s, got %v", delay1)
 	}
@@ -370,11 +370,11 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 	// Fail again
 	time.Sleep(1100 * time.Millisecond)
 	location, _ = scheduler.GetNextFileForProcessing(ctx, tenant)
-	scheduler.MarkAsFailed(ctx, location.FileKey, "Test error 2")
+	_ = scheduler.MarkAsFailed(ctx, location.FileKey, "Test error 2")
 
 	// Check retry delay after second failure (should be 2 seconds)
 	metadata, _ = repo.Get(ctx, location.FileKey)
-	delay2 := metadata.AvailableForProcessingAt.Sub(time.Now())
+	delay2 := time.Until(*metadata.AvailableForProcessingAt)
 	if delay2 < 1900*time.Millisecond || delay2 > 2100*time.Millisecond {
 		t.Errorf("Expected delay ~2s, got %v", delay2)
 	}
@@ -382,11 +382,11 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 	// Fail again
 	time.Sleep(2100 * time.Millisecond)
 	location, _ = scheduler.GetNextFileForProcessing(ctx, tenant)
-	scheduler.MarkAsFailed(ctx, location.FileKey, "Test error 3")
+	_ = scheduler.MarkAsFailed(ctx, location.FileKey, "Test error 3")
 
 	// Check retry delay after third failure (should be 4 seconds)
 	metadata, _ = repo.Get(ctx, location.FileKey)
-	delay3 := metadata.AvailableForProcessingAt.Sub(time.Now())
+	delay3 := time.Until(*metadata.AvailableForProcessingAt)
 	if delay3 < 3900*time.Millisecond || delay3 > 4100*time.Millisecond {
 		t.Errorf("Expected delay ~4s, got %v", delay3)
 	}

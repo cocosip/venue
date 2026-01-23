@@ -15,8 +15,8 @@ import (
 func main() {
 	// Clean up old data
 	dataDir := "./venue-data"
-	os.RemoveAll(dataDir)
-	defer os.RemoveAll(dataDir)
+	_ = os.RemoveAll(dataDir)
+	defer func() { _ = os.RemoveAll(dataDir) }()
 
 	fmt.Println("=== Venue with Viper Configuration Example ===")
 	fmt.Println()
@@ -136,7 +136,7 @@ venue:
     periodicCheckInterval: 1h
 `
 
-	appViper.ReadConfig(strings.NewReader(appConfig))
+	_ = appViper.ReadConfig(strings.NewReader(appConfig))
 
 	cfg4, err := config.LoadVenueSectionWithViper(appViper, "venue")
 	if err != nil {
@@ -158,7 +158,7 @@ venue:
 	if err := venueInstance.Start(); err != nil {
 		log.Fatalf("Failed to start venue: %v", err)
 	}
-	defer venueInstance.Stop()
+	defer func() { _ = venueInstance.Stop() }()
 
 	fmt.Println("✓ Venue services started")
 	fmt.Println()

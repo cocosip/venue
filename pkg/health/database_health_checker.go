@@ -145,7 +145,7 @@ func (c *databaseHealthChecker) CheckMetadataDatabase(ctx context.Context, tenan
 		status.Error = fmt.Sprintf("failed to open database: %v", err)
 		return status, nil
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Try a simple read operation
 	err = db.View(func(txn *badger.Txn) error {
@@ -202,7 +202,7 @@ func (c *databaseHealthChecker) checkDirectoryQuotaDatabaseInternal(ctx context.
 		status.Error = fmt.Sprintf("failed to open database: %v", err)
 		return status
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Try a simple read operation
 	err = db.View(func(txn *badger.Txn) error {
@@ -336,7 +336,7 @@ func IsDatabaseCorrupted(dbPath string) bool {
 		// Cannot open = corrupted
 		return true
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Try a simple operation
 	err = db.View(func(txn *badger.Txn) error {

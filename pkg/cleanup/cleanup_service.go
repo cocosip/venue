@@ -194,11 +194,11 @@ func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context) (*co
 
 		// Decrement quotas
 		if s.tenantQuotaMgr != nil {
-			s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
+			_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
 		}
 		if s.dirQuotaMgr != nil {
 			directoryPath := filepath.Dir(file.PhysicalPath)
-			s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
+			_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
 		}
 
 		stats.PermanentlyFailedFilesRemoved++
@@ -231,7 +231,7 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 			volume, exists := s.volumes[file.VolumeID]
 			if !exists {
 				// Volume doesn't exist, metadata is orphaned
-				s.metadataRepo.Delete(ctx, file.FileKey)
+				_ = s.metadataRepo.Delete(ctx, file.FileKey)
 				stats.OrphanedMetadataRemoved++
 				continue
 			}
@@ -240,15 +240,15 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 			fileExists, err := volume.FileExists(ctx, file.PhysicalPath)
 			if err != nil || !fileExists {
 				// File doesn't exist, metadata is orphaned
-				s.metadataRepo.Delete(ctx, file.FileKey)
+				_ = s.metadataRepo.Delete(ctx, file.FileKey)
 
 				// Decrement quotas
 				if s.tenantQuotaMgr != nil {
-					s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
+					_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
 				}
 				if s.dirQuotaMgr != nil {
 					directoryPath := filepath.Dir(file.PhysicalPath)
-					s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
+					_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
 				}
 
 				stats.OrphanedMetadataRemoved++

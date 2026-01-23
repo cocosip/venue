@@ -24,7 +24,7 @@ func createBenchVolume(shardDepth int) (*LocalFileSystemVolume, string, error) {
 
 	volume, err := NewLocalFileSystemVolume(opts)
 	if err != nil {
-		os.RemoveAll(tempDir)
+		_ = os.RemoveAll(tempDir)
 		return nil, "", err
 	}
 
@@ -98,7 +98,7 @@ func BenchmarkLocalFileSystemVolume_WriteFile(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer os.RemoveAll(tempDir)
+			defer func() { _ = os.RemoveAll(tempDir) }()
 
 			content := strings.Repeat("A", tc.size)
 
@@ -134,7 +134,7 @@ func BenchmarkLocalFileSystemVolume_ReadFile(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer os.RemoveAll(tempDir)
+			defer func() { _ = os.RemoveAll(tempDir) }()
 
 			content := strings.Repeat("A", tc.size)
 
@@ -153,7 +153,7 @@ func BenchmarkLocalFileSystemVolume_ReadFile(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				readCloser, _ := volume.ReadFile(ctx, files[i])
 				if readCloser != nil {
-					readCloser.Close()
+					_ = readCloser.Close()
 				}
 			}
 		})
@@ -167,7 +167,7 @@ func BenchmarkLocalFileSystemVolume_FileExists(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	// Create a test file
 	relativePath := "bench-exists.txt"
@@ -188,7 +188,7 @@ func BenchmarkLocalFileSystemVolume_GetFileSize(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	// Create a test file
 	relativePath := "bench-size.txt"
@@ -210,7 +210,7 @@ func BenchmarkLocalFileSystemVolume_DeleteFile(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	// Prepare files
 	files := make([]string, b.N)
@@ -249,7 +249,7 @@ func BenchmarkLocalFileSystemVolume_ShardedWrite(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer os.RemoveAll(tempDir)
+			defer func() { _ = os.RemoveAll(tempDir) }()
 
 			b.ResetTimer()
 			b.SetBytes(int64(len(content)))
@@ -271,7 +271,7 @@ func BenchmarkLocalFileSystemVolume_IsHealthy(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	b.ResetTimer()
 
@@ -286,7 +286,7 @@ func BenchmarkLocalFileSystemVolume_BuildFilePath(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	fileKey := "550e8400e29b41d4a716446655440000"
 
@@ -304,7 +304,7 @@ func BenchmarkLocalFileSystemVolume_ConcurrentWrites(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	content := strings.Repeat("A", 1024) // 1KB
 
@@ -330,7 +330,7 @@ func BenchmarkLocalFileSystemVolume_ConcurrentReads(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 
 	content := strings.Repeat("A", 1024) // 1KB
 
@@ -353,7 +353,7 @@ func BenchmarkLocalFileSystemVolume_ConcurrentReads(b *testing.B) {
 		for pb.Next() {
 			readCloser, _ := volume.ReadFile(ctx, files[i%numFiles])
 			if readCloser != nil {
-				readCloser.Close()
+				_ = readCloser.Close()
 			}
 			i++
 		}

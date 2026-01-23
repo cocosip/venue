@@ -78,7 +78,7 @@ func NewStoragePool(opts *StoragePoolOptions) (core.StoragePool, error) {
 		return nil, fmt.Errorf("file scheduler cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
-	if opts.Volumes == nil || len(opts.Volumes) == 0 {
+	if len(opts.Volumes) == 0 {
 		return nil, fmt.Errorf("at least one storage volume is required: %w", core.ErrInvalidArgument)
 	}
 
@@ -129,7 +129,7 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 		// Defer decrement in case of error
 		defer func() {
 			if err := recover(); err != nil {
-				p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
+				_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
 				panic(err)
 			}
 		}()
@@ -140,7 +140,7 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 		if err := p.dirQuotaMgr.IncrementFileCount(ctx, tenant.ID, directoryPath); err != nil {
 			// Rollback tenant quota
 			if p.tenantQuotaMgr != nil {
-				p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
+				_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
 			}
 			return "", err
 		}
@@ -151,10 +151,10 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 	if err != nil {
 		// Rollback quotas
 		if p.dirQuotaMgr != nil {
-			p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
+			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
 		}
 		if p.tenantQuotaMgr != nil {
-			p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
+			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
 		}
 		return "", err
 	}
@@ -164,10 +164,10 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 	if err != nil {
 		// Rollback quotas
 		if p.dirQuotaMgr != nil {
-			p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
+			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
 		}
 		if p.tenantQuotaMgr != nil {
-			p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
+			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
 		}
 		return "", fmt.Errorf("failed to write file to volume: %w", err)
 	}
@@ -191,13 +191,13 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 	// Save metadata
 	if err := p.metadataRepo.AddOrUpdate(ctx, metadata); err != nil {
 		// Try to delete the physical file (best effort)
-		volume.DeleteFile(ctx, relativePath)
+		_ = volume.DeleteFile(ctx, relativePath)
 		// Rollback quotas
 		if p.dirQuotaMgr != nil {
-			p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
+			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
 		}
 		if p.tenantQuotaMgr != nil {
-			p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
+			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
 		}
 		return "", fmt.Errorf("failed to save file metadata: %w", err)
 	}

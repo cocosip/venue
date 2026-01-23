@@ -157,7 +157,7 @@ func (v *Venue) initialize() error {
 		if tenantCfg.Quota != nil {
 			// Use tenant-specific quota
 			if *tenantCfg.Quota > 0 {
-				v.tenantQuotaManager.SetQuota(ctx, tenantCfg.TenantId, int(*tenantCfg.Quota))
+				_ = v.tenantQuotaManager.SetQuota(ctx, tenantCfg.TenantId, int(*tenantCfg.Quota))
 				v.logger.Info("Tenant quota set", "tenantId", tenantCfg.TenantId, "quota", *tenantCfg.Quota)
 			} else if *tenantCfg.Quota == 0 {
 				// 0 means unlimited
@@ -165,7 +165,7 @@ func (v *Venue) initialize() error {
 			}
 		} else if v.config.DefaultTenantQuota > 0 {
 			// Use default quota if no specific quota is set
-			v.tenantQuotaManager.SetQuota(ctx, tenantCfg.TenantId, int(v.config.DefaultTenantQuota))
+			_ = v.tenantQuotaManager.SetQuota(ctx, tenantCfg.TenantId, int(v.config.DefaultTenantQuota))
 			v.logger.Info("Tenant quota set to default", "tenantId", tenantCfg.TenantId, "quota", v.config.DefaultTenantQuota)
 		}
 	}
@@ -400,7 +400,7 @@ func (v *Venue) Start() error {
 	if v.cleanupService != nil {
 		if err := v.cleanupService.Start(); err != nil {
 			if v.healthCheckService != nil {
-				v.healthCheckService.Stop()
+				_ = v.healthCheckService.Stop()
 			}
 			v.running = false
 			return fmt.Errorf("failed to start cleanup service: %w", err)
@@ -411,10 +411,10 @@ func (v *Venue) Start() error {
 	if v.fileWatcherService != nil {
 		if err := v.fileWatcherService.Start(); err != nil {
 			if v.cleanupService != nil {
-				v.cleanupService.Stop()
+				_ = v.cleanupService.Stop()
 			}
 			if v.healthCheckService != nil {
-				v.healthCheckService.Stop()
+				_ = v.healthCheckService.Stop()
 			}
 			v.running = false
 			return fmt.Errorf("failed to start file watcher service: %w", err)

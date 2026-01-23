@@ -17,8 +17,8 @@ func TestNewFileScheduler(t *testing.T) {
 
 	t.Run("Valid configuration", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
-		defer repo.(*metadata.BadgerMetadataRepository).Close()
+		defer func() { _ = os.RemoveAll(tmpDir) }()
+		defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -45,8 +45,8 @@ func TestNewFileScheduler(t *testing.T) {
 
 	t.Run("Nil volumes", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
-		defer repo.(*metadata.BadgerMetadataRepository).Close()
+		defer func() { _ = os.RemoveAll(tmpDir) }()
+		defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		_, err := NewFileScheduler(repo, nil, nil)
 		if err == nil {
@@ -56,8 +56,8 @@ func TestNewFileScheduler(t *testing.T) {
 
 	t.Run("Empty volumes", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
-		defer repo.(*metadata.BadgerMetadataRepository).Close()
+		defer func() { _ = os.RemoveAll(tmpDir) }()
+		defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		_, err := NewFileScheduler(repo, map[string]core.StorageVolume{}, nil)
 		if err == nil {
@@ -73,8 +73,8 @@ func TestGetNextFileForProcessing(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*metadata.BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -85,16 +85,12 @@ func TestGetNextFileForProcessing(t *testing.T) {
 	t.Run("Get pending file", func(t *testing.T) {
 		// Add a pending file
 		file := createTestFileMetadata("file1", core.FileStatusPending)
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Get next file
 		location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
-		if err != nil {
-			t.Fatalf("Expected no error, got %v", err)
-		}
-
-		if location == nil {
-			t.Fatal("Expected file location")
+		if err != nil || location == nil {
+			t.Fatalf("Expected no error and valid location, got error: %v, location: %v", err, location)
 		}
 
 		if location.FileKey != "file1" {
@@ -140,7 +136,7 @@ func TestGetNextFileForProcessing(t *testing.T) {
 		future := time.Now().Add(1 * time.Hour)
 		file := createTestFileMetadata("file-future", core.FileStatusPending)
 		file.AvailableForProcessingAt = &future
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Should not get this file
 		_, err := scheduler.GetNextFileForProcessing(ctx, tenant)
@@ -156,7 +152,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 
 	t.Run("Get batch of files", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
+		defer func() { _ = os.RemoveAll(tmpDir) }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -167,7 +163,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 		// Add 5 pending files
 		for i := 1; i <= 5; i++ {
 			file := createTestFileMetadata(string(rune('a'+i-1)), core.FileStatusPending)
-			repo.AddOrUpdate(ctx, file)
+			_ = repo.AddOrUpdate(ctx, file)
 		}
 
 		// Get batch of 3
@@ -190,7 +186,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 
 	t.Run("Empty result when no files", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
+		defer func() { _ = os.RemoveAll(tmpDir) }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -210,7 +206,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 
 	t.Run("Invalid batch size", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
-		defer os.RemoveAll(tmpDir)
+		defer func() { _ = os.RemoveAll(tmpDir) }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -230,8 +226,8 @@ func TestMarkAsCompleted(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*metadata.BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -241,7 +237,7 @@ func TestMarkAsCompleted(t *testing.T) {
 	t.Run("Mark file as completed", func(t *testing.T) {
 		// Add a processing file
 		file := createTestFileMetadata("file1", core.FileStatusProcessing)
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Mark as completed
 		err := scheduler.MarkAsCompleted(ctx, "file1")
@@ -276,8 +272,8 @@ func TestMarkAsFailed(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*metadata.BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -298,7 +294,7 @@ func TestMarkAsFailed(t *testing.T) {
 		// Add a processing file with retry count 0
 		file := createTestFileMetadata("file1", core.FileStatusProcessing)
 		file.RetryCount = 0
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Mark as failed
 		err := scheduler.MarkAsFailed(ctx, "file1", "Test error")
@@ -333,7 +329,7 @@ func TestMarkAsFailed(t *testing.T) {
 		// Add a processing file with max retry count
 		file := createTestFileMetadata("file2", core.FileStatusProcessing)
 		file.RetryCount = 3 // Already at max
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		// Mark as failed (this should exceed max)
 		err := scheduler.MarkAsFailed(ctx, "file2", "Final error")
@@ -369,8 +365,8 @@ func TestGetFileStatus(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*metadata.BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -379,7 +375,7 @@ func TestGetFileStatus(t *testing.T) {
 
 	t.Run("Get status of existing file", func(t *testing.T) {
 		file := createTestFileMetadata("file1", core.FileStatusPending)
-		repo.AddOrUpdate(ctx, file)
+		_ = repo.AddOrUpdate(ctx, file)
 
 		status, err := scheduler.GetFileStatus(ctx, "file1")
 		if err != nil {
@@ -411,8 +407,8 @@ func TestResetTimedOutFiles(t *testing.T) {
 	ctx := context.Background()
 
 	repo, tmpDir := createTestRepository(t)
-	defer os.RemoveAll(tmpDir)
-	defer repo.(*metadata.BadgerMetadataRepository).Close()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -426,11 +422,11 @@ func TestResetTimedOutFiles(t *testing.T) {
 
 		file1 := createTestFileMetadata("file1", core.FileStatusProcessing)
 		file1.ProcessingStartTime = &longAgo
-		repo.AddOrUpdate(ctx, file1)
+		_ = repo.AddOrUpdate(ctx, file1)
 
 		file2 := createTestFileMetadata("file2", core.FileStatusProcessing)
 		file2.ProcessingStartTime = &recent
-		repo.AddOrUpdate(ctx, file2)
+		_ = repo.AddOrUpdate(ctx, file2)
 
 		// Reset files with timeout of 1 hour
 		count, err := scheduler.ResetTimedOutFiles(ctx, 1*time.Hour)
@@ -489,7 +485,7 @@ func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 
 	repo, err := metadata.NewBadgerMetadataRepository(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create repository: %v", err)
 	}
 
@@ -509,7 +505,7 @@ func createTestVolumes(t *testing.T) map[string]core.StorageVolume {
 
 	vol, err := volume.NewLocalFileSystemVolume(opts)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create volume: %v", err)
 	}
 
@@ -520,7 +516,7 @@ func createTestVolumes(t *testing.T) map[string]core.StorageVolume {
 
 func cleanupVolumes(volumes map[string]core.StorageVolume) {
 	for _, vol := range volumes {
-		os.RemoveAll(vol.MountPath())
+		_ = os.RemoveAll(vol.MountPath())
 	}
 }
 

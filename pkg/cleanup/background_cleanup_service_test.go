@@ -173,7 +173,7 @@ func TestBackgroundCleanupService_CleanupExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to start service: %v", err)
 	}
-	defer bgSvc.Stop()
+	defer func() { _ = bgSvc.Stop() }()
 
 	// Wait for initial delay + first execution
 	time.Sleep(100 * time.Millisecond)
@@ -223,7 +223,7 @@ func TestBackgroundCleanupService_SelectiveCleanup(t *testing.T) {
 	// Wait for first execution
 	time.Sleep(100 * time.Millisecond)
 
-	bgSvc.Stop()
+	_ = bgSvc.Stop()
 
 	// Only empty directories cleanup should have been called
 	if mockSvc.cleanupEmptyDirsCalled.Load() < 1 {
@@ -296,7 +296,7 @@ func TestBackgroundCleanupService_DatabaseOptimization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to start service: %v", err)
 	}
-	defer bgSvc.Stop()
+	defer func() { _ = bgSvc.Stop() }()
 
 	// Wait for optimization to happen (should happen on first run and after interval)
 	time.Sleep(400 * time.Millisecond)

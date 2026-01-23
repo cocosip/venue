@@ -84,7 +84,7 @@ func TestTenantManager_CreateTenant(t *testing.T) {
 		ctx := context.Background()
 
 		// Create first time
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		// Create second time should fail
 		err := manager.CreateTenant(ctx, "tenant-001")
@@ -109,7 +109,7 @@ func TestTenantManager_GetTenant(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		tenant, err := manager.GetTenant(ctx, "tenant-001")
 		if err != nil {
@@ -152,7 +152,7 @@ func TestTenantManager_GetTenant(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		// First call - loads from disk
 		tenant1, _ := manager.GetTenant(ctx, "tenant-001")
@@ -171,7 +171,7 @@ func TestTenantManager_EnableDisableTenant(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		err := manager.DisableTenant(ctx, "tenant-001")
 		if err != nil {
@@ -189,8 +189,8 @@ func TestTenantManager_EnableDisableTenant(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
-		manager.DisableTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.DisableTenant(ctx, "tenant-001")
 
 		err := manager.EnableTenant(ctx, "tenant-001")
 		if err != nil {
@@ -208,7 +208,7 @@ func TestTenantManager_EnableDisableTenant(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		// Get tenant to populate cache
 		tenant1, _ := manager.GetTenant(ctx, "tenant-001")
@@ -217,7 +217,7 @@ func TestTenantManager_EnableDisableTenant(t *testing.T) {
 		}
 
 		// Disable tenant
-		manager.DisableTenant(ctx, "tenant-001")
+		_ = manager.DisableTenant(ctx, "tenant-001")
 
 		// Get tenant again - should reload from disk
 		tenant2, _ := manager.GetTenant(ctx, "tenant-001")
@@ -232,7 +232,7 @@ func TestTenantManager_IsTenantEnabled(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		enabled, err := manager.IsTenantEnabled(ctx, "tenant-001")
 		if err != nil {
@@ -247,8 +247,8 @@ func TestTenantManager_IsTenantEnabled(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
-		manager.DisableTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.DisableTenant(ctx, "tenant-001")
 
 		enabled, err := manager.IsTenantEnabled(ctx, "tenant-001")
 		if err != nil {
@@ -279,9 +279,9 @@ func TestTenantManager_GetAllTenants(t *testing.T) {
 		ctx := context.Background()
 
 		// Create multiple tenants
-		manager.CreateTenant(ctx, "tenant-001")
-		manager.CreateTenant(ctx, "tenant-002")
-		manager.CreateTenant(ctx, "tenant-003")
+		_ = manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-002")
+		_ = manager.CreateTenant(ctx, "tenant-003")
 
 		tenants, err := manager.GetAllTenants(ctx)
 		if err != nil {
@@ -317,16 +317,16 @@ func TestTenantManager_CacheExpiration(t *testing.T) {
 		manager, _ := NewTenantManager(opts)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		// First call - loads from disk
-		manager.GetTenant(ctx, "tenant-001")
+		_, _ = manager.GetTenant(ctx, "tenant-001")
 
 		// Wait for cache to expire
 		time.Sleep(150 * time.Millisecond)
 
 		// Disable tenant on disk
-		manager.DisableTenant(ctx, "tenant-001")
+		_ = manager.DisableTenant(ctx, "tenant-001")
 
 		// This should reload from disk (cache expired)
 		tenant, _ := manager.GetTenant(ctx, "tenant-001")
@@ -375,22 +375,22 @@ func TestTenantManager_ConcurrentAccess(t *testing.T) {
 		manager, _ := setupTestManager(t)
 		ctx := context.Background()
 
-		manager.CreateTenant(ctx, "tenant-001")
+		_ = manager.CreateTenant(ctx, "tenant-001")
 
 		// Concurrent reads and writes
 		done := make(chan bool, 20)
 		for i := 0; i < 10; i++ {
 			go func() {
-				manager.GetTenant(ctx, "tenant-001")
+				_, _ = manager.GetTenant(ctx, "tenant-001")
 				done <- true
 			}()
 		}
 		for i := 0; i < 10; i++ {
 			go func(idx int) {
 				if idx%2 == 0 {
-					manager.EnableTenant(ctx, "tenant-001")
+					_ = manager.EnableTenant(ctx, "tenant-001")
 				} else {
-					manager.DisableTenant(ctx, "tenant-001")
+					_ = manager.DisableTenant(ctx, "tenant-001")
 				}
 				done <- true
 			}(i)
@@ -413,8 +413,8 @@ func TestTenantManager_Persistence(t *testing.T) {
 		// Create manager and tenant
 		manager1, _ := NewTenantManager(opts)
 		ctx := context.Background()
-		manager1.CreateTenant(ctx, "tenant-001")
-		manager1.DisableTenant(ctx, "tenant-001")
+		_ = manager1.CreateTenant(ctx, "tenant-001")
+		_ = manager1.DisableTenant(ctx, "tenant-001")
 
 		// Create new manager with same root
 		manager2, _ := NewTenantManager(opts)
@@ -478,7 +478,7 @@ func TestMetadataStore(t *testing.T) {
 		store, _ := NewMetadataStore(tempDir)
 
 		metadata := createDefaultMetadata("tenant-001", "/storage/tenant-001")
-		store.Save(metadata)
+		_ = store.Save(metadata)
 
 		err := store.Delete("tenant-001")
 		if err != nil {
@@ -500,7 +500,7 @@ func TestMetadataStore(t *testing.T) {
 		for i := 1; i <= 3; i++ {
 			tenantID := fmt.Sprintf("tenant-%03d", i)
 			metadata := createDefaultMetadata(tenantID, "/storage")
-			store.Save(metadata)
+			_ = store.Save(metadata)
 		}
 
 		// List all
@@ -519,7 +519,7 @@ func TestMetadataStore(t *testing.T) {
 		store, _ := NewMetadataStore(tempDir)
 
 		metadata := createDefaultMetadata("tenant-001", "/storage/tenant-001")
-		store.Save(metadata)
+		_ = store.Save(metadata)
 
 		// Save should be atomic via temp file + rename
 		filePath := filepath.Join(tempDir, "tenant-001.json")

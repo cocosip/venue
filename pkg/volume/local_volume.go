@@ -99,7 +99,7 @@ func (v *LocalFileSystemVolume) IsHealthy(ctx context.Context) bool {
 	}
 
 	// Clean up test file
-	os.Remove(testPath)
+	_ = os.Remove(testPath)
 
 	return true
 }
@@ -128,13 +128,13 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 	if err != nil {
 		return 0, fmt.Errorf("failed to create file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Copy content
 	written, err := io.Copy(file, content)
 	if err != nil {
 		// Clean up on error
-		os.Remove(fullPath)
+		_ = os.Remove(fullPath)
 		return 0, fmt.Errorf("failed to write file content: %w", err)
 	}
 
