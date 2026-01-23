@@ -36,6 +36,7 @@ func newMetadataCache(ttl time.Duration) *metadataCache {
 
 // get retrieves a file metadata from the cache.
 // Returns nil if not found or expired.
+// Returns a copy to prevent concurrent modification.
 func (c *metadataCache) get(fileKey string) *core.FileMetadata {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -49,16 +50,21 @@ func (c *metadataCache) get(fileKey string) *core.FileMetadata {
 		return nil
 	}
 
-	return entry.metadata
+	// Return a copy to avoid data races when multiple goroutines access the same cached object
+	metadataCopy := *entry.metadata
+	return &metadataCopy
 }
 
 // set adds or updates a file metadata in the cache.
+// Stores a copy to prevent concurrent modification.
 func (c *metadataCache) set(fileKey string, metadata *core.FileMetadata) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Store a copy to avoid data races when the caller modifies the original
+	metadataCopy := *metadata
 	c.entries[fileKey] = &cacheEntry{
-		metadata:  metadata,
+		metadata:  &metadataCopy,
 		expiresAt: time.Now().Add(c.ttl),
 	}
 }

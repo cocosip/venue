@@ -254,6 +254,15 @@ type MetadataRepository interface {
 	// UpdateStatus atomically updates file status.
 	UpdateStatus(ctx context.Context, fileKey string, newStatus FileProcessingStatus) error
 
+	// CompareAndTransitionToProcessing atomically transitions a file to Processing status
+	// if and only if it is currently in Pending status.
+	// Returns the updated metadata on success, or an error if:
+	// - File not found
+	// - File is not in Pending status
+	// - Database error
+	// This is a compare-and-swap operation to prevent duplicate processing.
+	CompareAndTransitionToProcessing(ctx context.Context, fileKey string) (*FileMetadata, error)
+
 	// GetTimedOutProcessingFiles retrieves files in Processing status that exceed timeout.
 	GetTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) ([]*FileMetadata, error)
 

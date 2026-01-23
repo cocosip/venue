@@ -278,7 +278,9 @@ func (s *BackgroundCleanupService) executeCleanup() {
 		s.logger.Info("Starting database optimization")
 		// Note: Database optimization is not yet implemented in CleanupService interface
 		// This is a placeholder for future implementation
+		s.mu.Lock()
 		s.lastOptimizationTime = time.Now()
+		s.mu.Unlock()
 		s.logger.Info("Database optimization completed")
 	}
 
@@ -293,6 +295,8 @@ func (s *BackgroundCleanupService) executeCleanup() {
 
 // shouldOptimizeDatabases returns true if enough time has passed since last optimization.
 func (s *BackgroundCleanupService) shouldOptimizeDatabases() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.lastOptimizationTime.IsZero() {
 		return true
 	}

@@ -152,30 +152,14 @@ func (s *fileScheduler) GetNextBatchForProcessing(ctx context.Context, tenant co
 // transitionToProcessing atomically transitions a file from Pending to Processing.
 // Returns error if the file is no longer in Pending status (already claimed).
 func (s *fileScheduler) transitionToProcessing(ctx context.Context, file *core.FileMetadata) error {
-	// Re-read the file to check current status
-	current, err := s.metadataRepo.Get(ctx, file.FileKey)
+	// Use atomic compare-and-swap operation
+	updated, err := s.metadataRepo.CompareAndTransitionToProcessing(ctx, file.FileKey)
 	if err != nil {
-		return fmt.Errorf("failed to get current file status: %w", err)
+		return err
 	}
 
-	// Check if still in Pending status
-	if current.Status != core.FileStatusPending {
-		return fmt.Errorf("file status changed, no longer pending")
-	}
-
-	// Update to Processing status with processing start time
-	now := time.Now()
-	current.Status = core.FileStatusProcessing
-	current.ProcessingStartTime = &now
-	current.UpdatedAt = now
-
-	// Save the update
-	if err := s.metadataRepo.AddOrUpdate(ctx, current); err != nil {
-		return fmt.Errorf("failed to update file status: %w", err)
-	}
-
-	// Update the input file metadata
-	*file = *current
+	// Update the input file metadata with the updated values
+	*file = *updated
 
 	return nil
 }

@@ -445,6 +445,87 @@ func (r *BadgerMetadataRepository) UpdateStatus(ctx context.Context, fileKey str
 	return nil
 }
 
+// CompareAndTransitionToProcessing atomically transitions a file to Processing status
+// if and only if it is currently in Pending status.
+func (r *BadgerMetadataRepository) CompareAndTransitionToProcessing(ctx context.Context, fileKey string) (*core.FileMetadata, error) {
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return nil, fmt.Errorf("repository is closed")
+	}
+	r.mu.RUnlock()
+
+	if fileKey == "" {
+		return nil, fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	var updatedMetadata *core.FileMetadata
+
+	// Perform atomic compare-and-swap in a transaction
+	err := r.db.Update(func(txn *badger.Txn) error {
+		key := r.buildKey(fileKey)
+
+		// Get existing metadata
+		item, err := txn.Get(key)
+		if err != nil {
+			if err == badger.ErrKeyNotFound {
+				return core.ErrFileNotFound
+			}
+			return err
+		}
+
+		var metadata *core.FileMetadata
+		err = item.Value(func(val []byte) error {
+			metadata = &core.FileMetadata{}
+			return json.Unmarshal(val, metadata)
+		})
+		if err != nil {
+			return err
+		}
+
+		// Check if file is in Pending status
+		if metadata.Status != core.FileStatusPending {
+			return fmt.Errorf("file is not in pending status: current status is %s", metadata.Status.String())
+		}
+
+		// Check if available for processing
+		if metadata.AvailableForProcessingAt != nil && time.Now().Before(*metadata.AvailableForProcessingAt) {
+			return fmt.Errorf("file is not yet available for processing")
+		}
+
+		// Update to Processing status
+		now := time.Now()
+		metadata.Status = core.FileStatusProcessing
+		metadata.ProcessingStartTime = &now
+		metadata.UpdatedAt = now
+
+		// Serialize and save
+		data, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+
+		updatedMetadata = metadata
+
+		return txn.Set(key, data)
+	})
+
+	if err != nil {
+		// Don't wrap known errors
+		if err == core.ErrFileNotFound {
+			return nil, err
+		}
+		return nil, fmt.Errorf("failed to transition file to processing: %w", err)
+	}
+
+	// Update cache with a copy
+	r.cache.set(fileKey, updatedMetadata)
+
+	// Return a copy to prevent concurrent modification
+	result := *updatedMetadata
+	return &result, nil
+}
+
 // GetTimedOutProcessingFiles retrieves files in Processing status that exceed timeout.
 func (r *BadgerMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) ([]*core.FileMetadata, error) {
 	r.mu.RLock()
