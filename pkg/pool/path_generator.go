@@ -3,45 +3,8 @@ package pool
 import (
 	"path/filepath"
 	"strconv"
-	"sync"
 	"time"
 )
-
-// stringBuilderPool reduces GC pressure by reusing string builders for path generation
-var stringBuilderPool = sync.Pool{
-	New: func() interface{} {
-		return &stringBuilder{}
-	},
-}
-
-type stringBuilder struct {
-	buf [256]byte
-	len int
-}
-
-func (sb *stringBuilder) reset() {
-	sb.len = 0
-}
-
-func (sb *stringBuilder) appendString(s string) {
-	n := copy(sb.buf[sb.len:], s)
-	sb.len += n
-}
-
-func (sb *stringBuilder) appendInt(i int, width int) {
-	n := strconv.Itoa(i)
-	if width > len(n) {
-		for i := 0; i < width-len(n); i++ {
-			sb.buf[sb.len] = '0'
-			sb.len++
-		}
-	}
-	sb.appendString(n)
-}
-
-func (sb *stringBuilder) string() string {
-	return string(sb.buf[:sb.len])
-}
 
 // DateBasedPathGenerator generates paths based on the current date.
 // Format: {tenantID}/{YYYY}/{MM}/{DD}/{fileKey}{ext}

@@ -24,17 +24,11 @@ func (e *lruCacheEntry) isExpired() bool {
 // Only active files (Pending/Processing/Failed) are cached.
 // When cache reaches maxSize, least recently used entries are evicted.
 type metadataCache struct {
-	entries  map[string]*lruCacheEntry
-	ttl      time.Duration
-	maxSize  int
-	mu       sync.RWMutex
-	lruList  *list.List // Front = most recent, Back = least recent
-}
-
-// newMetadataCache creates a new metadata cache with LRU eviction.
-// If maxSize is 0, defaults to 10000 entries.
-func newMetadataCache(ttl time.Duration) *metadataCache {
-	return newMetadataCacheWithSize(ttl, 10000)
+	entries map[string]*lruCacheEntry
+	ttl     time.Duration
+	maxSize int
+	mu      sync.RWMutex
+	lruList *list.List // Front = most recent, Back = least recent
 }
 
 // newMetadataCacheWithSize creates a new metadata cache with specified max size.
@@ -105,7 +99,7 @@ func (c *metadataCache) set(fileKey string, metadata *core.FileMetadata) {
 		metadata:  &metadataCopy,
 		expiresAt: time.Now().Add(c.ttl),
 	}
-	
+
 	// Add to front of LRU list (most recent)
 	entry.listElem = c.lruList.PushFront(fileKey)
 	c.entries[fileKey] = entry
@@ -134,7 +128,7 @@ func (c *metadataCache) evictLRU() {
 	if elem == nil {
 		return
 	}
-	
+
 	fileKey := elem.Value.(string)
 	c.lruList.Remove(elem)
 	delete(c.entries, fileKey)

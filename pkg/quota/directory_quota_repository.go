@@ -102,13 +102,13 @@ func NewBadgerDirectoryQuotaRepository(opts *BadgerDirectoryQuotaRepositoryOptio
 		WithLogger(nil). // Disable BadgerDB logging
 		WithMemTableSize(memTableSize).
 		WithValueLogFileSize(valueLogFileSize).
-		WithNumMemtables(2).                          // 2 memtables for quota operations
-		WithNumLevelZeroTables(2).                    // 2 L0 tables
-		WithNumLevelZeroTablesStall(4).               // Stall threshold
-		WithValueThreshold(1 << 10).                  // 1KB threshold for value log
-		WithCompression(options.Snappy).              // Enable Snappy compression
+		WithNumMemtables(2).             // 2 memtables for quota operations
+		WithNumLevelZeroTables(2).       // 2 L0 tables
+		WithNumLevelZeroTablesStall(4).  // Stall threshold
+		WithValueThreshold(1 << 10).     // 1KB threshold for value log
+		WithCompression(options.Snappy). // Enable Snappy compression
 		WithBlockCacheSize(blockCacheSize).
-		WithCompactL0OnClose(true).                   // Compact on close
+		WithCompactL0OnClose(true). // Compact on close
 		WithSyncWrites(opts.SyncWrites)
 
 	db, err := badger.Open(badgerOpts)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -132,15 +131,15 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 		WithLogger(nil). // Disable BadgerDB logging
 		WithMemTableSize(memTableSize).
 		WithValueLogFileSize(valueLogFileSize).
-		WithNumMemtables(3).                          // 3 memtables for smoother L0 flush
-		WithNumLevelZeroTables(3).                    // 3 L0 tables before compaction
-		WithNumLevelZeroTablesStall(6).               // Stall threshold to prevent too many L0 tables
-		WithValueThreshold(1 << 10).                  // 1KB threshold for value log
-		WithCompression(options.Snappy).              // Enable Snappy compression for better I/O
+		WithNumMemtables(3).             // 3 memtables for smoother L0 flush
+		WithNumLevelZeroTables(3).       // 3 L0 tables before compaction
+		WithNumLevelZeroTablesStall(6).  // Stall threshold to prevent too many L0 tables
+		WithValueThreshold(1 << 10).     // 1KB threshold for value log
+		WithCompression(options.Snappy). // Enable Snappy compression for better I/O
 		WithBlockCacheSize(blockCacheSize).
-		WithIndexCacheSize(32 << 20).                 // 32MB index cache
-		WithNumCompactors(3).                         // 3 concurrent compactors
-		WithCompactL0OnClose(true).                   // Compact L0 on close for faster restart
+		WithIndexCacheSize(32 << 20). // 32MB index cache
+		WithNumCompactors(3).         // 3 concurrent compactors
+		WithCompactL0OnClose(true).   // Compact L0 on close for faster restart
 		WithSyncWrites(opts.SyncWrites)
 		// Note: Must keep conflict detection enabled for concurrent file allocation
 
@@ -830,11 +829,6 @@ func (r *BadgerMetadataRepository) buildKey(fileKey string) []byte {
 	return []byte(fmt.Sprintf("file:%s", fileKey))
 }
 
-// buildPrefix builds the prefix for all file metadata keys.
-func (r *BadgerMetadataRepository) buildPrefix() []byte {
-	return []byte("file:")
-}
-
 // isActiveStatus checks if a status is considered "active" for caching.
 // Active statuses: Pending, Processing, Failed
 // Inactive statuses: Completed, PermanentlyFailed
@@ -888,7 +882,6 @@ func (r *BadgerMetadataRepository) GetCacheStats() map[string]interface{} {
 	return r.cache.getStats()
 }
 
-
 // getMetadataInTxn retrieves metadata within a transaction (no locking).
 func (r *BadgerMetadataRepository) getMetadataInTxn(txn *badger.Txn, fileKey string) (*core.FileMetadata, error) {
 	key := r.buildKey(fileKey)
@@ -940,44 +933,6 @@ func (r *BadgerMetadataRepository) extractFileKeyFromIndex(indexKey string) stri
 		return indexKey[lastColon+1:]
 	}
 	return ""
-}
-
-// parsePendingIndexKey parses a Pending status index key.
-// Returns availableTime and fileKey.
-func (r *BadgerMetadataRepository) parsePendingIndexKey(indexKey string) (*time.Time, string, error) {
-	// Format: idx:status:0:{availableTime}:{fileKey}
-	const prefix = "idx:status:0:"
-	if !strings.HasPrefix(indexKey, prefix) {
-		return nil, "", fmt.Errorf("invalid pending index key")
-	}
-
-	// Extract available time and fileKey
-	remaining := indexKey[len(prefix):]
-	// Find the separator between availableTime and fileKey (last colon might be in fileKey)
-	// Format: 0000-00-00T00:00:00Z:fileKey
-	idx := strings.Index(remaining, ":")
-	if idx == -1 {
-		return nil, "", fmt.Errorf("invalid index key format")
-	}
-
-	timeStr := remaining[:idx]
-	fileKey := remaining[idx+1:]
-
-	// Parse time
-	var availableTime *time.Time
-	if timeStr != "0000-00-00T00:00:00Z" {
-		t, err := time.Parse(time.RFC3339Nano, timeStr)
-		if err != nil {
-			// Try without nano
-			t, err = time.Parse(time.RFC3339, timeStr)
-			if err != nil {
-				return nil, "", err
-			}
-		}
-		availableTime = &t
-	}
-
-	return availableTime, fileKey, nil
 }
 
 // equalAvailableTime compares two time pointers for equality.

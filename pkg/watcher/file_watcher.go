@@ -30,10 +30,10 @@ type FileWatcherOptions struct {
 type fileWatcher struct {
 	tenantMgr       core.TenantManager
 	storagePool     core.StoragePool
-	watchers        sync.Map          // map[string]*core.FileWatcherConfiguration
-	configRoot      string            // Configuration root directory
-	importedFiles   sync.Map          // map[string]string: filePath -> fileKey (imported files history)
-	importedFilesMu sync.RWMutex      // Lock for persisting imported files
+	watchers        sync.Map     // map[string]*core.FileWatcherConfiguration
+	configRoot      string       // Configuration root directory
+	importedFiles   sync.Map     // map[string]string: filePath -> fileKey (imported files history)
+	importedFilesMu sync.RWMutex // Lock for persisting imported files
 }
 
 // NewFileWatcher creates a new file watcher.
