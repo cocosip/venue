@@ -238,12 +238,19 @@ type MetadataRepository interface {
 	// AddOrUpdate adds or updates file metadata atomically.
 	AddOrUpdate(ctx context.Context, metadata *FileMetadata) error
 
+	// AddOrUpdateBatch adds or updates multiple file metadata atomically in a single transaction.
+	// More efficient than calling AddOrUpdate multiple times for bulk operations.
+	AddOrUpdateBatch(ctx context.Context, metadata []*FileMetadata) error
+
 	// Get retrieves file metadata by key.
 	// Returns nil if not found.
 	Get(ctx context.Context, fileKey string) (*FileMetadata, error)
 
 	// Delete removes file metadata.
 	Delete(ctx context.Context, fileKey string) error
+
+	// DeleteBatch removes multiple file metadata atomically in a single transaction.
+	DeleteBatch(ctx context.Context, fileKeys []string) error
 
 	// GetByStatus retrieves files by status with optional limit.
 	GetByStatus(ctx context.Context, tenantID string, status FileProcessingStatus, limit int) ([]*FileMetadata, error)

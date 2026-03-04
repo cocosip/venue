@@ -8,6 +8,9 @@ import (
 	"github.com/cocosip/venue/pkg/core"
 )
 
+// Note: sync.Map is used instead of map+mutex for better concurrent performance
+// with many tenants. It's optimized for frequent reads and infrequent writes.
+
 // tenantQuota represents quota information for a tenant.
 type tenantQuota struct {
 	tenantID     string
@@ -25,16 +28,17 @@ func (q *tenantQuota) canAddFile() bool {
 }
 
 // tenantQuotaManager implements TenantQuotaManager interface.
+// Uses sync.Map for better concurrent performance with high tenant counts.
 type tenantQuotaManager struct {
-	quotas map[string]*tenantQuota
-	mu     sync.RWMutex
+	quotas sync.Map // map[string]*tenantQuota
+	// Note: sync.Map is optimized for frequent reads and infrequent writes
+	// which matches the quota check pattern (many CanAddFile calls,
+	// fewer Increment/Decrement calls)
 }
 
 // NewTenantQuotaManager creates a new tenant quota manager.
 func NewTenantQuotaManager() core.TenantQuotaManager {
-	return &tenantQuotaManager{
-		quotas: make(map[string]*tenantQuota),
-	}
+	return &tenantQuotaManager{}
 }
 
 // CanAddFile checks if a file can be added to a tenant without exceeding quota.
@@ -43,16 +47,13 @@ func (m *tenantQuotaManager) CanAddFile(ctx context.Context, tenantID string) (b
 		return false, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	quota, exists := m.quotas[tenantID]
-	if !exists {
-		// No quota set, unlimited
-		return true, nil
+	if val, ok := m.quotas.Load(tenantID); ok {
+		quota := val.(*tenantQuota)
+		return quota.canAddFile(), nil
 	}
 
-	return quota.canAddFile(), nil
+	// No quota set, unlimited
+	return true, nil
 }
 
 // IncrementFileCount atomically increments the file count for a tenant.
@@ -61,30 +62,43 @@ func (m *tenantQuotaManager) IncrementFileCount(ctx context.Context, tenantID st
 		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	quota, exists := m.quotas[tenantID]
-	if !exists {
-		// No quota set, create default (unlimited)
-		m.quotas[tenantID] = &tenantQuota{
-			tenantID:     tenantID,
-			currentCount: 1,
-			maxCount:     0,
-			enabled:      false,
+	for {
+		val, loaded := m.quotas.Load(tenantID)
+		if !loaded {
+			// No quota set, create default (unlimited)
+			newQuota := &tenantQuota{
+				tenantID:     tenantID,
+				currentCount: 1,
+				maxCount:     0,
+				enabled:      false,
+			}
+			if _, loaded := m.quotas.LoadOrStore(tenantID, newQuota); !loaded {
+				return nil // Successfully stored
+			}
+			// Another goroutine stored, retry
+			continue
 		}
-		return nil
+
+		quota := val.(*tenantQuota)
+
+		// Check if we can add a file
+		if !quota.canAddFile() {
+			return core.ErrTenantQuotaExceeded
+		}
+
+		// Try to increment atomically using CompareAndSwap
+		newQuota := &tenantQuota{
+			tenantID:     quota.tenantID,
+			currentCount: quota.currentCount + 1,
+			maxCount:     quota.maxCount,
+			enabled:      quota.enabled,
+		}
+
+		if m.quotas.CompareAndSwap(tenantID, quota, newQuota) {
+			return nil
+		}
+		// CAS failed, retry
 	}
-
-	// Check if we can add a file
-	if !quota.canAddFile() {
-		return core.ErrTenantQuotaExceeded
-	}
-
-	// Increment count
-	quota.currentCount++
-
-	return nil
 }
 
 // DecrementFileCount atomically decrements the file count for a tenant.
@@ -93,21 +107,29 @@ func (m *tenantQuotaManager) DecrementFileCount(ctx context.Context, tenantID st
 		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	for {
+		val, loaded := m.quotas.Load(tenantID)
+		if !loaded {
+			return nil // No quota, nothing to decrement
+		}
 
-	quota, exists := m.quotas[tenantID]
-	if !exists {
-		// No quota, nothing to decrement
-		return nil
+		quota := val.(*tenantQuota)
+		if quota.currentCount <= 0 {
+			return nil // Already at 0
+		}
+
+		newQuota := &tenantQuota{
+			tenantID:     quota.tenantID,
+			currentCount: quota.currentCount - 1,
+			maxCount:     quota.maxCount,
+			enabled:      quota.enabled,
+		}
+
+		if m.quotas.CompareAndSwap(tenantID, quota, newQuota) {
+			return nil
+		}
+		// CAS failed, retry
 	}
-
-	// Decrement count (don't go below 0)
-	if quota.currentCount > 0 {
-		quota.currentCount--
-	}
-
-	return nil
 }
 
 // GetFileCount returns the current file count for a tenant.
@@ -116,15 +138,10 @@ func (m *tenantQuotaManager) GetFileCount(ctx context.Context, tenantID string) 
 		return 0, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	quota, exists := m.quotas[tenantID]
-	if !exists {
-		return 0, nil
+	if val, ok := m.quotas.Load(tenantID); ok {
+		return val.(*tenantQuota).currentCount, nil
 	}
-
-	return quota.currentCount, nil
+	return 0, nil
 }
 
 // SetQuota sets the maximum file count for a tenant (0 = unlimited).
@@ -137,24 +154,33 @@ func (m *tenantQuotaManager) SetQuota(ctx context.Context, tenantID string, maxC
 		return fmt.Errorf("max count cannot be negative: %w", core.ErrInvalidArgument)
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	for {
+		val, loaded := m.quotas.Load(tenantID)
+		if !loaded {
+			// Create new quota
+			newQuota := &tenantQuota{
+				tenantID:     tenantID,
+				currentCount: 0,
+				maxCount:     maxCount,
+				enabled:      maxCount > 0,
+			}
+			if _, loaded := m.quotas.LoadOrStore(tenantID, newQuota); !loaded {
+				return nil
+			}
+			continue
+		}
 
-	quota, exists := m.quotas[tenantID]
-	if !exists {
-		// Create new quota
-		m.quotas[tenantID] = &tenantQuota{
-			tenantID:     tenantID,
-			currentCount: 0,
+		quota := val.(*tenantQuota)
+		newQuota := &tenantQuota{
+			tenantID:     quota.tenantID,
+			currentCount: quota.currentCount,
 			maxCount:     maxCount,
 			enabled:      maxCount > 0,
 		}
-		return nil
+
+		if m.quotas.CompareAndSwap(tenantID, quota, newQuota) {
+			return nil
+		}
+		// CAS failed, retry
 	}
-
-	// Update existing quota
-	quota.maxCount = maxCount
-	quota.enabled = maxCount > 0
-
-	return nil
 }

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
 )
 
 // BadgerRepositoryOptions configures a BadgerDB metadata repository.
@@ -25,6 +27,10 @@ type BadgerRepositoryOptions struct {
 	// Only active files (Pending/Processing/Failed) are cached.
 	CacheTTL time.Duration
 
+	// MaxCacheEntries is the maximum number of entries in the cache.
+	// Default: 10000
+	MaxCacheEntries int
+
 	// GCInterval is the interval for running BadgerDB garbage collection.
 	// Default: 10 minutes
 	GCInterval time.Duration
@@ -33,6 +39,22 @@ type BadgerRepositoryOptions struct {
 	// Files with this ratio of outdated data will be rewritten.
 	// Default: 0.5 (50%)
 	GCDiscardRatio float64
+
+	// MemTableSize is the size of each memtable in bytes.
+	// Default: 32MB for metadata
+	MemTableSize int64
+
+	// ValueLogFileSize is the size of each value log file in bytes.
+	// Default: 64MB
+	ValueLogFileSize int64
+
+	// BlockCacheSize is the size of the block cache in bytes.
+	// Default: 64MB for metadata
+	BlockCacheSize int64
+
+	// SyncWrites enables synchronous writes. Disable for better performance.
+	// Default: false
+	SyncWrites bool
 }
 
 // BadgerMetadataRepository implements MetadataRepository using BadgerDB.
@@ -68,6 +90,11 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 		cacheTTL = 5 * time.Minute
 	}
 
+	maxCacheEntries := opts.MaxCacheEntries
+	if maxCacheEntries == 0 {
+		maxCacheEntries = 10000
+	}
+
 	gcInterval := opts.GCInterval
 	if gcInterval == 0 {
 		gcInterval = 10 * time.Minute
@@ -78,22 +105,43 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 		gcDiscardRatio = 0.5
 	}
 
+	memTableSize := opts.MemTableSize
+	if memTableSize == 0 {
+		memTableSize = 32 << 20 // 32MB default
+	}
+
+	valueLogFileSize := opts.ValueLogFileSize
+	if valueLogFileSize == 0 {
+		valueLogFileSize = 64 << 20 // 64MB default
+	}
+
+	blockCacheSize := opts.BlockCacheSize
+	if blockCacheSize == 0 {
+		blockCacheSize = 64 << 20 // 64MB default
+	}
+
 	// Create tenant-specific database path
 	dbPath := filepath.Join(opts.DataPath, opts.TenantID, "metadata")
 	if err := os.MkdirAll(dbPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create database path: %w", err)
 	}
 
-	// Open BadgerDB
+	// Open BadgerDB with optimized settings for production workloads
+	// These settings balance memory usage, write performance, and durability
 	badgerOpts := badger.DefaultOptions(dbPath).
 		WithLogger(nil). // Disable BadgerDB logging
-		WithMemTableSize(1 << 20).                    // 1MB memtable (default is 64MB)
-		WithValueLogFileSize(1 << 20).                // 1MB value log files (default is 1GB)
-		WithNumMemtables(2).                          // Keep at least 2 memtables for smoother operation
-		WithNumLevelZeroTables(2).                    // Keep at least 2 L0 tables
-		WithNumLevelZeroTablesStall(4).               // Reasonable stall threshold
+		WithMemTableSize(memTableSize).
+		WithValueLogFileSize(valueLogFileSize).
+		WithNumMemtables(3).                          // 3 memtables for smoother L0 flush
+		WithNumLevelZeroTables(3).                    // 3 L0 tables before compaction
+		WithNumLevelZeroTablesStall(6).               // Stall threshold to prevent too many L0 tables
 		WithValueThreshold(1 << 10).                  // 1KB threshold for value log
-		WithCompression(0)                            // Disable compression for better performance
+		WithCompression(options.Snappy).              // Enable Snappy compression for better I/O
+		WithBlockCacheSize(blockCacheSize).
+		WithIndexCacheSize(32 << 20).                 // 32MB index cache
+		WithNumCompactors(3).                         // 3 concurrent compactors
+		WithCompactL0OnClose(true).                   // Compact L0 on close for faster restart
+		WithSyncWrites(opts.SyncWrites)
 		// Note: Must keep conflict detection enabled for concurrent file allocation
 
 	db, err := badger.Open(badgerOpts)
@@ -101,8 +149,8 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 		return nil, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
 
-	// Create cache
-	cache := newMetadataCache(cacheTTL)
+	// Create cache with size limit
+	cache := newMetadataCacheWithSize(cacheTTL, maxCacheEntries)
 
 	repo := &BadgerMetadataRepository{
 		tenantID:       opts.TenantID,
@@ -120,6 +168,7 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 }
 
 // AddOrUpdate adds or updates file metadata atomically.
+// Also maintains secondary indexes for efficient status-based queries.
 func (r *BadgerMetadataRepository) AddOrUpdate(ctx context.Context, metadata *core.FileMetadata) error {
 	r.mu.RLock()
 	if r.closed {
@@ -142,10 +191,33 @@ func (r *BadgerMetadataRepository) AddOrUpdate(ctx context.Context, metadata *co
 		return fmt.Errorf("failed to serialize metadata: %w", err)
 	}
 
-	// Write to BadgerDB
+	// Write to BadgerDB with index maintenance
 	err = r.db.Update(func(txn *badger.Txn) error {
+		// Get old metadata to update indexes
+		oldMetadata, _ := r.getMetadataInTxn(txn, metadata.FileKey)
+
+		// Write primary data
 		key := r.buildKey(metadata.FileKey)
-		return txn.Set(key, data)
+		if err := txn.Set(key, data); err != nil {
+			return err
+		}
+
+		// Update secondary indexes if status changed or this is a new file
+		if oldMetadata == nil || oldMetadata.Status != metadata.Status ||
+			!r.equalAvailableTime(oldMetadata.AvailableForProcessingAt, metadata.AvailableForProcessingAt) {
+			// Delete old status index if exists
+			if oldMetadata != nil {
+				oldIndexKey := r.buildStatusIndexKey(oldMetadata)
+				_ = txn.Delete(oldIndexKey)
+			}
+			// Add new status index
+			newIndexKey := r.buildStatusIndexKey(metadata)
+			if err := txn.Set(newIndexKey, []byte(metadata.FileKey)); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
 
 	if err != nil {
@@ -158,6 +230,79 @@ func (r *BadgerMetadataRepository) AddOrUpdate(ctx context.Context, metadata *co
 	} else {
 		// Remove from cache if no longer active
 		r.cache.delete(metadata.FileKey)
+	}
+
+	return nil
+}
+
+// AddOrUpdateBatch adds or updates multiple file metadata atomically in a single transaction.
+// More efficient than calling AddOrUpdate multiple times for bulk operations.
+func (r *BadgerMetadataRepository) AddOrUpdateBatch(ctx context.Context, metadata []*core.FileMetadata) error {
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return fmt.Errorf("repository is closed")
+	}
+	r.mu.RUnlock()
+
+	if len(metadata) == 0 {
+		return nil // Nothing to do
+	}
+
+	// Perform batch update in a single transaction
+	err := r.db.Update(func(txn *badger.Txn) error {
+		for _, m := range metadata {
+			if m == nil || m.FileKey == "" {
+				continue // Skip invalid entries
+			}
+
+			// Serialize metadata
+			data, err := json.Marshal(m)
+			if err != nil {
+				return fmt.Errorf("failed to serialize metadata for %s: %w", m.FileKey, err)
+			}
+
+			// Get old metadata to update indexes
+			oldMetadata, _ := r.getMetadataInTxn(txn, m.FileKey)
+
+			// Write primary data
+			key := r.buildKey(m.FileKey)
+			if err := txn.Set(key, data); err != nil {
+				return err
+			}
+
+			// Update secondary indexes if status changed or this is a new file
+			if oldMetadata == nil || oldMetadata.Status != m.Status ||
+				!r.equalAvailableTime(oldMetadata.AvailableForProcessingAt, m.AvailableForProcessingAt) {
+				// Delete old status index if exists
+				if oldMetadata != nil {
+					oldIndexKey := r.buildStatusIndexKey(oldMetadata)
+					_ = txn.Delete(oldIndexKey)
+				}
+				// Add new status index
+				newIndexKey := r.buildStatusIndexKey(m)
+				if err := txn.Set(newIndexKey, []byte(m.FileKey)); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to batch update metadata: %w", err)
+	}
+
+	// Update cache after successful transaction
+	for _, m := range metadata {
+		if m == nil || m.FileKey == "" {
+			continue
+		}
+		if r.isActiveStatus(m.Status) {
+			r.cache.set(m.FileKey, m)
+		} else {
+			r.cache.delete(m.FileKey)
+		}
 	}
 
 	return nil
@@ -215,7 +360,7 @@ func (r *BadgerMetadataRepository) Get(ctx context.Context, fileKey string) (*co
 	return metadata, nil
 }
 
-// Delete removes file metadata.
+// Delete removes file metadata and its secondary indexes.
 func (r *BadgerMetadataRepository) Delete(ctx context.Context, fileKey string) error {
 	r.mu.RLock()
 	if r.closed {
@@ -228,8 +373,16 @@ func (r *BadgerMetadataRepository) Delete(ctx context.Context, fileKey string) e
 		return fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	// Delete from BadgerDB
+	// Delete from BadgerDB including indexes
 	err := r.db.Update(func(txn *badger.Txn) error {
+		// Get metadata first to delete index
+		metadata, _ := r.getMetadataInTxn(txn, fileKey)
+		if metadata != nil {
+			indexKey := r.buildStatusIndexKey(metadata)
+			_ = txn.Delete(indexKey)
+		}
+
+		// Delete primary data
 		key := r.buildKey(fileKey)
 		return txn.Delete(key)
 	})
@@ -244,7 +397,54 @@ func (r *BadgerMetadataRepository) Delete(ctx context.Context, fileKey string) e
 	return nil
 }
 
+// DeleteBatch removes multiple file metadata atomically in a single transaction.
+func (r *BadgerMetadataRepository) DeleteBatch(ctx context.Context, fileKeys []string) error {
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return fmt.Errorf("repository is closed")
+	}
+	r.mu.RUnlock()
+
+	if len(fileKeys) == 0 {
+		return nil // Nothing to do
+	}
+
+	// Perform batch delete in a single transaction
+	err := r.db.Update(func(txn *badger.Txn) error {
+		for _, fileKey := range fileKeys {
+			if fileKey == "" {
+				continue
+			}
+
+			// Get metadata first to delete index
+			metadata, _ := r.getMetadataInTxn(txn, fileKey)
+			if metadata != nil {
+				indexKey := r.buildStatusIndexKey(metadata)
+				_ = txn.Delete(indexKey)
+			}
+
+			// Delete primary data
+			key := r.buildKey(fileKey)
+			_ = txn.Delete(key)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to batch delete metadata: %w", err)
+	}
+
+	// Remove from cache
+	for _, fileKey := range fileKeys {
+		r.cache.delete(fileKey)
+	}
+
+	return nil
+}
+
 // GetByStatus retrieves files by status with optional limit.
+// Uses secondary index for O(log n) lookup instead of O(n) full scan.
 // tenantID parameter is ignored since this repository is tenant-specific.
 func (r *BadgerMetadataRepository) GetByStatus(ctx context.Context, tenantID string, status core.FileProcessingStatus, limit int) ([]*core.FileMetadata, error) {
 	r.mu.RLock()
@@ -266,39 +466,31 @@ func (r *BadgerMetadataRepository) GetByStatus(ctx context.Context, tenantID str
 		}
 	}
 
-	// Scan BadgerDB
+	// Use secondary index for efficient lookup
 	var results []*core.FileMetadata
 	err := r.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false // We only need keys from index
 		opts.PrefetchSize = 100
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		prefix := r.buildPrefix()
+		// Scan status index: idx:status:{status}:{availableTime}:{fileKey}
+		prefix := r.buildStatusIndexPrefix(status)
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			item := it.Item()
-			err := item.Value(func(val []byte) error {
-				metadata := &core.FileMetadata{}
-				if err := json.Unmarshal(val, metadata); err != nil {
-					return err
-				}
+			// Extract fileKey from index key
+			indexKey := string(it.Item().Key())
+			fileKey := r.extractFileKeyFromIndex(indexKey)
 
-				if metadata.Status == status {
-					results = append(results, metadata)
-					// Check limit
-					if limit > 0 && len(results) >= limit {
-						return nil
-					}
-				}
-
-				return nil
-			})
-
+			// Get actual metadata
+			metadata, err := r.getMetadataInTxn(txn, fileKey)
 			if err != nil {
-				return err
+				continue // Skip if file not found (shouldn't happen)
 			}
 
-			// Break if limit reached
+			results = append(results, metadata)
+
+			// Check limit
 			if limit > 0 && len(results) >= limit {
 				break
 			}
@@ -315,6 +507,7 @@ func (r *BadgerMetadataRepository) GetByStatus(ctx context.Context, tenantID str
 }
 
 // GetPendingFiles retrieves files ready for processing.
+// Uses secondary index for efficient O(log n) lookup.
 // tenantID parameter is ignored since this repository is tenant-specific.
 func (r *BadgerMetadataRepository) GetPendingFiles(ctx context.Context, tenantID string, limit int) ([]*core.FileMetadata, error) {
 	r.mu.RLock()
@@ -329,41 +522,35 @@ func (r *BadgerMetadataRepository) GetPendingFiles(ctx context.Context, tenantID
 
 	err := r.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false // We only need keys from index
 		opts.PrefetchSize = 100
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		prefix := r.buildPrefix()
+		// Scan Pending status index: idx:status:0:{availableTime}:{fileKey}
+		prefix := r.buildStatusIndexPrefix(core.FileStatusPending)
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			item := it.Item()
-			err := item.Value(func(val []byte) error {
-				metadata := &core.FileMetadata{}
-				if err := json.Unmarshal(val, metadata); err != nil {
-					return err
-				}
-
-				// Check if file is ready for processing
-				if metadata.Status == core.FileStatusPending {
-					// Check if available time has passed
-					if metadata.AvailableForProcessingAt == nil || metadata.AvailableForProcessingAt.Before(now) {
-						results = append(results, metadata)
-						// Check limit
-						if limit > 0 && len(results) >= limit {
-							return nil
-						}
-					}
-				}
-
-				return nil
-			})
-
-			if err != nil {
-				return err
+			// Extract fileKey from index
+			indexKey := string(it.Item().Key())
+			fileKey := r.extractFileKeyFromIndex(indexKey)
+			if fileKey == "" {
+				continue
 			}
 
-			// Break if limit reached
-			if limit > 0 && len(results) >= limit {
-				break
+			// Get actual metadata to verify availability
+			metadata, err := r.getMetadataInTxn(txn, fileKey)
+			if err != nil {
+				continue // Skip if file not found
+			}
+
+			// Check if file is ready for processing
+			if metadata.AvailableForProcessingAt == nil || metadata.AvailableForProcessingAt.Before(now) {
+				results = append(results, metadata)
+
+				// Check limit
+				if limit > 0 && len(results) >= limit {
+					break
+				}
 			}
 		}
 
@@ -377,7 +564,7 @@ func (r *BadgerMetadataRepository) GetPendingFiles(ctx context.Context, tenantID
 	return results, nil
 }
 
-// UpdateStatus atomically updates file status.
+// UpdateStatus atomically updates file status and maintains secondary indexes.
 func (r *BadgerMetadataRepository) UpdateStatus(ctx context.Context, fileKey string, newStatus core.FileProcessingStatus) error {
 	r.mu.RLock()
 	if r.closed {
@@ -390,7 +577,7 @@ func (r *BadgerMetadataRepository) UpdateStatus(ctx context.Context, fileKey str
 		return fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	// Update in BadgerDB
+	// Update in BadgerDB with index maintenance
 	var updatedMetadata *core.FileMetadata
 	err := r.db.Update(func(txn *badger.Txn) error {
 		key := r.buildKey(fileKey)
@@ -413,12 +600,24 @@ func (r *BadgerMetadataRepository) UpdateStatus(ctx context.Context, fileKey str
 			return err
 		}
 
+		// Delete old status index if status changed
+		if metadata.Status != newStatus {
+			oldIndexKey := r.buildStatusIndexKey(metadata)
+			_ = txn.Delete(oldIndexKey)
+		}
+
 		// Update status
 		metadata.Status = newStatus
 
 		// Serialize and save
 		data, err := json.Marshal(metadata)
 		if err != nil {
+			return err
+		}
+
+		// Add new status index
+		newIndexKey := r.buildStatusIndexKey(metadata)
+		if err := txn.Set(newIndexKey, []byte(metadata.FileKey)); err != nil {
 			return err
 		}
 
@@ -448,6 +647,7 @@ func (r *BadgerMetadataRepository) UpdateStatus(ctx context.Context, fileKey str
 
 // CompareAndTransitionToProcessing atomically transitions a file to Processing status
 // if and only if it is currently in Pending status.
+// Also updates secondary indexes.
 func (r *BadgerMetadataRepository) CompareAndTransitionToProcessing(ctx context.Context, fileKey string) (*core.FileMetadata, error) {
 	r.mu.RLock()
 	if r.closed {
@@ -494,6 +694,10 @@ func (r *BadgerMetadataRepository) CompareAndTransitionToProcessing(ctx context.
 			return fmt.Errorf("file is not yet available for processing")
 		}
 
+		// Delete old Pending status index
+		oldIndexKey := r.buildStatusIndexKey(metadata)
+		_ = txn.Delete(oldIndexKey)
+
 		// Update to Processing status
 		now := time.Now()
 		metadata.Status = core.FileStatusProcessing
@@ -503,6 +707,12 @@ func (r *BadgerMetadataRepository) CompareAndTransitionToProcessing(ctx context.
 		// Serialize and save
 		data, err := json.Marshal(metadata)
 		if err != nil {
+			return err
+		}
+
+		// Add new Processing status index
+		newIndexKey := r.buildStatusIndexKey(metadata)
+		if err := txn.Set(newIndexKey, []byte(metadata.FileKey)); err != nil {
 			return err
 		}
 
@@ -528,6 +738,7 @@ func (r *BadgerMetadataRepository) CompareAndTransitionToProcessing(ctx context.
 }
 
 // GetTimedOutProcessingFiles retrieves files in Processing status that exceed timeout.
+// Uses secondary index for efficient lookup.
 func (r *BadgerMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) ([]*core.FileMetadata, error) {
 	r.mu.RLock()
 	if r.closed {
@@ -541,34 +752,30 @@ func (r *BadgerMetadataRepository) GetTimedOutProcessingFiles(ctx context.Contex
 
 	err := r.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false // We only need keys from index
 		opts.PrefetchSize = 100
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		prefix := r.buildPrefix()
+		// Scan Processing status index
+		prefix := r.buildStatusIndexPrefix(core.FileStatusProcessing)
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			item := it.Item()
-			err := item.Value(func(val []byte) error {
-				metadata := &core.FileMetadata{}
-				if err := json.Unmarshal(val, metadata); err != nil {
-					return err
-				}
+			// Extract fileKey from index
+			indexKey := string(it.Item().Key())
+			fileKey := r.extractFileKeyFromIndex(indexKey)
 
-				// Check if file is in Processing status and has timed out
-				if metadata.Status == core.FileStatusProcessing {
-					if metadata.ProcessingStartTime != nil {
-						elapsed := now.Sub(*metadata.ProcessingStartTime)
-						if elapsed > timeout {
-							results = append(results, metadata)
-						}
-					}
-				}
-
-				return nil
-			})
-
+			// Get actual metadata
+			metadata, err := r.getMetadataInTxn(txn, fileKey)
 			if err != nil {
-				return err
+				continue // Skip if file not found
+			}
+
+			// Check if processing has timed out
+			if metadata.ProcessingStartTime != nil {
+				elapsed := now.Sub(*metadata.ProcessingStartTime)
+				if elapsed > timeout {
+					results = append(results, metadata)
+				}
 			}
 		}
 
@@ -679,4 +886,107 @@ func (r *BadgerMetadataRepository) runGC() {
 // GetCacheStats returns cache statistics for monitoring.
 func (r *BadgerMetadataRepository) GetCacheStats() map[string]interface{} {
 	return r.cache.getStats()
+}
+
+
+// getMetadataInTxn retrieves metadata within a transaction (no locking).
+func (r *BadgerMetadataRepository) getMetadataInTxn(txn *badger.Txn, fileKey string) (*core.FileMetadata, error) {
+	key := r.buildKey(fileKey)
+	item, err := txn.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	var metadata *core.FileMetadata
+	err = item.Value(func(val []byte) error {
+		metadata = &core.FileMetadata{}
+		return json.Unmarshal(val, metadata)
+	})
+	return metadata, err
+}
+
+// buildStatusIndexKey builds the secondary index key for status.
+// Format: idx:status:{status}:{availableTime}:{fileKey}
+// This allows efficient querying by status and sorting by available time.
+func (r *BadgerMetadataRepository) buildStatusIndexKey(metadata *core.FileMetadata) []byte {
+	var availableTimeStr string
+	if metadata.AvailableForProcessingAt != nil {
+		availableTimeStr = metadata.AvailableForProcessingAt.Format(time.RFC3339Nano)
+	} else {
+		availableTimeStr = "0000-00-00T00:00:00Z" // Sort nil times first
+	}
+	return []byte(fmt.Sprintf("idx:status:%d:%s:%s", metadata.Status, availableTimeStr, metadata.FileKey))
+}
+
+// buildStatusIndexPrefix builds the prefix for scanning by status.
+func (r *BadgerMetadataRepository) buildStatusIndexPrefix(status core.FileProcessingStatus) []byte {
+	return []byte(fmt.Sprintf("idx:status:%d:", status))
+}
+
+// extractFileKeyFromIndex extracts the fileKey from an index key.
+// Index format: idx:status:{status}:{availableTime}:{fileKey}
+// The availableTime is in RFC3339 format which may contain colons.
+// We find the last colon, everything after is the fileKey.
+func (r *BadgerMetadataRepository) extractFileKeyFromIndex(indexKey string) string {
+	// Find the last colon - everything after it is the fileKey
+	lastColon := -1
+	for i := len(indexKey) - 1; i >= 0; i-- {
+		if indexKey[i] == ':' {
+			lastColon = i
+			break
+		}
+	}
+	if lastColon >= 0 && lastColon+1 < len(indexKey) {
+		return indexKey[lastColon+1:]
+	}
+	return ""
+}
+
+// parsePendingIndexKey parses a Pending status index key.
+// Returns availableTime and fileKey.
+func (r *BadgerMetadataRepository) parsePendingIndexKey(indexKey string) (*time.Time, string, error) {
+	// Format: idx:status:0:{availableTime}:{fileKey}
+	const prefix = "idx:status:0:"
+	if !strings.HasPrefix(indexKey, prefix) {
+		return nil, "", fmt.Errorf("invalid pending index key")
+	}
+
+	// Extract available time and fileKey
+	remaining := indexKey[len(prefix):]
+	// Find the separator between availableTime and fileKey (last colon might be in fileKey)
+	// Format: 0000-00-00T00:00:00Z:fileKey
+	idx := strings.Index(remaining, ":")
+	if idx == -1 {
+		return nil, "", fmt.Errorf("invalid index key format")
+	}
+
+	timeStr := remaining[:idx]
+	fileKey := remaining[idx+1:]
+
+	// Parse time
+	var availableTime *time.Time
+	if timeStr != "0000-00-00T00:00:00Z" {
+		t, err := time.Parse(time.RFC3339Nano, timeStr)
+		if err != nil {
+			// Try without nano
+			t, err = time.Parse(time.RFC3339, timeStr)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		availableTime = &t
+	}
+
+	return availableTime, fileKey, nil
+}
+
+// equalAvailableTime compares two time pointers for equality.
+func (r *BadgerMetadataRepository) equalAvailableTime(a, b *time.Time) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Equal(*b)
 }

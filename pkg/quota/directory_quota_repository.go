@@ -11,6 +11,7 @@ import (
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
 )
 
 // BadgerDirectoryQuotaRepositoryOptions configures the BadgerDB quota repository.
@@ -25,6 +26,22 @@ type BadgerDirectoryQuotaRepositoryOptions struct {
 	// GCDiscardRatio is the discard ratio for GC (0.0 - 1.0).
 	// Default: 0.5 (50%)
 	GCDiscardRatio float64
+
+	// MemTableSize is the size of each memtable in bytes.
+	// Default: 16MB for quota
+	MemTableSize int64
+
+	// ValueLogFileSize is the size of each value log file in bytes.
+	// Default: 32MB
+	ValueLogFileSize int64
+
+	// BlockCacheSize is the size of the block cache in bytes.
+	// Default: 32MB for quota
+	BlockCacheSize int64
+
+	// SyncWrites enables synchronous writes. Disable for better performance.
+	// Default: false
+	SyncWrites bool
 }
 
 // badgerDirectoryQuotaRepository implements DirectoryQuotaRepository using BadgerDB.
@@ -59,22 +76,40 @@ func NewBadgerDirectoryQuotaRepository(opts *BadgerDirectoryQuotaRepositoryOptio
 		gcDiscardRatio = 0.5
 	}
 
+	memTableSize := opts.MemTableSize
+	if memTableSize == 0 {
+		memTableSize = 16 << 20 // 16MB default for quota
+	}
+
+	valueLogFileSize := opts.ValueLogFileSize
+	if valueLogFileSize == 0 {
+		valueLogFileSize = 32 << 20 // 32MB default
+	}
+
+	blockCacheSize := opts.BlockCacheSize
+	if blockCacheSize == 0 {
+		blockCacheSize = 32 << 20 // 32MB default for quota
+	}
+
 	// Create database path
 	dbPath := filepath.Join(opts.DataPath, "quota")
 	if err := os.MkdirAll(dbPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create database path: %w", err)
 	}
 
-	// Open BadgerDB
+	// Open BadgerDB with optimized settings for production workloads
 	badgerOpts := badger.DefaultOptions(dbPath).
 		WithLogger(nil). // Disable BadgerDB logging
-		WithMemTableSize(1 << 20).                    // 1MB memtable (default is 64MB)
-		WithValueLogFileSize(1 << 20).                // 1MB value log files (default is 1GB)
-		WithNumMemtables(1).                          // Reduce number of memtables
-		WithNumLevelZeroTables(1).                    // Reduce L0 tables
-		WithNumLevelZeroTablesStall(2).               // Reduce L0 stall threshold
+		WithMemTableSize(memTableSize).
+		WithValueLogFileSize(valueLogFileSize).
+		WithNumMemtables(2).                          // 2 memtables for quota operations
+		WithNumLevelZeroTables(2).                    // 2 L0 tables
+		WithNumLevelZeroTablesStall(4).               // Stall threshold
 		WithValueThreshold(1 << 10).                  // 1KB threshold for value log
-		WithCompression(0)                            // Disable compression for better performance
+		WithCompression(options.Snappy).              // Enable Snappy compression
+		WithBlockCacheSize(blockCacheSize).
+		WithCompactL0OnClose(true).                   // Compact on close
+		WithSyncWrites(opts.SyncWrites)
 
 	db, err := badger.Open(badgerOpts)
 	if err != nil {

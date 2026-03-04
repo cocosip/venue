@@ -75,6 +75,9 @@ type TenantManagerOptionsConfig struct {
 type MetadataOptionsConfig struct {
 	// CacheTTL is the cache time-to-live for metadata
 	CacheTTL time.Duration `json:"cacheTTL" yaml:"cacheTTL" mapstructure:"cacheTTL"`
+
+	// MaxCacheEntries is the maximum number of entries in the metadata cache (0 = use default 10000)
+	MaxCacheEntries int `json:"maxCacheEntries" yaml:"maxCacheEntries" mapstructure:"maxCacheEntries"`
 }
 
 // BadgerDBOptionsConfig defines BadgerDB database configuration.
@@ -84,6 +87,18 @@ type BadgerDBOptionsConfig struct {
 
 	// GCDiscardRatio is the discard ratio for garbage collection (0.0 - 1.0)
 	GCDiscardRatio float64 `json:"gcDiscardRatio" yaml:"gcDiscardRatio" mapstructure:"gcDiscardRatio"`
+
+	// MemTableSize is the size of each memtable in MB (0 = use default 32MB for metadata, 16MB for quota)
+	MemTableSize int `json:"memTableSize" yaml:"memTableSize" mapstructure:"memTableSize"`
+
+	// ValueLogFileSize is the size of each value log file in MB (0 = use default 64MB)
+	ValueLogFileSize int `json:"valueLogFileSize" yaml:"valueLogFileSize" mapstructure:"valueLogFileSize"`
+
+	// BlockCacheSize is the size of the block cache in MB (0 = use default 64MB for metadata, 32MB for quota)
+	BlockCacheSize int `json:"blockCacheSize" yaml:"blockCacheSize" mapstructure:"blockCacheSize"`
+
+	// SyncWrites enables synchronous writes. Disable for better performance (at the cost of durability).
+	SyncWrites bool `json:"syncWrites" yaml:"syncWrites" mapstructure:"syncWrites"`
 }
 
 // RetryPolicyConfig defines the retry policy for failed operations.
@@ -114,6 +129,9 @@ type VolumeConfig struct {
 
 	// ShardingDepth is the depth of directory sharding (0-3)
 	ShardingDepth int `json:"shardingDepth" yaml:"shardingDepth" mapstructure:"shardingDepth"`
+
+	// EnableFsync enables fsync after file writes for durability. Disable for better performance.
+	EnableFsync bool `json:"enableFsync" yaml:"enableFsync" mapstructure:"enableFsync"`
 }
 
 // TenantConfig represents a tenant configuration.
@@ -247,11 +265,16 @@ func DefaultConfig() *Config {
 			CacheTTL:     5 * time.Minute, // Default cache TTL
 		},
 		MetadataOptions: MetadataOptionsConfig{
-			CacheTTL: 5 * time.Minute, // Default cache TTL
+			CacheTTL:        5 * time.Minute, // Default cache TTL
+			MaxCacheEntries: 10000,           // Default max cache entries
 		},
 		BadgerDBOptions: BadgerDBOptionsConfig{
-			GCInterval:     10 * time.Minute, // Default GC interval
-			GCDiscardRatio: 0.5,              // Default discard ratio
+			GCInterval:       10 * time.Minute, // Default GC interval
+			GCDiscardRatio:   0.5,              // Default discard ratio
+			MemTableSize:     32,               // 32MB default for metadata
+			ValueLogFileSize: 64,               // 64MB default
+			BlockCacheSize:   64,               // 64MB default for metadata
+			SyncWrites:       false,            // Async writes for better performance
 		},
 		Volumes: []VolumeConfig{
 			{
@@ -299,6 +322,31 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.FileWatcherConfigurationDirectory == "" {
 		c.FileWatcherConfigurationDirectory = defaults.FileWatcherConfigurationDirectory
+	}
+
+	// Apply MetadataOptions defaults
+	if c.MetadataOptions.CacheTTL == 0 {
+		c.MetadataOptions.CacheTTL = defaults.MetadataOptions.CacheTTL
+	}
+	if c.MetadataOptions.MaxCacheEntries == 0 {
+		c.MetadataOptions.MaxCacheEntries = defaults.MetadataOptions.MaxCacheEntries
+	}
+
+	// Apply BadgerDBOptions defaults
+	if c.BadgerDBOptions.GCInterval == 0 {
+		c.BadgerDBOptions.GCInterval = defaults.BadgerDBOptions.GCInterval
+	}
+	if c.BadgerDBOptions.GCDiscardRatio == 0 {
+		c.BadgerDBOptions.GCDiscardRatio = defaults.BadgerDBOptions.GCDiscardRatio
+	}
+	if c.BadgerDBOptions.MemTableSize == 0 {
+		c.BadgerDBOptions.MemTableSize = defaults.BadgerDBOptions.MemTableSize
+	}
+	if c.BadgerDBOptions.ValueLogFileSize == 0 {
+		c.BadgerDBOptions.ValueLogFileSize = defaults.BadgerDBOptions.ValueLogFileSize
+	}
+	if c.BadgerDBOptions.BlockCacheSize == 0 {
+		c.BadgerDBOptions.BlockCacheSize = defaults.BadgerDBOptions.BlockCacheSize
 	}
 
 	// Apply RetryPolicy defaults

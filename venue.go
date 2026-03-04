@@ -137,11 +137,16 @@ func (v *Venue) initialize() error {
 	// 2. Initialize metadata repository
 	v.logger.Info("Initializing metadata repository")
 	metaRepo, err := metadata.NewBadgerMetadataRepository(&metadata.BadgerRepositoryOptions{
-		TenantID:       "shared", // Multi-tenant repository
-		DataPath:       v.config.MetadataDirectory,
-		CacheTTL:       v.config.MetadataOptions.CacheTTL,
-		GCInterval:     v.config.BadgerDBOptions.GCInterval,
-		GCDiscardRatio: v.config.BadgerDBOptions.GCDiscardRatio,
+		TenantID:         "shared", // Multi-tenant repository
+		DataPath:         v.config.MetadataDirectory,
+		CacheTTL:         v.config.MetadataOptions.CacheTTL,
+		MaxCacheEntries:  v.config.MetadataOptions.MaxCacheEntries,
+		GCInterval:       v.config.BadgerDBOptions.GCInterval,
+		GCDiscardRatio:   v.config.BadgerDBOptions.GCDiscardRatio,
+		MemTableSize:     int64(v.config.BadgerDBOptions.MemTableSize) << 20,
+		ValueLogFileSize: int64(v.config.BadgerDBOptions.ValueLogFileSize) << 20,
+		BlockCacheSize:   int64(v.config.BadgerDBOptions.BlockCacheSize) << 20,
+		SyncWrites:       v.config.BadgerDBOptions.SyncWrites,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create metadata repository: %w", err)
@@ -171,9 +176,13 @@ func (v *Venue) initialize() error {
 	}
 
 	dirQuotaRepo, err := quota.NewBadgerDirectoryQuotaRepository(&quota.BadgerDirectoryQuotaRepositoryOptions{
-		DataPath:       v.config.QuotaDirectory,
-		GCInterval:     v.config.BadgerDBOptions.GCInterval,
-		GCDiscardRatio: v.config.BadgerDBOptions.GCDiscardRatio,
+		DataPath:         v.config.QuotaDirectory,
+		GCInterval:       v.config.BadgerDBOptions.GCInterval,
+		GCDiscardRatio:   v.config.BadgerDBOptions.GCDiscardRatio,
+		MemTableSize:     int64(v.config.BadgerDBOptions.MemTableSize/2) << 20, // Half size for quota
+		ValueLogFileSize: int64(v.config.BadgerDBOptions.ValueLogFileSize/2) << 20,
+		BlockCacheSize:   int64(v.config.BadgerDBOptions.BlockCacheSize/2) << 20,
+		SyncWrites:       v.config.BadgerDBOptions.SyncWrites,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create directory quota repository: %w", err)
@@ -198,10 +207,11 @@ func (v *Venue) initialize() error {
 		case "LocalFileSystem", "":
 			// Default to LocalFileSystem if not specified
 			vol, err = volume.NewLocalFileSystemVolume(&volume.LocalFileSystemVolumeOptions{
-				VolumeID:   volConfig.VolumeId,
-				VolumeType: volConfig.VolumeType,
-				MountPath:  volConfig.MountPath,
-				ShardDepth: volConfig.ShardingDepth,
+				VolumeID:    volConfig.VolumeId,
+				VolumeType:  volConfig.VolumeType,
+				MountPath:   volConfig.MountPath,
+				ShardDepth:  volConfig.ShardingDepth,
+				EnableFsync: volConfig.EnableFsync,
 			})
 		default:
 			return fmt.Errorf("unsupported volume type %s for volume %s", volConfig.VolumeType, volConfig.VolumeId)

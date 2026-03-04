@@ -28,14 +28,19 @@ type LocalFileSystemVolumeOptions struct {
 	// 2 = two levels (ab/cd/file)
 	// 3 = three levels (ab/cd/ef/file)
 	ShardDepth int
+
+	// EnableFsync enables fsync after file writes for durability.
+	// Disable for better write performance at the cost of durability.
+	EnableFsync bool
 }
 
 // LocalFileSystemVolume implements StorageVolume for local filesystem.
 type LocalFileSystemVolume struct {
-	volumeID   string
-	mountPath  string
-	shardDepth int
-	sanitizer  *PathSanitizer
+	volumeID    string
+	mountPath   string
+	shardDepth  int
+	enableFsync bool
+	sanitizer   *PathSanitizer
 }
 
 // NewLocalFileSystemVolume creates a new local file system volume.
@@ -67,10 +72,11 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 	}
 
 	return &LocalFileSystemVolume{
-		volumeID:   opts.VolumeID,
-		mountPath:  opts.MountPath,
-		shardDepth: opts.ShardDepth,
-		sanitizer:  NewPathSanitizer(opts.MountPath),
+		volumeID:    opts.VolumeID,
+		mountPath:   opts.MountPath,
+		shardDepth:  opts.ShardDepth,
+		enableFsync: opts.EnableFsync,
+		sanitizer:   NewPathSanitizer(opts.MountPath),
 	}, nil
 }
 
@@ -138,9 +144,12 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 		return 0, fmt.Errorf("failed to write file content: %w", err)
 	}
 
-	// Sync to disk
-	if err := file.Sync(); err != nil {
-		return written, fmt.Errorf("failed to sync file: %w", err)
+	// Sync to disk if enabled (for durability)
+	// Note: Full sync can be expensive for high-throughput scenarios.
+	if v.enableFsync {
+		if err := file.Sync(); err != nil {
+			return written, fmt.Errorf("failed to sync file: %w", err)
+		}
 	}
 
 	return written, nil

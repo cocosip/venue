@@ -38,6 +38,8 @@ venue:
   metadataOptions:
     # Cache time-to-live for metadata
     cacheTTL: 5m
+    # Maximum number of entries in the metadata cache (0 = default 10000)
+    maxCacheEntries: 10000
 
   # BadgerDB database configuration (applies to all BadgerDB databases)
   badgerDBOptions:
@@ -45,6 +47,14 @@ venue:
     gcInterval: 10m
     # Garbage collection discard ratio (0.0 - 1.0)
     gcDiscardRatio: 0.5
+    # MemTable size in MB (0 = default 32MB for metadata, 16MB for quota)
+    memTableSize: 32
+    # Value log file size in MB (0 = default 64MB)
+    valueLogFileSize: 64
+    # Block cache size in MB (0 = default 64MB for metadata, 32MB for quota)
+    blockCacheSize: 64
+    # Enable synchronous writes (true = durable but slower, false = faster)
+    syncWrites: false
 
   # Storage volumes configuration
   volumes:
@@ -52,11 +62,14 @@ venue:
       mountPath: ./venue-data/storage/volume-1
       volumeType: LocalFileSystem
       shardingDepth: 2
+      # Enable fsync after file writes (true = durable but slower)
+      enableFsync: false
 
     - volumeId: vol-002
       mountPath: ./venue-data/storage/volume-2
       volumeType: LocalFileSystem
       shardingDepth: 2
+      enableFsync: false
 
   # Tenant configurations
   tenants:
