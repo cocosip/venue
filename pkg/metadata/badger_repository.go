@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -788,6 +789,33 @@ func (r *BadgerMetadataRepository) GetTimedOutProcessingFiles(ctx context.Contex
 	return results, nil
 }
 
+// Optimize triggers BadgerDB garbage collection to reclaim disk space.
+func (r *BadgerMetadataRepository) Optimize(ctx context.Context) error {
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return fmt.Errorf("repository is closed")
+	}
+	r.mu.RUnlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		err := r.db.RunValueLogGC(r.gcDiscardRatio)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, badger.ErrNoRewrite) {
+			return nil
+		}
+		return fmt.Errorf("failed to optimize BadgerDB: %w", err)
+	}
+}
+
 // Close closes the repository and releases resources.
 func (r *BadgerMetadataRepository) Close() error {
 	r.mu.Lock()
@@ -860,21 +888,7 @@ func (r *BadgerMetadataRepository) startGC() {
 
 // runGC runs BadgerDB garbage collection.
 func (r *BadgerMetadataRepository) runGC() {
-	r.mu.RLock()
-	if r.closed {
-		r.mu.RUnlock()
-		return
-	}
-	r.mu.RUnlock()
-
-	// Run GC until no more rewriting is needed
-	for {
-		err := r.db.RunValueLogGC(r.gcDiscardRatio)
-		if err != nil {
-			// No more GC needed or error occurred
-			break
-		}
-	}
+	_ = r.Optimize(context.Background())
 }
 
 // GetCacheStats returns cache statistics for monitoring.

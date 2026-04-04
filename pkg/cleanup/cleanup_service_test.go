@@ -3,6 +3,7 @@ package cleanup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -315,9 +316,194 @@ func TestCleanupEmptyDirectories(t *testing.T) {
 			t.Error("Expected non-empty directory to still exist")
 		}
 	})
+
+	t.Run("Preserve system managed directories", func(t *testing.T) {
+		vol := volumes["test-volume"]
+
+		tenantRoot := filepath.Join(vol.MountPath(), "tenant-system")
+		dateDir := filepath.Join(tenantRoot, "2026", "04", "04")
+		hourDir := filepath.Join(dateDir, "15")
+		shardDir := filepath.Join(vol.MountPath(), "ab", "cd", "ef")
+		customEmptyDir := filepath.Join(tenantRoot, "custom-empty")
+
+		_ = os.MkdirAll(hourDir, 0755)
+		_ = os.MkdirAll(shardDir, 0755)
+		_ = os.MkdirAll(customEmptyDir, 0755)
+
+		stats, err := service.CleanupEmptyDirectories(ctx)
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		if stats.EmptyDirectoriesRemoved == 0 {
+			t.Error("Expected at least one non-system empty directory to be removed")
+		}
+
+		if _, err := os.Stat(vol.MountPath()); err != nil {
+			t.Fatalf("Expected mount path to remain, got %v", err)
+		}
+
+		if _, err := os.Stat(tenantRoot); err != nil {
+			t.Fatalf("Expected tenant root to remain, got %v", err)
+		}
+
+		if _, err := os.Stat(dateDir); err != nil {
+			t.Fatalf("Expected date-based system directory to remain, got %v", err)
+		}
+
+		if _, err := os.Stat(hourDir); err != nil {
+			t.Fatalf("Expected hour-based system directory to remain, got %v", err)
+		}
+
+		if _, err := os.Stat(shardDir); err != nil {
+			t.Fatalf("Expected shard directory to remain, got %v", err)
+		}
+
+		if _, err := os.Stat(customEmptyDir); !os.IsNotExist(err) {
+			t.Fatalf("Expected custom empty directory to be removed, got %v", err)
+		}
+	})
+}
+
+func TestOptimizeDatabases(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Optimize metadata and quota repositories", func(t *testing.T) {
+		metaRepo := &stubMetadataRepository{}
+		quotaRepo := &stubDirectoryQuotaRepository{}
+
+		service := &cleanupService{
+			metadataRepo: metaRepo,
+			dirQuotaRepo: quotaRepo,
+		}
+
+		stats, err := service.OptimizeDatabases(ctx)
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		if stats.MetadataDatabasesOptimized != 1 {
+			t.Fatalf("Expected metadata optimization count 1, got %d", stats.MetadataDatabasesOptimized)
+		}
+
+		if stats.QuotaDatabasesOptimized != 1 {
+			t.Fatalf("Expected quota optimization count 1, got %d", stats.QuotaDatabasesOptimized)
+		}
+
+		if metaRepo.optimizeCalls != 1 {
+			t.Fatalf("Expected metadata optimize to be called once, got %d", metaRepo.optimizeCalls)
+		}
+
+		if quotaRepo.optimizeCalls != 1 {
+			t.Fatalf("Expected quota optimize to be called once, got %d", quotaRepo.optimizeCalls)
+		}
+	})
+
+	t.Run("Stop when metadata optimization fails", func(t *testing.T) {
+		metaRepo := &stubMetadataRepository{optimizeErr: errors.New("metadata optimize failed")}
+		quotaRepo := &stubDirectoryQuotaRepository{}
+
+		service := &cleanupService{
+			metadataRepo: metaRepo,
+			dirQuotaRepo: quotaRepo,
+		}
+
+		_, err := service.OptimizeDatabases(ctx)
+		if err == nil {
+			t.Fatal("Expected error, got nil")
+		}
+
+		if quotaRepo.optimizeCalls != 0 {
+			t.Fatalf("Expected quota optimize not to run after metadata failure, got %d", quotaRepo.optimizeCalls)
+		}
+	})
 }
 
 // Helper functions
+
+type stubMetadataRepository struct {
+	optimizeCalls int
+	optimizeErr   error
+}
+
+func (r *stubMetadataRepository) AddOrUpdate(ctx context.Context, metadata *core.FileMetadata) error {
+	return nil
+}
+
+func (r *stubMetadataRepository) AddOrUpdateBatch(ctx context.Context, metadata []*core.FileMetadata) error {
+	return nil
+}
+
+func (r *stubMetadataRepository) Get(ctx context.Context, fileKey string) (*core.FileMetadata, error) {
+	return nil, core.ErrFileNotFound
+}
+
+func (r *stubMetadataRepository) Delete(ctx context.Context, fileKey string) error {
+	return nil
+}
+
+func (r *stubMetadataRepository) DeleteBatch(ctx context.Context, fileKeys []string) error {
+	return nil
+}
+
+func (r *stubMetadataRepository) GetByStatus(ctx context.Context, tenantID string, status core.FileProcessingStatus, limit int) ([]*core.FileMetadata, error) {
+	return nil, nil
+}
+
+func (r *stubMetadataRepository) GetPendingFiles(ctx context.Context, tenantID string, limit int) ([]*core.FileMetadata, error) {
+	return nil, nil
+}
+
+func (r *stubMetadataRepository) UpdateStatus(ctx context.Context, fileKey string, newStatus core.FileProcessingStatus) error {
+	return nil
+}
+
+func (r *stubMetadataRepository) CompareAndTransitionToProcessing(ctx context.Context, fileKey string) (*core.FileMetadata, error) {
+	return nil, core.ErrFileNotFound
+}
+
+func (r *stubMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) ([]*core.FileMetadata, error) {
+	return nil, nil
+}
+
+func (r *stubMetadataRepository) Optimize(ctx context.Context) error {
+	r.optimizeCalls++
+	return r.optimizeErr
+}
+
+func (r *stubMetadataRepository) Close() error {
+	return nil
+}
+
+type stubDirectoryQuotaRepository struct {
+	optimizeCalls int
+	optimizeErr   error
+}
+
+func (r *stubDirectoryQuotaRepository) GetOrCreate(ctx context.Context, directoryPath string) (*core.DirectoryQuota, error) {
+	return &core.DirectoryQuota{DirectoryPath: directoryPath}, nil
+}
+
+func (r *stubDirectoryQuotaRepository) Update(ctx context.Context, quota *core.DirectoryQuota) error {
+	return nil
+}
+
+func (r *stubDirectoryQuotaRepository) IncrementCount(ctx context.Context, directoryPath string) error {
+	return nil
+}
+
+func (r *stubDirectoryQuotaRepository) DecrementCount(ctx context.Context, directoryPath string) error {
+	return nil
+}
+
+func (r *stubDirectoryQuotaRepository) Optimize(ctx context.Context) error {
+	r.optimizeCalls++
+	return r.optimizeErr
+}
+
+func (r *stubDirectoryQuotaRepository) Close() error {
+	return nil
+}
 
 func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 	tmpDir, err := os.MkdirTemp("", "cleanup-test-*")

@@ -276,12 +276,19 @@ func (s *BackgroundCleanupService) executeCleanup() {
 	// 4. Optimize databases (if enough time has passed)
 	if s.optimizeDatabases && s.shouldOptimizeDatabases() {
 		s.logger.Info("Starting database optimization")
-		// Note: Database optimization is not yet implemented in CleanupService interface
-		// This is a placeholder for future implementation
-		s.mu.Lock()
-		s.lastOptimizationTime = time.Now()
-		s.mu.Unlock()
-		s.logger.Info("Database optimization completed")
+		stats, err := s.cleanupService.OptimizeDatabases(s.ctx)
+		if err != nil {
+			s.logger.Error("Failed to optimize databases", "error", err)
+		} else {
+			totalStats.MetadataDatabasesOptimized += stats.MetadataDatabasesOptimized
+			totalStats.QuotaDatabasesOptimized += stats.QuotaDatabasesOptimized
+			s.mu.Lock()
+			s.lastOptimizationTime = time.Now()
+			s.mu.Unlock()
+			s.logger.Info("Database optimization completed",
+				"metadata_databases", stats.MetadataDatabasesOptimized,
+				"quota_databases", stats.QuotaDatabasesOptimized)
+		}
 	}
 
 	duration := time.Since(startTime)
@@ -290,6 +297,8 @@ func (s *BackgroundCleanupService) executeCleanup() {
 		"empty_dirs_removed", totalStats.EmptyDirectoriesRemoved,
 		"timed_out_reset", totalStats.TimedOutFilesReset,
 		"failed_removed", totalStats.PermanentlyFailedFilesRemoved,
+		"metadata_databases_optimized", totalStats.MetadataDatabasesOptimized,
+		"quota_databases_optimized", totalStats.QuotaDatabasesOptimized,
 		"space_freed_bytes", totalStats.SpaceFreed)
 }
 

@@ -15,6 +15,7 @@ type mockCleanupService struct {
 	cleanupTimedOutFilesCalled    atomic.Int32
 	cleanupFailedFilesCalled      atomic.Int32
 	cleanupOrphanedMetadataCalled atomic.Int32
+	optimizeDatabasesCalled       atomic.Int32
 }
 
 func (m *mockCleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.CleanupStatistics, error) {
@@ -35,6 +36,14 @@ func (m *mockCleanupService) CleanupPermanentlyFailedFiles(ctx context.Context) 
 func (m *mockCleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.CleanupStatistics, error) {
 	m.cleanupOrphanedMetadataCalled.Add(1)
 	return &core.CleanupStatistics{OrphanedMetadataRemoved: 1}, nil
+}
+
+func (m *mockCleanupService) OptimizeDatabases(ctx context.Context) (*core.CleanupStatistics, error) {
+	m.optimizeDatabasesCalled.Add(1)
+	return &core.CleanupStatistics{
+		MetadataDatabasesOptimized: 1,
+		QuotaDatabasesOptimized:    1,
+	}, nil
 }
 
 func TestNewBackgroundCleanupService(t *testing.T) {
@@ -310,5 +319,9 @@ func TestBackgroundCleanupService_DatabaseOptimization(t *testing.T) {
 	// Verify lastOptimizationTime is set
 	if bgSvc.lastOptimizationTime.IsZero() {
 		t.Error("lastOptimizationTime should be set after optimization")
+	}
+
+	if mockSvc.optimizeDatabasesCalled.Load() < 1 {
+		t.Error("OptimizeDatabases should have been called at least once")
 	}
 }

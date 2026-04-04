@@ -231,6 +231,9 @@ type CleanupService interface {
 
 	// CleanupOrphanedMetadata removes metadata for files that no longer exist physically.
 	CleanupOrphanedMetadata(ctx context.Context) (*CleanupStatistics, error)
+
+	// OptimizeDatabases triggers database space reclamation and compaction work.
+	OptimizeDatabases(ctx context.Context) (*CleanupStatistics, error)
 }
 
 // MetadataRepository manages file metadata storage with caching.
@@ -273,6 +276,9 @@ type MetadataRepository interface {
 	// GetTimedOutProcessingFiles retrieves files in Processing status that exceed timeout.
 	GetTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) ([]*FileMetadata, error)
 
+	// Optimize triggers repository-level garbage collection / compaction work.
+	Optimize(ctx context.Context) error
+
 	// Close closes the repository and releases all resources.
 	Close() error
 }
@@ -290,6 +296,9 @@ type DirectoryQuotaRepository interface {
 
 	// DecrementCount atomically decrements the file count.
 	DecrementCount(ctx context.Context, directoryPath string) error
+
+	// Optimize triggers repository-level garbage collection / compaction work.
+	Optimize(ctx context.Context) error
 
 	// Close closes the repository and releases all resources.
 	Close() error

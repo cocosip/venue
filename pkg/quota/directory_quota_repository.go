@@ -3,6 +3,7 @@ package quota
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -351,6 +352,33 @@ func (r *badgerDirectoryQuotaRepository) DecrementCount(ctx context.Context, dir
 	return nil
 }
 
+// Optimize triggers BadgerDB garbage collection to reclaim disk space.
+func (r *badgerDirectoryQuotaRepository) Optimize(ctx context.Context) error {
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return fmt.Errorf("repository is closed")
+	}
+	r.mu.RUnlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		err := r.db.RunValueLogGC(r.gcDiscardRatio)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, badger.ErrNoRewrite) {
+			return nil
+		}
+		return fmt.Errorf("failed to optimize BadgerDB: %w", err)
+	}
+}
+
 // Close closes the repository and releases resources.
 func (r *badgerDirectoryQuotaRepository) Close() error {
 	r.mu.Lock()
@@ -401,19 +429,5 @@ func (r *badgerDirectoryQuotaRepository) startGC() {
 
 // runGC runs BadgerDB garbage collection.
 func (r *badgerDirectoryQuotaRepository) runGC() {
-	r.mu.RLock()
-	if r.closed {
-		r.mu.RUnlock()
-		return
-	}
-	r.mu.RUnlock()
-
-	// Run GC until no more rewriting is needed
-	for {
-		err := r.db.RunValueLogGC(r.gcDiscardRatio)
-		if err != nil {
-			// No more GC needed or error occurred
-			break
-		}
-	}
+	_ = r.Optimize(context.Background())
 }

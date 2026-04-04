@@ -296,6 +296,12 @@ type CleanupStatistics struct {
 	// OrphanedMetadataRemoved is the number of orphaned metadata records removed.
 	OrphanedMetadataRemoved int
 
+	// MetadataDatabasesOptimized is the number of metadata databases optimized.
+	MetadataDatabasesOptimized int
+
+	// QuotaDatabasesOptimized is the number of quota databases optimized.
+	QuotaDatabasesOptimized int
+
 	// SpaceFreed is the total space freed in bytes.
 	SpaceFreed int64
 }

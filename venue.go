@@ -265,6 +265,7 @@ func (v *Venue) initialize() error {
 		Volumes:                  v.volumes,
 		TenantQuotaManager:       v.tenantQuotaManager,
 		DirectoryQuotaManager:    v.dirQuotaManager,
+		DirectoryQuotaRepository: dirQuotaRepo,
 		DefaultProcessingTimeout: v.config.CleanupOptions.ProcessingTimeout,
 	})
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,10 @@ type CleanupServiceOptions struct {
 	// Optional: used to decrement counts when deleting files.
 	DirectoryQuotaManager core.DirectoryQuotaManager
 
+	// DirectoryQuotaRepository stores directory quota data.
+	// Optional: used for database optimization.
+	DirectoryQuotaRepository core.DirectoryQuotaRepository
+
 	// DefaultProcessingTimeout is the default timeout for processing files.
 	// Default: 30 minutes
 	DefaultProcessingTimeout time.Duration
@@ -42,6 +47,7 @@ type cleanupService struct {
 	volumes                  map[string]core.StorageVolume
 	tenantQuotaMgr           core.TenantQuotaManager
 	dirQuotaMgr              core.DirectoryQuotaManager
+	dirQuotaRepo             core.DirectoryQuotaRepository
 	defaultProcessingTimeout time.Duration
 	mu                       sync.RWMutex
 }
@@ -75,6 +81,7 @@ func NewCleanupService(opts *CleanupServiceOptions) (core.CleanupService, error)
 		volumes:                  opts.Volumes,
 		tenantQuotaMgr:           opts.TenantQuotaManager,
 		dirQuotaMgr:              opts.DirectoryQuotaManager,
+		dirQuotaRepo:             opts.DirectoryQuotaRepository,
 		defaultProcessingTimeout: defaultTimeout,
 	}, nil
 }
@@ -108,7 +115,8 @@ func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume co
 	mountPath := volume.MountPath()
 	removed := 0
 
-	// Walk the directory tree bottom-up
+	// Walk the directory tree and remove only non-system empty directories.
+	// Parent directories may become removable on a later cleanup pass.
 	err := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Skip errors
@@ -118,8 +126,8 @@ func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume co
 			return nil // Skip files
 		}
 
-		if path == mountPath {
-			return nil // Don't remove the mount point
+		if isProtectedSystemDirectory(mountPath, path) {
+			return nil // Preserve mount path and system-managed directory structure
 		}
 
 		// Check if directory is empty
@@ -143,6 +151,117 @@ func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume co
 	}
 
 	return removed, nil
+}
+
+func isProtectedSystemDirectory(mountPath string, path string) bool {
+	cleanMountPath := filepath.Clean(mountPath)
+	cleanPath := filepath.Clean(path)
+
+	if cleanPath == cleanMountPath {
+		return true
+	}
+
+	relativePath, err := filepath.Rel(cleanMountPath, cleanPath)
+	if err != nil {
+		return true
+	}
+
+	if relativePath == "." {
+		return true
+	}
+
+	parts := strings.Split(filepath.ToSlash(relativePath), "/")
+	if len(parts) == 0 {
+		return true
+	}
+
+	// The first level under the volume mount is system-managed in Venue.
+	// With the default generators this is the tenant directory, and with
+	// sharded storage it can also be the first shard directory.
+	if len(parts) == 1 {
+		return true
+	}
+
+	return isProtectedDateHierarchy(parts) || isProtectedShardHierarchy(parts)
+}
+
+func isProtectedDateHierarchy(parts []string) bool {
+	if len(parts) < 2 || len(parts) > 5 {
+		return false
+	}
+
+	if !isNDigits(parts[1], 4) {
+		return false
+	}
+
+	if len(parts) >= 3 && !isNumericRange(parts[2], 2, 1, 12) {
+		return false
+	}
+
+	if len(parts) >= 4 && !isNumericRange(parts[3], 2, 1, 31) {
+		return false
+	}
+
+	if len(parts) == 5 && !isNumericRange(parts[4], 2, 0, 23) {
+		return false
+	}
+
+	return true
+}
+
+func isProtectedShardHierarchy(parts []string) bool {
+	if len(parts) < 2 || len(parts) > 3 {
+		return false
+	}
+
+	for _, part := range parts {
+		if !isLowerHexByte(part) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isNDigits(value string, width int) bool {
+	if len(value) != width {
+		return false
+	}
+
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isNumericRange(value string, width int, min int, max int) bool {
+	if !isNDigits(value, width) {
+		return false
+	}
+
+	number := 0
+	for _, r := range value {
+		number = number*10 + int(r-'0')
+	}
+
+	return number >= min && number <= max
+}
+
+func isLowerHexByte(value string) bool {
+	if len(value) != 2 {
+		return false
+	}
+
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+
+	return true
 }
 
 // CleanupTimedOutProcessingFiles resets files that have been in Processing status too long.
@@ -254,6 +373,25 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 				stats.OrphanedMetadataRemoved++
 			}
 		}
+	}
+
+	return stats, nil
+}
+
+// OptimizeDatabases triggers repository-level garbage collection / compaction work.
+func (s *cleanupService) OptimizeDatabases(ctx context.Context) (*core.CleanupStatistics, error) {
+	stats := &core.CleanupStatistics{}
+
+	if err := s.metadataRepo.Optimize(ctx); err != nil {
+		return stats, fmt.Errorf("failed to optimize metadata repository: %w", err)
+	}
+	stats.MetadataDatabasesOptimized++
+
+	if s.dirQuotaRepo != nil {
+		if err := s.dirQuotaRepo.Optimize(ctx); err != nil {
+			return stats, fmt.Errorf("failed to optimize directory quota repository: %w", err)
+		}
+		stats.QuotaDatabasesOptimized++
 	}
 
 	return stats, nil
