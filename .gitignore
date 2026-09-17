@@ -51,3 +51,6 @@ CHANGELOG.md
 
 # Docker
 .dockerignore.bak
+.kilo/
+docs/superpowers/
+.superpowers/
