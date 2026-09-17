@@ -25,6 +25,55 @@ func TestCleanupServiceIntegration(t *testing.T) {
 	system := setupFullSystem(t)
 	defer cleanupSystem(system)
 
+	t.Run("Completed files are retained until completed cleanup", func(t *testing.T) {
+		tenantCtx, err := system.tenantManager.GetTenant(ctx, "test-tenant")
+		if err != nil {
+			t.Fatalf("get tenant: %v", err)
+		}
+		fileName := "completed-cleanup.txt"
+		fileKey, err := system.storagePool.WriteFile(ctx, tenantCtx, bytes.NewReader([]byte("completed payload")), &fileName)
+		if err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		location, err := system.storagePool.GetNextFileForProcessing(ctx, tenantCtx)
+		if err != nil {
+			t.Fatalf("claim file: %v", err)
+		}
+		if location.FileKey != fileKey || location.Lease == nil {
+			t.Fatalf("claim = %#v, want leased file %s", location, fileKey)
+		}
+		if err := system.storagePool.MarkAsCompleted(ctx, *location.Lease); err != nil {
+			t.Fatalf("complete file: %v", err)
+		}
+
+		completed, err := system.metadataRepo.Get(ctx, tenantCtx.ID, fileKey)
+		if err != nil {
+			t.Fatalf("get completed metadata: %v", err)
+		}
+		if completed.Status != core.FileStatusCompleted || completed.CompletedAt == nil {
+			t.Fatalf("completed metadata = status %s completedAt %v", completed.Status, completed.CompletedAt)
+		}
+		exists, err := system.volumes[completed.VolumeID].FileExists(ctx, completed.PhysicalPath)
+		if err != nil || !exists {
+			t.Fatalf("completed physical file exists = %v, error = %v", exists, err)
+		}
+
+		stats, err := system.cleanupService.CleanupCompletedFiles(ctx, 0)
+		if err != nil {
+			t.Fatalf("cleanup completed files: %v", err)
+		}
+		if stats.CompletedRecordsRemoved != 1 {
+			t.Errorf("completed records removed = %d, want 1", stats.CompletedRecordsRemoved)
+		}
+		if _, err := system.metadataRepo.Get(ctx, tenantCtx.ID, fileKey); err != core.ErrFileNotFound {
+			t.Errorf("completed metadata lookup error = %v, want ErrFileNotFound", err)
+		}
+		exists, err = system.volumes[completed.VolumeID].FileExists(ctx, completed.PhysicalPath)
+		if err != nil || exists {
+			t.Errorf("completed physical file exists = %v, error = %v", exists, err)
+		}
+	})
+
 	t.Run("End-to-end timed out file cleanup", func(t *testing.T) {
 		// Create a tenant
 		tenantCtx, err := system.tenantManager.GetTenant(ctx, "test-tenant")
@@ -51,13 +100,13 @@ func TestCleanupServiceIntegration(t *testing.T) {
 		}
 
 		// Verify file is in Processing status
-		status, _ := system.storagePool.GetFileStatus(ctx, fileKey)
+		status, _ := system.storagePool.GetFileStatus(ctx, tenantCtx, fileKey)
 		if status != core.FileStatusProcessing {
 			t.Errorf("Expected status Processing, got %v", status)
 		}
 
 		// Manually update the processing start time to simulate timeout
-		meta, _ := system.metadataRepo.Get(ctx, fileKey)
+		meta, _ := system.metadataRepo.Get(ctx, tenantCtx.ID, fileKey)
 		oldTime := time.Now().Add(-2 * time.Hour)
 		meta.ProcessingStartTime = &oldTime
 		_ = system.metadataRepo.AddOrUpdate(ctx, meta)
@@ -73,7 +122,7 @@ func TestCleanupServiceIntegration(t *testing.T) {
 		}
 
 		// Verify file is back to Pending
-		status, _ = system.storagePool.GetFileStatus(ctx, fileKey)
+		status, _ = system.storagePool.GetFileStatus(ctx, tenantCtx, fileKey)
 		if status != core.FileStatusPending {
 			t.Errorf("Expected status Pending after cleanup, got %v", status)
 		}
@@ -103,23 +152,16 @@ func TestCleanupServiceIntegration(t *testing.T) {
 		// Get initial quota counts
 		initialTenantCount, _ := system.tenantQuotaMgr.GetFileCount(ctx, "test-tenant")
 
-		// Mark file as failed multiple times to trigger permanent failure
-		for i := 0; i < 6; i++ {
-			err = system.storagePool.MarkAsFailed(ctx, fileKey, "Test error")
-			if err != nil {
-				// Ignore errors as it might be permanently failed already
-				break
-			}
-		}
+		markPermanentlyFailed(t, system, tenantCtx.ID, fileKey)
 
 		// Verify file is permanently failed
-		status, _ := system.storagePool.GetFileStatus(ctx, fileKey)
+		status, _ := system.storagePool.GetFileStatus(ctx, tenantCtx, fileKey)
 		if status != core.FileStatusPermanentlyFailed {
 			t.Errorf("Expected status PermanentlyFailed, got %v", status)
 		}
 
 		// Run cleanup
-		stats, err := system.cleanupService.CleanupPermanentlyFailedFiles(ctx)
+		stats, err := system.cleanupService.CleanupPermanentlyFailedFiles(ctx, 0)
 		if err != nil {
 			t.Fatalf("Cleanup failed: %v", err)
 		}
@@ -133,7 +175,7 @@ func TestCleanupServiceIntegration(t *testing.T) {
 		}
 
 		// Verify file metadata is deleted
-		_, err = system.metadataRepo.Get(ctx, fileKey)
+		_, err = system.metadataRepo.Get(ctx, tenantCtx.ID, fileKey)
 		if err != core.ErrFileNotFound {
 			t.Errorf("Expected file metadata to be deleted, got error: %v", err)
 		}
@@ -187,7 +229,7 @@ func TestCleanupServiceIntegration(t *testing.T) {
 		}
 
 		// Verify metadata is deleted
-		_, err = system.metadataRepo.Get(ctx, fileKey)
+		_, err = system.metadataRepo.Get(ctx, tenantCtx.ID, fileKey)
 		if err != core.ErrFileNotFound {
 			t.Errorf("Expected orphaned metadata to be deleted, got error: %v", err)
 		}
@@ -288,12 +330,9 @@ func TestCleanupServiceIntegration(t *testing.T) {
 			t.Errorf("Expected quota count 3, got %d", count)
 		}
 
-		// Mark one file as permanently failed and clean it up
-		for i := 0; i < 6; i++ {
-			_ = system.storagePool.MarkAsFailed(ctx, fileKeys[0], "Test error")
-		}
+		markPermanentlyFailed(t, system, tenantCtx.ID, fileKeys[0])
 
-		stats, err := system.cleanupService.CleanupPermanentlyFailedFiles(ctx)
+		stats, err := system.cleanupService.CleanupPermanentlyFailedFiles(ctx, 0)
 		if err != nil {
 			t.Fatalf("Cleanup failed: %v", err)
 		}
@@ -345,9 +384,7 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 
 	// Mark half as permanently failed
 	for i := 0; i < numFiles/2; i++ {
-		for j := 0; j < 6; j++ {
-			_ = system.storagePool.MarkAsFailed(ctx, fileKeys[i], "Test error")
-		}
+		markPermanentlyFailed(t, system, tenantCtx.ID, fileKeys[i])
 	}
 
 	// Get the other half for processing (to set them to Processing status)
@@ -357,7 +394,7 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 
 	// Simulate timeout by updating processing start times
 	for i := numFiles / 2; i < numFiles; i++ {
-		meta, _ := system.metadataRepo.Get(ctx, fileKeys[i])
+		meta, _ := system.metadataRepo.Get(ctx, tenantCtx.ID, fileKeys[i])
 		oldTime := time.Now().Add(-2 * time.Hour)
 		meta.ProcessingStartTime = &oldTime
 		_ = system.metadataRepo.AddOrUpdate(ctx, meta)
@@ -367,7 +404,7 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 	done := make(chan bool, 3)
 
 	go func() {
-		_, _ = system.cleanupService.CleanupPermanentlyFailedFiles(ctx)
+		_, _ = system.cleanupService.CleanupPermanentlyFailedFiles(ctx, 0)
 		done <- true
 	}()
 
@@ -389,7 +426,7 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 	// Verify system is in consistent state
 	// All permanently failed files should be removed
 	for i := 0; i < numFiles/2; i++ {
-		_, err := system.metadataRepo.Get(ctx, fileKeys[i])
+		_, err := system.metadataRepo.Get(ctx, tenantCtx.ID, fileKeys[i])
 		if err != core.ErrFileNotFound {
 			t.Errorf("Expected file %s to be deleted, got error: %v", fileKeys[i], err)
 		}
@@ -397,7 +434,7 @@ func TestCleanupServiceConcurrency(t *testing.T) {
 
 	// All timed out files should be back to Pending
 	for i := numFiles / 2; i < numFiles; i++ {
-		status, _ := system.storagePool.GetFileStatus(ctx, fileKeys[i])
+		status, _ := system.storagePool.GetFileStatus(ctx, tenantCtx, fileKeys[i])
 		if status != core.FileStatusPending {
 			t.Errorf("Expected file %s to be Pending, got %v", fileKeys[i], status)
 		}
@@ -550,6 +587,7 @@ func setupFullSystem(t *testing.T) *System {
 
 	// Create cleanup service
 	cleanupOpts := &CleanupServiceOptions{
+		TenantManager:            tenantMgr,
 		MetadataRepository:       metadataRepo,
 		FileScheduler:            fileScheduler,
 		Volumes:                  volumes,
@@ -597,4 +635,41 @@ func cleanupSystem(system *System) {
 	for _, vol := range system.volumes {
 		_ = os.RemoveAll(vol.MountPath())
 	}
+}
+
+func markPermanentlyFailed(t *testing.T, system *System, tenantID, fileKey string) {
+	t.Helper()
+	ctx := context.Background()
+	for attempt := 0; attempt < 10; attempt++ {
+		current, err := system.metadataRepo.Get(ctx, tenantID, fileKey)
+		if err != nil {
+			t.Fatalf("get metadata before failure %d: %v", attempt+1, err)
+		}
+		if current.Status == core.FileStatusPermanentlyFailed {
+			return
+		}
+		if current.Status != core.FileStatusPending {
+			t.Fatalf("metadata status before failure %d = %s, want Pending", attempt+1, current.Status)
+		}
+		current.AvailableForProcessingAt = nil
+		if err := system.metadataRepo.AddOrUpdate(ctx, current); err != nil {
+			t.Fatalf("make metadata available before failure %d: %v", attempt+1, err)
+		}
+		claimed, err := system.metadataRepo.CompareAndTransitionToProcessing(ctx, tenantID, fileKey)
+		if err != nil {
+			t.Fatalf("claim metadata before failure %d: %v", attempt+1, err)
+		}
+		if claimed.ProcessingStartTime == nil {
+			t.Fatalf("claim before failure %d has nil processing start", attempt+1)
+		}
+		lease := core.FileProcessingLease{
+			TenantID:               tenantID,
+			FileKey:                fileKey,
+			ProcessingStartTimeUTC: *claimed.ProcessingStartTime,
+		}
+		if err := system.storagePool.MarkAsFailed(ctx, lease, "Test error"); err != nil {
+			t.Fatalf("mark failure %d: %v", attempt+1, err)
+		}
+	}
+	t.Fatalf("file %q did not become permanently failed", fileKey)
 }

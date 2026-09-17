@@ -153,7 +153,7 @@ func (s *fileScheduler) GetNextBatchForProcessing(ctx context.Context, tenant co
 // Returns error if the file is no longer in Pending status (already claimed).
 func (s *fileScheduler) transitionToProcessing(ctx context.Context, file *core.FileMetadata) error {
 	// Use atomic compare-and-swap operation
-	updated, err := s.metadataRepo.CompareAndTransitionToProcessing(ctx, file.FileKey)
+	updated, err := s.metadataRepo.CompareAndTransitionToProcessing(ctx, file.TenantID, file.FileKey)
 	if err != nil {
 		return err
 	}
@@ -165,82 +165,77 @@ func (s *fileScheduler) transitionToProcessing(ctx context.Context, file *core.F
 }
 
 // MarkAsCompleted marks a file as completed and schedules it for deletion.
-func (s *fileScheduler) MarkAsCompleted(ctx context.Context, fileKey string) error {
-	if fileKey == "" {
+func (s *fileScheduler) MarkAsCompleted(ctx context.Context, lease core.FileProcessingLease) error {
+	if lease.TenantID == "" {
+		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if lease.FileKey == "" {
 		return fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	// Get current file metadata
-	metadata, err := s.metadataRepo.Get(ctx, fileKey)
+	completedAt := time.Now()
+	_, err := s.metadataRepo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
+		current.Status = core.FileStatusCompleted
+		current.ProcessingStartTime = nil
+		current.CompletedAt = &completedAt
+		current.AvailableForProcessingAt = nil
+		current.LastError = ""
+		current.UpdatedAt = completedAt
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to get file metadata: %w", err)
-	}
-
-	// Get the storage volume
-	volume, exists := s.volumes[metadata.VolumeID]
-	if !exists {
-		return fmt.Errorf("storage volume %s not found", metadata.VolumeID)
-	}
-
-	// Delete the physical file (ignore errors as file might already be deleted)
-	_ = volume.DeleteFile(ctx, metadata.PhysicalPath)
-
-	// Delete metadata
-	if err := s.metadataRepo.Delete(ctx, fileKey); err != nil {
-		return fmt.Errorf("failed to delete metadata: %w", err)
+		return fmt.Errorf("failed to complete processing lease: %w", err)
 	}
 
 	return nil
 }
 
 // MarkAsFailed marks a file as failed and schedules retry or permanent failure.
-func (s *fileScheduler) MarkAsFailed(ctx context.Context, fileKey string, errorMessage string) error {
-	if fileKey == "" {
+func (s *fileScheduler) MarkAsFailed(ctx context.Context, lease core.FileProcessingLease, errorMessage string) error {
+	if lease.TenantID == "" {
+		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if lease.FileKey == "" {
 		return fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	// Get current file metadata
-	metadata, err := s.metadataRepo.Get(ctx, fileKey)
-	if err != nil {
-		return fmt.Errorf("failed to get file metadata: %w", err)
-	}
-
-	// Increment retry count
-	metadata.RetryCount++
 	now := time.Now()
-	metadata.LastFailedAt = &now
-	metadata.LastError = errorMessage
-	metadata.UpdatedAt = now
-	metadata.ProcessingStartTime = nil
+	_, err := s.metadataRepo.CompareAndUpdateProcessing(ctx, lease, func(metadata *core.FileMetadata) error {
+		metadata.RetryCount++
+		metadata.LastFailedAt = &now
+		metadata.LastError = errorMessage
+		metadata.UpdatedAt = now
+		metadata.ProcessingStartTime = nil
 
-	// Check if exceeded max retries
-	if metadata.RetryCount > s.retryPolicy.MaxRetryCount {
-		// Permanently failed
-		metadata.Status = core.FileStatusPermanentlyFailed
-		metadata.AvailableForProcessingAt = nil
-	} else {
-		// Schedule for retry with exponential backoff
+		if metadata.RetryCount >= s.retryPolicy.MaxRetryCount {
+			metadata.Status = core.FileStatusPermanentlyFailed
+			metadata.AvailableForProcessingAt = nil
+			return nil
+		}
+
 		metadata.Status = core.FileStatusPending
 		retryDelay := s.retryPolicy.CalculateRetryDelay(metadata.RetryCount)
 		availableAt := now.Add(retryDelay)
 		metadata.AvailableForProcessingAt = &availableAt
-	}
-
-	// Save the update
-	if err := s.metadataRepo.AddOrUpdate(ctx, metadata); err != nil {
-		return fmt.Errorf("failed to update file metadata: %w", err)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to fail processing lease: %w", err)
 	}
 
 	return nil
 }
 
 // GetFileStatus returns the current status of a file.
-func (s *fileScheduler) GetFileStatus(ctx context.Context, fileKey string) (core.FileProcessingStatus, error) {
+func (s *fileScheduler) GetFileStatus(ctx context.Context, tenant core.TenantContext, fileKey string) (core.FileProcessingStatus, error) {
+	if tenant.ID == "" {
+		return 0, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
 	if fileKey == "" {
 		return 0, fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	metadata, err := s.metadataRepo.Get(ctx, fileKey)
+	metadata, err := s.metadataRepo.Get(ctx, tenant.ID, fileKey)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get file metadata: %w", err)
 	}
@@ -250,31 +245,39 @@ func (s *fileScheduler) GetFileStatus(ctx context.Context, fileKey string) (core
 
 // ResetTimedOutFiles finds files in Processing status that exceed timeout
 // and resets them to Pending status for retry.
-func (s *fileScheduler) ResetTimedOutFiles(ctx context.Context, timeout time.Duration) (int, error) {
+func (s *fileScheduler) ResetTimedOutFiles(ctx context.Context, tenant core.TenantContext, timeout time.Duration) (int, error) {
+	if tenant.ID == "" {
+		return 0, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
 	// Use configured timeout if not specified
 	if timeout == 0 {
 		timeout = s.processingTimeout
 	}
 
 	// Get timed out files
-	timedOutFiles, err := s.metadataRepo.GetTimedOutProcessingFiles(ctx, timeout)
+	timedOutFiles, err := s.metadataRepo.GetTimedOutProcessingFiles(ctx, tenant.ID, timeout)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get timed out files: %w", err)
 	}
 
 	resetCount := 0
 	for _, file := range timedOutFiles {
-		// Reset to Pending status
+		if file.ProcessingStartTime == nil {
+			continue
+		}
+		lease := core.FileProcessingLease{
+			TenantID:               file.TenantID,
+			FileKey:                file.FileKey,
+			ProcessingStartTimeUTC: *file.ProcessingStartTime,
+		}
 		now := time.Now()
-		file.Status = core.FileStatusPending
-		file.ProcessingStartTime = nil
-		file.UpdatedAt = now
-
-		// Keep existing retry count and available time
-		// (this is a timeout, not a failure)
-
-		if err := s.metadataRepo.AddOrUpdate(ctx, file); err != nil {
-			// Log error but continue with other files
+		_, err := s.metadataRepo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
+			current.Status = core.FileStatusPending
+			current.ProcessingStartTime = nil
+			current.UpdatedAt = now
+			return nil
+		})
+		if err != nil {
 			continue
 		}
 

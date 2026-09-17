@@ -88,7 +88,7 @@
     "cleanupTimedOutFiles": true,
     "processingTimeout": "30m",
     "cleanupPermanentlyFailedFiles": true,
-    "failedFileRetentionPeriod": "168h",
+    "failedFileRetentionPeriod": "72h",
     "cleanupCompletedRecords": false,
     "completedRecordRetentionPeriod": "720h",
     "optimizeDatabases": true,

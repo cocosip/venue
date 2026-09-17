@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,7 +108,7 @@ func TestGetNextFileForProcessing(t *testing.T) {
 		}
 
 		// Verify status was updated in repository
-		updated, _ := repo.Get(ctx, "file1")
+		updated, _ := repo.Get(ctx, "test-tenant", "file1")
 		if updated.Status != core.FileStatusProcessing {
 			t.Errorf("Expected status Processing in repo, got %v", updated.Status)
 		}
@@ -236,35 +238,99 @@ func TestMarkAsCompleted(t *testing.T) {
 
 	t.Run("Mark file as completed", func(t *testing.T) {
 		// Add a processing file
+		leaseStart := time.Now().UTC()
 		file := createTestFileMetadata("file1", core.FileStatusProcessing)
+		file.ProcessingStartTime = &leaseStart
 		_ = repo.AddOrUpdate(ctx, file)
 
 		// Mark as completed
-		err := scheduler.MarkAsCompleted(ctx, "file1")
+		err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
+			TenantID:               "test-tenant",
+			FileKey:                "file1",
+			ProcessingStartTimeUTC: leaseStart,
+		})
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
-		// Verify file metadata is deleted
-		_, err = repo.Get(ctx, "file1")
-		if err != core.ErrFileNotFound {
-			t.Errorf("Expected ErrFileNotFound, got %v", err)
+		// Completion is durable metadata; physical deletion happens in cleanup.
+		completed, err := repo.Get(ctx, "test-tenant", "file1")
+		if err != nil {
+			t.Fatalf("get completed metadata: %v", err)
+		}
+		if completed.Status != core.FileStatusCompleted {
+			t.Errorf("completed status = %s, want Completed", completed.Status)
+		}
+		if completed.CompletedAt == nil {
+			t.Error("completed metadata has nil CompletedAt")
 		}
 	})
 
 	t.Run("Empty file key", func(t *testing.T) {
-		err := scheduler.MarkAsCompleted(ctx, "")
+		err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{TenantID: "test-tenant"})
 		if err == nil {
 			t.Fatal("Expected error for empty file key")
 		}
 	})
 
 	t.Run("Non-existent file", func(t *testing.T) {
-		err := scheduler.MarkAsCompleted(ctx, "non-existent")
+		err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
+			TenantID:               "test-tenant",
+			FileKey:                "non-existent",
+			ProcessingStartTimeUTC: time.Now().UTC(),
+		})
 		if err == nil {
 			t.Fatal("Expected error for non-existent file")
 		}
 	})
+}
+
+func TestMarkAsCompletedRejectsStaleLeaseBeforeDeletingFile(t *testing.T) {
+	ctx := context.Background()
+	repo, tmpDir := createTestRepository(t)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
+	volumes := createTestVolumes(t)
+	defer cleanupVolumes(volumes)
+
+	activeStart := time.Date(2026, time.September, 17, 14, 0, 0, 0, time.UTC)
+	file := createTestFileMetadata("stale-completion", core.FileStatusProcessing)
+	file.PhysicalPath = "stale-completion.txt"
+	file.ProcessingStartTime = &activeStart
+	if err := repo.AddOrUpdate(ctx, file); err != nil {
+		t.Fatalf("add metadata: %v", err)
+	}
+	if _, err := volumes["test-volume"].WriteFile(ctx, file.PhysicalPath, strings.NewReader("payload")); err != nil {
+		t.Fatalf("write physical file: %v", err)
+	}
+
+	scheduler, err := NewFileScheduler(repo, volumes, nil)
+	if err != nil {
+		t.Fatalf("new scheduler: %v", err)
+	}
+	err = scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
+		TenantID:               "test-tenant",
+		FileKey:                file.FileKey,
+		ProcessingStartTimeUTC: activeStart.Add(-time.Minute),
+	})
+	if !errors.Is(err, core.ErrProcessingLeaseMismatch) {
+		t.Fatalf("error = %v, want ErrProcessingLeaseMismatch", err)
+	}
+
+	exists, err := volumes["test-volume"].FileExists(ctx, file.PhysicalPath)
+	if err != nil {
+		t.Fatalf("check physical file: %v", err)
+	}
+	if !exists {
+		t.Fatal("stale completion deleted the physical file")
+	}
+	current, err := repo.Get(ctx, "test-tenant", file.FileKey)
+	if err != nil {
+		t.Fatalf("get metadata: %v", err)
+	}
+	if current.Status != core.FileStatusProcessing || !current.ProcessingStartTime.Equal(activeStart) {
+		t.Errorf("metadata changed to status %s lease %v", current.Status, current.ProcessingStartTime)
+	}
 }
 
 // TestMarkAsFailed tests marking a file as failed with retry logic.
@@ -292,18 +358,24 @@ func TestMarkAsFailed(t *testing.T) {
 
 	t.Run("First failure - schedule retry", func(t *testing.T) {
 		// Add a processing file with retry count 0
+		leaseStart := time.Now().UTC()
 		file := createTestFileMetadata("file1", core.FileStatusProcessing)
 		file.RetryCount = 0
+		file.ProcessingStartTime = &leaseStart
 		_ = repo.AddOrUpdate(ctx, file)
 
 		// Mark as failed
-		err := scheduler.MarkAsFailed(ctx, "file1", "Test error")
+		err := scheduler.MarkAsFailed(ctx, core.FileProcessingLease{
+			TenantID:               "test-tenant",
+			FileKey:                "file1",
+			ProcessingStartTimeUTC: leaseStart,
+		}, "Test error")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
 		// Verify file status
-		updated, _ := repo.Get(ctx, "file1")
+		updated, _ := repo.Get(ctx, "test-tenant", "file1")
 		if updated.Status != core.FileStatusPending {
 			t.Errorf("Expected status Pending after first failure, got %v", updated.Status)
 		}
@@ -327,24 +399,30 @@ func TestMarkAsFailed(t *testing.T) {
 
 	t.Run("Exceed max retries - permanently failed", func(t *testing.T) {
 		// Add a processing file with max retry count
+		leaseStart := time.Now().UTC()
 		file := createTestFileMetadata("file2", core.FileStatusProcessing)
-		file.RetryCount = 3 // Already at max
+		file.RetryCount = 2 // Third failure reaches the configured maximum
+		file.ProcessingStartTime = &leaseStart
 		_ = repo.AddOrUpdate(ctx, file)
 
-		// Mark as failed (this should exceed max)
-		err := scheduler.MarkAsFailed(ctx, "file2", "Final error")
+		// Mark as failed (this reaches max)
+		err := scheduler.MarkAsFailed(ctx, core.FileProcessingLease{
+			TenantID:               "test-tenant",
+			FileKey:                "file2",
+			ProcessingStartTimeUTC: leaseStart,
+		}, "Final error")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
 		// Verify file is permanently failed
-		updated, _ := repo.Get(ctx, "file2")
+		updated, _ := repo.Get(ctx, "test-tenant", "file2")
 		if updated.Status != core.FileStatusPermanentlyFailed {
 			t.Errorf("Expected status PermanentlyFailed, got %v", updated.Status)
 		}
 
-		if updated.RetryCount != 4 {
-			t.Errorf("Expected RetryCount 4, got %d", updated.RetryCount)
+		if updated.RetryCount != 3 {
+			t.Errorf("Expected RetryCount 3, got %d", updated.RetryCount)
 		}
 
 		if updated.AvailableForProcessingAt != nil {
@@ -353,11 +431,52 @@ func TestMarkAsFailed(t *testing.T) {
 	})
 
 	t.Run("Empty file key", func(t *testing.T) {
-		err := scheduler.MarkAsFailed(ctx, "", "error")
+		err := scheduler.MarkAsFailed(ctx, core.FileProcessingLease{TenantID: "test-tenant"}, "error")
 		if err == nil {
 			t.Fatal("Expected error for empty file key")
 		}
 	})
+}
+
+func TestMarkAsFailedRejectsStaleLeaseWithoutChangingRetryState(t *testing.T) {
+	ctx := context.Background()
+	repo, tmpDir := createTestRepository(t)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
+	volumes := createTestVolumes(t)
+	defer cleanupVolumes(volumes)
+
+	activeStart := time.Date(2026, time.September, 17, 15, 0, 0, 0, time.UTC)
+	file := createTestFileMetadata("stale-failure", core.FileStatusProcessing)
+	file.ProcessingStartTime = &activeStart
+	file.RetryCount = 2
+	if err := repo.AddOrUpdate(ctx, file); err != nil {
+		t.Fatalf("add metadata: %v", err)
+	}
+
+	scheduler, err := NewFileScheduler(repo, volumes, nil)
+	if err != nil {
+		t.Fatalf("new scheduler: %v", err)
+	}
+	err = scheduler.MarkAsFailed(ctx, core.FileProcessingLease{
+		TenantID:               "test-tenant",
+		FileKey:                file.FileKey,
+		ProcessingStartTimeUTC: activeStart.Add(-time.Minute),
+	}, "stale worker failed")
+	if !errors.Is(err, core.ErrProcessingLeaseMismatch) {
+		t.Fatalf("error = %v, want ErrProcessingLeaseMismatch", err)
+	}
+
+	current, err := repo.Get(ctx, "test-tenant", file.FileKey)
+	if err != nil {
+		t.Fatalf("get metadata: %v", err)
+	}
+	if current.Status != core.FileStatusProcessing || current.RetryCount != 2 {
+		t.Errorf("metadata changed to status %s retry %d", current.Status, current.RetryCount)
+	}
+	if current.LastError != "" || current.LastFailedAt != nil {
+		t.Errorf("failure fields changed to error %q at %v", current.LastError, current.LastFailedAt)
+	}
 }
 
 // TestGetFileStatus tests getting file status.
@@ -377,7 +496,7 @@ func TestGetFileStatus(t *testing.T) {
 		file := createTestFileMetadata("file1", core.FileStatusPending)
 		_ = repo.AddOrUpdate(ctx, file)
 
-		status, err := scheduler.GetFileStatus(ctx, "file1")
+		status, err := scheduler.GetFileStatus(ctx, createTestTenant(), "file1")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -388,14 +507,14 @@ func TestGetFileStatus(t *testing.T) {
 	})
 
 	t.Run("Empty file key", func(t *testing.T) {
-		_, err := scheduler.GetFileStatus(ctx, "")
+		_, err := scheduler.GetFileStatus(ctx, createTestTenant(), "")
 		if err == nil {
 			t.Fatal("Expected error for empty file key")
 		}
 	})
 
 	t.Run("Non-existent file", func(t *testing.T) {
-		_, err := scheduler.GetFileStatus(ctx, "non-existent")
+		_, err := scheduler.GetFileStatus(ctx, createTestTenant(), "non-existent")
 		if err == nil {
 			t.Fatal("Expected error for non-existent file")
 		}
@@ -429,7 +548,7 @@ func TestResetTimedOutFiles(t *testing.T) {
 		_ = repo.AddOrUpdate(ctx, file2)
 
 		// Reset files with timeout of 1 hour
-		count, err := scheduler.ResetTimedOutFiles(ctx, 1*time.Hour)
+		count, err := scheduler.ResetTimedOutFiles(ctx, createTestTenant(), 1*time.Hour)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -439,7 +558,7 @@ func TestResetTimedOutFiles(t *testing.T) {
 		}
 
 		// Verify file1 was reset to Pending
-		updated1, _ := repo.Get(ctx, "file1")
+		updated1, _ := repo.Get(ctx, "test-tenant", "file1")
 		if updated1.Status != core.FileStatusPending {
 			t.Errorf("Expected file1 status Pending, got %v", updated1.Status)
 		}
@@ -449,14 +568,14 @@ func TestResetTimedOutFiles(t *testing.T) {
 		}
 
 		// Verify file2 is still Processing
-		updated2, _ := repo.Get(ctx, "file2")
+		updated2, _ := repo.Get(ctx, "test-tenant", "file2")
 		if updated2.Status != core.FileStatusProcessing {
 			t.Errorf("Expected file2 status Processing, got %v", updated2.Status)
 		}
 	})
 
 	t.Run("No timed out files", func(t *testing.T) {
-		count, err := scheduler.ResetTimedOutFiles(ctx, 1*time.Hour)
+		count, err := scheduler.ResetTimedOutFiles(ctx, createTestTenant(), 1*time.Hour)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -465,6 +584,49 @@ func TestResetTimedOutFiles(t *testing.T) {
 			t.Errorf("Expected 0 files to be reset, got %d", count)
 		}
 	})
+}
+
+func TestResetTimedOutFilesDoesNotOverwriteReplacementLease(t *testing.T) {
+	ctx := context.Background()
+	baseRepo, tmpDir := createTestRepository(t)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
+	volumes := createTestVolumes(t)
+	defer cleanupVolumes(volumes)
+
+	oldStart := time.Now().Add(-2 * time.Hour)
+	newStart := time.Now().UTC()
+	file := createTestFileMetadata("replacement-lease", core.FileStatusProcessing)
+	file.ProcessingStartTime = &oldStart
+	if err := baseRepo.AddOrUpdate(ctx, file); err != nil {
+		t.Fatalf("add metadata: %v", err)
+	}
+
+	repo := &replacementLeaseRepository{
+		MetadataRepository: baseRepo,
+		tenantID:           "test-tenant",
+		fileKey:            file.FileKey,
+		replacementStart:   newStart,
+	}
+	scheduler, err := NewFileScheduler(repo, volumes, nil)
+	if err != nil {
+		t.Fatalf("new scheduler: %v", err)
+	}
+
+	count, err := scheduler.ResetTimedOutFiles(ctx, createTestTenant(), time.Hour)
+	if err != nil {
+		t.Fatalf("reset timed out files: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("reset count = %d, want 0", count)
+	}
+	current, err := baseRepo.Get(ctx, "test-tenant", file.FileKey)
+	if err != nil {
+		t.Fatalf("get metadata: %v", err)
+	}
+	if current.Status != core.FileStatusProcessing || current.ProcessingStartTime == nil || !current.ProcessingStartTime.Equal(newStart) {
+		t.Errorf("replacement lease overwritten: status %s start %v", current.Status, current.ProcessingStartTime)
+	}
 }
 
 // Helper functions
@@ -543,4 +705,33 @@ func createTestFileMetadata(fileKey string, status core.FileProcessingStatus) *c
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
+}
+
+type replacementLeaseRepository struct {
+	core.MetadataRepository
+	tenantID         string
+	fileKey          string
+	replacementStart time.Time
+}
+
+func (r *replacementLeaseRepository) GetTimedOutProcessingFiles(
+	ctx context.Context,
+	tenantID string,
+	timeout time.Duration,
+) ([]*core.FileMetadata, error) {
+	timedOut, err := r.MetadataRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout)
+	if err != nil || len(timedOut) == 0 {
+		return timedOut, err
+	}
+	current, err := r.Get(ctx, r.tenantID, r.fileKey)
+	if err != nil {
+		return nil, err
+	}
+	current.Status = core.FileStatusProcessing
+	current.ProcessingStartTime = &r.replacementStart
+	current.UpdatedAt = r.replacementStart
+	if err := r.AddOrUpdate(ctx, current); err != nil {
+		return nil, err
+	}
+	return timedOut, nil
 }

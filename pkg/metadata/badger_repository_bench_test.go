@@ -44,7 +44,7 @@ func BenchmarkGet(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fileKey := fmt.Sprintf("file-%d", i%numFiles)
-		_, err := repo.Get(ctx, fileKey)
+		_, err := repo.Get(ctx, "bench-tenant", fileKey)
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}
@@ -61,11 +61,11 @@ func BenchmarkGetCached(b *testing.B) {
 	// Add a single file and ensure it's cached
 	metadata := createTestMetadata("cached-file", core.FileStatusPending)
 	_ = repo.AddOrUpdate(ctx, metadata)
-	_, _ = repo.Get(ctx, "cached-file") // Warm up cache
+	_, _ = repo.Get(ctx, "bench-tenant", "cached-file") // Warm up cache
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := repo.Get(ctx, "cached-file")
+		_, err := repo.Get(ctx, "bench-tenant", "cached-file")
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}
@@ -89,7 +89,7 @@ func BenchmarkGetUncached(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fileKey := fmt.Sprintf("file-%d", i%numFiles)
-		_, err := repo.Get(ctx, fileKey)
+		_, err := repo.Get(ctx, "bench-tenant", fileKey)
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}
@@ -117,7 +117,7 @@ func BenchmarkUpdateStatus(b *testing.B) {
 		if i%2 == 0 {
 			status = core.FileStatusCompleted
 		}
-		err := repo.UpdateStatus(ctx, fileKey, status)
+		err := repo.UpdateStatus(ctx, "bench-tenant", fileKey, status)
 		if err != nil {
 			b.Fatalf("UpdateStatus failed: %v", err)
 		}
@@ -193,7 +193,7 @@ func BenchmarkDelete(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fileKey := fmt.Sprintf("file-%d", i)
-		err := repo.Delete(ctx, fileKey)
+		err := repo.Delete(ctx, "bench-tenant", fileKey)
 		if err != nil {
 			b.Fatalf("Delete failed: %v", err)
 		}
@@ -240,7 +240,7 @@ func BenchmarkConcurrentReads(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			fileKey := fmt.Sprintf("file-%d", i%numFiles)
-			_, err := repo.Get(ctx, fileKey)
+			_, err := repo.Get(ctx, "bench-tenant", fileKey)
 			if err != nil {
 				b.Fatalf("Get failed: %v", err)
 			}
@@ -271,12 +271,12 @@ func BenchmarkMixedOperations(b *testing.B) {
 
 			switch operation {
 			case 0: // Read
-				_, _ = repo.Get(ctx, fileKey)
+				_, _ = repo.Get(ctx, "bench-tenant", fileKey)
 			case 1: // Write
 				metadata := createTestMetadata(fileKey, core.FileStatusPending)
 				_ = repo.AddOrUpdate(ctx, metadata)
 			case 2: // Update status
-				_ = repo.UpdateStatus(ctx, fileKey, core.FileStatusProcessing)
+				_ = repo.UpdateStatus(ctx, "bench-tenant", fileKey, core.FileStatusProcessing)
 			case 3: // Query
 				_, _ = repo.GetByStatus(ctx, "test-tenant", core.FileStatusPending, 10)
 			}

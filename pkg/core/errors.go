@@ -1,6 +1,10 @@
 package core
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 // Tenant-related errors
 
@@ -51,6 +55,48 @@ var ErrInvalidFileKey = errors.New("invalid file key")
 
 // ErrFileAlreadyExists is returned when attempting to create a file that already exists.
 var ErrFileAlreadyExists = errors.New("file already exists")
+
+// ErrProcessingLeaseMismatch is returned when a processing transition uses a stale lease.
+var ErrProcessingLeaseMismatch = errors.New("processing lease mismatch")
+
+// FileProcessingLeaseMismatchError describes the active state that rejected a lease.
+type FileProcessingLeaseMismatchError struct {
+	TenantID                       string
+	FileKey                        string
+	ExpectedProcessingStartTimeUTC time.Time
+	ActualProcessingStartTimeUTC   *time.Time
+	ActualStatus                   *FileProcessingStatus
+}
+
+// Error returns a diagnostic description of the rejected processing lease.
+func (e *FileProcessingLeaseMismatchError) Error() string {
+	actualStatus := "Unknown"
+	if e.ActualStatus != nil {
+		actualStatus = e.ActualStatus.String()
+	}
+	if e.ActualProcessingStartTimeUTC != nil {
+		return fmt.Sprintf(
+			"processing lease for tenant %q file %q no longer matches: expected start %s, active start %s, actual status %s",
+			e.TenantID,
+			e.FileKey,
+			e.ExpectedProcessingStartTimeUTC.Format(time.RFC3339Nano),
+			e.ActualProcessingStartTimeUTC.Format(time.RFC3339Nano),
+			actualStatus,
+		)
+	}
+	return fmt.Sprintf(
+		"processing lease for tenant %q file %q no longer matches active metadata: expected start %s, actual status %s",
+		e.TenantID,
+		e.FileKey,
+		e.ExpectedProcessingStartTimeUTC.Format(time.RFC3339Nano),
+		actualStatus,
+	)
+}
+
+// Unwrap supports errors.Is with ErrProcessingLeaseMismatch.
+func (e *FileProcessingLeaseMismatchError) Unwrap() error {
+	return ErrProcessingLeaseMismatch
+}
 
 // General errors
 

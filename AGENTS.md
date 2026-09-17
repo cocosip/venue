@@ -1,795 +1,182 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file defines repository architecture and development rules for Venue. User-facing setup and API examples belong in `README.md` and `examples/`.
 
-## Project Overview
+## Project Scope
 
-**Venue** is a high-performance, multi-tenant file storage pool system implemented in Go 1.25. It's a port of the [Locus](https://github.com/cocosip/Locus) .NET library, designed as a **file queue system** with the following characteristics:
+Venue is a Go 1.26 multi-tenant file storage queue. Locus `v2.0.0` commit `292bd2cea7051ec277d97ca708443e668b40a2d4` is the current behavioral reference baseline.
 
-- **Multi-tenant isolation**: Each tenant has isolated storage with enable/disable controls
-- **Queue-based processing**: Files are processed as a queue with automatic retry on failure
-- **Unlimited storage expansion**: Dynamically mount multiple storage volumes
-- **High concurrency**: Thread-safe operations with per-tenant databases and active-data caching
-- **System-managed files**: Users receive fileKeys, system handles all physical storage details
+Venue is not a caller-managed filesystem:
 
-## Key Concept: File Queue System (Not Traditional File Storage)
+- `WriteFile` generates the `fileKey`.
+- Callers never select physical paths or storage volumes.
+- Workers claim pending files through queue APIs.
+- Completion records durable queue state; cleanup later deletes the managed file.
+- Locus behavior is the compatibility target, but public APIs must follow Go conventions.
 
-**Critical**: Venue is NOT a traditional file system where users specify paths. Instead:
+## Architecture
 
-1. **Write** → System generates and returns a `fileKey` (UUID)
-2. **Process** → Workers fetch next pending file from queue
-3. **Complete/Retry** → Mark file as completed (deleted) or failed (retry)
+```text
+venue.NewVenue(*config.Config)
+    |
+    +-- tenant manager
+    +-- storage pool
+    |   +-- volume selection and physical files
+    |   +-- metadata repository and active cache
+    |   +-- tenant and directory quotas
+    |   +-- file scheduler
+    +-- cleanup services
+    +-- file watcher services
+    +-- database health services
+```
 
-Users never need to know which volume, directory, or path contains their files.
+Repository ownership:
 
-## Build and Test Commands
+- `config/`: public, configuration-source-independent model, defaults, validation, cloning, and fluent methods.
+- `viperconfig/`: optional Viper-to-`config.Config` adapter.
+- `pkg/core/`: public interfaces, shared models, statuses, and domain errors.
+- `pkg/tenant/`: tenant lifecycle and metadata cache.
+- `pkg/metadata/`: BadgerDB metadata projection, indexes, migration, and active-data cache.
+- `pkg/pool/`: storage and queue facade.
+- `pkg/scheduler/`: atomic queue transitions and retry scheduling.
+- `pkg/quota/`: tenant and directory quotas.
+- `pkg/volume/`: physical storage volumes and path safety.
+- `pkg/cleanup/`: cleanup and database optimization.
+- `pkg/watcher/`: watched-directory imports.
+- `pkg/health/`: startup and periodic health checks.
+- `pkg/logging/`: instance-scoped structured logging runtime.
+- `test/benchmark/`: public-entry system benchmarks.
 
-### Build
-```bash
-# Build all packages
+Keep edits within these ownership boundaries. Do not create a second runtime configuration model or bypass the public entry point in integration tests and system benchmarks.
+
+## Configuration Rules
+
+- The only public runtime model is `config.Config`.
+- `venue.NewVenue` accepts `*config.Config` directly.
+- Applications may use direct field assignment or chainable `With...` methods.
+- Every nested configuration type must support chainable construction.
+- `WithVolumes`, `WithTenants`, and `WithFileWatchers` replace collections.
+- `AddVolume`, `AddTenant`, and `AddFileWatcher` append to collections.
+- Every exported configuration field must retain `json`, `yaml`, and `mapstructure` tags.
+- Runtime-only values such as `slog.Handler` must use `json:"-" yaml:"-" mapstructure:"-"`.
+- `config` must not import Viper or configuration-file parsers and must not perform file I/O.
+- Viper integration belongs only in the top-level `viperconfig` package.
+- File watching, environment variables, reload policy, and configuration persistence belong to the application entry point.
+
+When adding a configuration field, update defaults, cloning, validation where relevant, fluent methods, binding-tag tests, adapter tests, example files, and README documentation together.
+
+## Logging Rules
+
+- Use `log/slog` only through the injected `pkg/logging.Runtime`.
+- Never use, replace, or configure `slog.Default()`.
+- `Config.Logging == nil` means logging is disabled and silent.
+- The caller owns the handler and any writer behind it.
+- Logging must not cause storage operations to fail; handler panics remain isolated.
+- Do not log file contents, original file names, full physical paths, tenant-sensitive data, credentials, or raw errors that may contain those values.
+- Use structured attributes and stable event names.
+
+## Tenant Isolation
+
+- Scope metadata primary keys, secondary indexes, caches, and mutations by `(tenantID, fileKey)`.
+- Never infer a tenant from process-global state, headers, or a package global.
+- Every caller-visible read, status transition, completion, and failure operation must carry tenant context.
+- A tenant must not list, claim, read, mutate, or delete another tenant's metadata or files.
+- Legacy metadata migrations must be restartable and idempotent.
+- Rebuild indexes from stored tenant ownership rather than from path assumptions.
+
+## Queue And Concurrency
+
+- File allocation must be atomic; one pending file can be claimed by only one worker.
+- Metadata transitions belong in BadgerDB transactions.
+- Preserve FIFO ordering among files that are available for processing.
+- Retry uses exponential backoff capped by the configured maximum.
+- Processing timeout recovery must not permit a stale worker to mutate a newer claim.
+- Use per-directory synchronization for directory quota changes.
+- Protect tenant caches and lifecycle state with `sync.Map`, mutexes, or atomic state as appropriate.
+- Do not reduce concurrency to hide races or contention defects.
+- Check `context.Context` cancellation in loops and background services.
+
+## Storage And Persistence
+
+- Physical file creation and metadata persistence form one logical operation.
+- Roll back the physical file when metadata persistence fails.
+- Close every `io.ReadCloser` and database handle on all paths.
+- Preserve original file extensions only for diagnostics; never use caller names as physical paths.
+- Sanitize all relative paths and keep resolved paths under their configured volume root.
+- BadgerDB deletion requires periodic value-log GC to reclaim disk space.
+- Treat `badger.ErrNoRewrite` as a normal no-work GC outcome.
+- Keep durability trade-offs such as `SyncWrites` and file `fsync` explicit in configuration.
+
+## Error Handling
+
+- Define stable domain errors in `pkg/core/errors.go`.
+- Wrap errors with `%w` and include safe operational context such as tenant ID, file key, or component.
+- Use `errors.Is` for domain checks.
+- Never ignore an error unless cleanup is explicitly best-effort and the reason is clear.
+- Defer transactional rollback immediately after opening a transaction; committing must remain explicit.
+
+## Public API And Documentation
+
+- Add godoc comments to every exported type, function, method, field whose meaning is not obvious, and interface behavior.
+- Document ownership and lifecycle for readers, handlers, goroutines, and database resources.
+- Keep README examples compilable against the current public API.
+- Do not put roadmap status, implementation progress, or temporary task notes in `AGENTS.md`.
+- Update README, `examples/`, configuration files, benchmarks, and tests whenever a public API changes.
+- Use Locus as a behavioral reference, not as a reason to copy .NET naming or configuration framework patterns.
+
+## Testing
+
+Use test-first development for behavioral changes. A regression test must fail for the expected reason before the implementation is changed.
+
+Required commands:
+
+```powershell
 go build ./...
-
-# Build main application (when cmd/venue exists)
-go build -o bin/venue ./cmd/venue
-
-# Build with race detector
-go build -race ./...
-```
-
-### Testing
-```bash
-# Run all tests
 go test ./...
-
-# Run tests with verbose output
-go test -v ./...
-
-# Run tests with race detector (CRITICAL before commits)
 go test -race ./...
-
-# Run tests with coverage
-go test -cover ./...
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-
-# Run integration tests (when implemented)
-go test -tags=integration ./...
-
-# Run specific package tests
-go test ./pkg/storage/...
-go test ./pkg/tenant/...
-```
-
-### Benchmarking
-```bash
-# Run all benchmarks
-go test -bench=. -benchmem ./...
-
-# Run benchmarks for specific package
-go test -bench=. -benchmem ./pkg/storage/metadata/
-
-# Run specific benchmark
-go test -bench=BenchmarkMetadataCache -benchmem ./pkg/storage/metadata/
-
-# Compare benchmark results
-go test -bench=. -benchmem ./... > old.txt
-# (make changes)
-go test -bench=. -benchmem ./... > new.txt
-benchstat old.txt new.txt
-```
-
-### Linting
-```bash
-# Run golangci-lint (when configured)
+go vet ./...
 golangci-lint run
-
-# Run with auto-fix
-golangci-lint run --fix
-
-# Check formatting
-gofmt -l .
-
-# Auto-format
-gofmt -w .
 ```
 
-## Architecture Overview
+Testing rules:
 
-### High-Level Design
+- Use table-driven tests for validation matrices and state transitions.
+- Use `t.TempDir()` for filesystem-backed tests.
+- Register repository and runtime shutdown before temporary directory cleanup.
+- Exercise integration paths through `venue.NewVenue(*config.Config)` unless the test targets a lower-level component.
+- Test same-`fileKey` behavior across different tenants.
+- Test restart and migration behavior with literal legacy fixtures.
+- Test background service cancellation and shutdown.
+- Run race tests before any commit.
+- Do not weaken assertions, add retries, or serialize tests merely to hide a race.
 
-```
-┌─────────────────────────────────────────────┐
-│   API Layer (StoragePool)                   │
-│   - Unified storage + queue interface       │
-├─────────────────────────────────────────────┤
-│   Active-Data Cache (Per-Tenant)           │
-│   - Only Pending/Processing/Failed files    │
-│   - sync.Map for fast lookups               │
-├─────────────────────────────────────────────┤
-│   Persistence Layer (Per-Tenant BadgerDB)  │
-│   - MetadataRepository: File metadata       │
-│   - DirectoryQuotaRepository: Quota limits  │
-│   - Auto GC and compression support         │
-├─────────────────────────────────────────────┤
-│   Tenant Management (JSON + Cache)         │
-│   - TenantMetadata: Status, dates           │
-│   - TTL cache (5 minutes)                   │
-├─────────────────────────────────────────────┤
-│   Storage Volumes (LocalFileSystemVolume)  │
-│   - Configurable sharding (0-3 levels)      │
-│   - Health monitoring                       │
-└─────────────────────────────────────────────┘
+On this Windows workspace, if the default Go cache is inaccessible, use ignored repository-local caches:
+
+```powershell
+$env:GOCACHE='D:\Code\go\venue\tmp\go-build'
+$env:GOLANGCI_LINT_CACHE='D:\Code\go\venue\tmp\golangci-lint'
 ```
 
-### Package Structure
+## Benchmarks
 
-```
-pkg/
-├── core/                   # Core abstractions
-│   ├── interfaces.go       # All interface definitions
-│   ├── models.go           # Shared models (FileLocation, FileInfo, etc.)
-│   └── errors.go           # Custom errors (TenantDisabledException, etc.)
-├── tenant/                 # Multi-tenant management
-│   ├── manager.go          # TenantManager implementation
-│   ├── context.go          # TenantContext
-│   └── metadata.go         # JSON-based tenant metadata
-├── storage/                # Storage pool implementation
-│   ├── pool.go             # StoragePool (main API)
-│   ├── scheduler.go        # FileScheduler (queue processing)
-│   ├── metadata/           # File metadata management
-│   │   ├── repository.go   # MetadataRepository
-│   │   └── cache.go        # Active-data caching
-│   └── quota/              # Quota management
-│       ├── directory.go    # DirectoryQuotaManager
-│       └── tenant.go       # TenantQuotaManager
-├── volume/                 # Storage volumes
-│   ├── interface.go        # StorageVolume interface
-│   ├── local.go            # LocalFileSystemVolume
-│   └── health.go           # Health monitoring
-└── cleanup/                # Background cleanup
-    ├── service.go          # CleanupService
-    └── background.go       # BackgroundCleanupService
+Benchmarks must use real code paths and report allocations. System benchmarks must initialize through the public Venue API.
+
+```powershell
+go test -run '^$' -bench=. -benchmem ./...
+go test -run '^$' -bench=. -benchmem ./test/benchmark
 ```
 
-## Key Design Patterns
-
-### 1. Per-Tenant Database Isolation
-
-Each tenant has **isolated BadgerDB databases**:
-- `metadata/{tenantId}/` - File metadata (BadgerDB directory)
-- `quota/{tenantId}/` - Directory quotas (BadgerDB directory)
-
-**Why**:
-- Prevents cross-tenant data leakage
-- Simplifies backup/restore
-- BadgerDB provides automatic compression via GC
-
-**Database Choice**: BadgerDB v4
-- Pure Go implementation (no CGO)
-- Built-in compression: `db.RunValueLogGC(0.7)`
-- High performance for our write-heavy workload
-- See [DATABASE_SELECTION.md](doc/DATABASE_SELECTION.md) for detailed analysis
-
-### 2. Active-Data Caching
-
-Only cache files in **Pending/Processing/Failed** states in memory.
-
-**Completed files** are immediately deleted from cache and database.
-
-**Why**: Prevents memory bloat from millions of historical files.
-
-### 3. Atomic File Allocation
-
-`GetNextFileForProcessing` uses database transactions to ensure:
-- Each file allocated to exactly one worker
-- Status transition `Pending → Processing` is atomic
-- No duplicate processing
-
-**Implementation**:
-```go
-// Pseudocode
-tx.Begin()
-file := db.QueryFirst("SELECT * FROM files WHERE status=Pending AND (availableAt IS NULL OR availableAt <= NOW) ORDER BY createdAt LIMIT 1 FOR UPDATE")
-if file != nil {
-    file.Status = Processing
-    file.ProcessingStartTime = Now()
-    db.Update(file)
-}
-tx.Commit()
-return file
-```
-
-### 4. Exponential Backoff Retry
-
-When `MarkAsFailed` is called:
-```
-RetryCount++
-if RetryCount >= MaxRetryCount:
-    Status = PermanentlyFailed
-else:
-    Status = Pending
-    delay = InitialDelay * 2^(RetryCount-1)
-    AvailableForProcessingAt = Now() + min(delay, MaxRetryDelay)
-```
-
-**Why**: Prevents thundering herd, gives transient errors time to resolve.
-
-### 5. File Extension Preservation
-
-Original filenames are preserved for debugging:
-```
-WriteFile(tenant, stream, "invoice.pdf")
-→ Physical: /storage/vol-001/tenant-001/a1/b2/a1b2c3d4...e5f6.pdf
-                                                         └─ Extension preserved
-```
-
-**Why**: Easier to inspect files during debugging/recovery.
-
-## Critical Concurrency Patterns
-
-### Thread-Safety Requirements
-
-1. **Metadata Operations**: Use database transactions
-2. **Quota Operations**: Use mutex per directory
-3. **Tenant Cache**: Use `sync.Map` or `sync.RWMutex`
-4. **Volume Selection**: Read-only after initialization (safe)
-
-### Race Detector is MANDATORY
-
-**Always run tests with `-race` before committing**:
-```bash
-go test -race ./...
-```
-
-### Goroutine Patterns
-
-**Background Cleanup**:
-```go
-go func() {
-    ticker := time.NewTicker(interval)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-ticker.C:
-            cleanup()
-        case <-ctx.Done():
-            return
-        }
-    }
-}()
-```
-
-**Worker Pool**:
-```go
-for i := 0; i < numWorkers; i++ {
-    go func(workerID int) {
-        for {
-            file, err := pool.GetNextFileForProcessing(ctx, tenant)
-            if err != nil {
-                return
-            }
-            process(file)
-        }
-    }(i)
-}
-```
-
-## Error Handling Conventions
-
-### Custom Errors (pkg/core/errors.go)
-
-All domain errors are defined as sentinel errors:
-
-```go
-var (
-    ErrTenantDisabled = errors.New("tenant is disabled")
-    ErrTenantNotFound = errors.New("tenant not found")
-    ErrQuotaExceeded = errors.New("quota exceeded")
-    ErrDirectoryQuotaExceeded = errors.New("directory quota exceeded")
-    ErrInsufficientStorage = errors.New("insufficient storage space")
-    ErrNoFilesAvailable = errors.New("no files available for processing")
-)
-```
-
-**Usage**:
-```go
-if !tenant.IsEnabled() {
-    return "", fmt.Errorf("tenant %s: %w", tenant.ID, ErrTenantDisabled)
-}
-
-// Caller can check:
-if errors.Is(err, ErrTenantDisabled) {
-    // Handle disabled tenant
-}
-```
-
-### Transaction Rollback Pattern
-
-```go
-tx, err := db.Begin()
-if err != nil {
-    return err
-}
-defer tx.Rollback() // Safe to call even after Commit
-
-// ... operations ...
-
-if err := tx.Commit(); err != nil {
-    return err
-}
-```
-
-### Physical File Rollback
-
-When metadata write fails, delete physical file:
-```go
-fileKey, err := volume.WriteFile(ctx, stream, path)
-if err != nil {
-    return "", err
-}
-
-err = metadata.AddOrUpdate(ctx, fileMetadata)
-if err != nil {
-    // Rollback: delete physical file
-    volume.DeleteFile(ctx, fileKey)
-    return "", err
-}
-
-return fileKey, nil
-```
-
-## Database Patterns
-
-### BadgerDB Key Structure
-
-BadgerDB is a key-value store. We use structured keys for efficient querying.
-
-#### Metadata Keys
-
-```
-# Primary key: file metadata
-file:{fileKey} → JSON(FileMetadata)
-
-# Secondary index: status + available time
-status:{status}:{availableTime}:{fileKey} → fileKey
-
-# Secondary index: created time
-created:{createdTime}:{fileKey} → fileKey
-
-# Example
-file:a1b2c3d4e5f6... → {"fileKey":"a1b2c3d4...","status":0,...}
-status:0:2026-01-22T10:00:00Z:a1b2c3d4... → a1b2c3d4...
-created:2026-01-22T09:00:00Z:a1b2c3d4... → a1b2c3d4...
-```
-
-#### Directory Quota Keys
-
-```
-# Primary key: quota config
-quota:{directoryPath} → JSON(DirectoryQuota)
-
-# Example
-quota:/tenant-001/vol-001/a1/b2 → {"currentCount":150,"maxCount":1000,...}
-```
-
-#### Indexing Pattern
-
-Since BadgerDB doesn't have built-in indexing, we maintain secondary indexes manually:
-
-```go
-// Write with indexes
-func (r *MetadataRepository) AddOrUpdate(ctx context.Context, m *FileMetadata) error {
-    return r.db.Update(func(txn *badger.Txn) error {
-        // 1. Write primary key
-        key := []byte("file:" + m.FileKey)
-        val, _ := json.Marshal(m)
-        txn.Set(key, val)
-
-        // 2. Write status index
-        statusKey := fmt.Sprintf("status:%d:%s:%s",
-            m.Status, m.AvailableForProcessingAt, m.FileKey)
-        txn.Set([]byte(statusKey), []byte(m.FileKey))
-
-        // 3. Write created index
-        createdKey := fmt.Sprintf("created:%s:%s",
-            m.CreatedAt.Format(time.RFC3339), m.FileKey)
-        txn.Set([]byte(createdKey), []byte(m.FileKey))
-
-        return nil
-    })
-}
-```
-
-### Connection Management
-
-Use BadgerDB with optimized options:
-```go
-import "github.com/dgraph-io/badger/v4"
-
-func OpenBadgerDB(path string) (*badger.DB, error) {
-    opts := badger.DefaultOptions(path)
-
-    // Performance optimizations
-    opts.SyncWrites = false              // Async writes for performance
-    opts.NumVersionsToKeep = 1           // Keep only latest version
-    opts.CompactL0OnClose = true         // Compact on close
-    opts.ValueLogFileSize = 64 << 20     // 64MB value log files
-    opts.ValueThreshold = 1024           // Values >1KB go to value log
-
-    // Compression settings
-    opts.Compression = options.Snappy    // Enable Snappy compression
-    opts.ZSTDCompressionLevel = 3        // Or use ZSTD level 3
-
-    return badger.Open(opts)
-}
-```
-
-**Key Settings**:
-- `SyncWrites=false`: Better performance (durability via periodic sync)
-- `NumVersionsToKeep=1`: Minimize storage (we don't need versioning)
-- `CompactL0OnClose=true`: Cleanup on graceful shutdown
-- `Compression`: Snappy (fast) or ZSTD (better ratio)
-
-### Garbage Collection and Compression
-
-**CRITICAL**: Run GC periodically to reclaim space after deletions.
-
-```go
-// Background GC service
-func RunPeriodicGC(ctx context.Context, db *badger.DB, interval time.Duration) {
-    ticker := time.NewTicker(interval) // e.g., 10 minutes
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            // Run GC with 0.7 threshold (reclaim if 70%+ space is garbage)
-            err := db.RunValueLogGC(0.7)
-            if err == badger.ErrNoRewrite {
-                // No GC needed, skip
-                continue
-            }
-            if err != nil {
-                log.Error("GC failed", "error", err)
-            } else {
-                log.Info("GC completed successfully")
-            }
-        case <-ctx.Done():
-            return
-        }
-    }
-}
-```
-
-**GC Behavior**:
-- `ErrNoRewrite`: No garbage to collect (< 70% threshold)
-- Success: Space reclaimed, files compacted
-- Error: GC failed, will retry next cycle
-
-**Recommended Settings**:
-- Run GC every 5-10 minutes
-- Threshold: 0.5-0.7 (50-70% garbage)
-- Monitor GC duration and space savings
-
-## Testing Patterns
-
-### Unit Test Structure
-
-```go
-func TestFeatureName(t *testing.T) {
-    // Arrange
-    ctx := context.Background()
-    tenant := &TenantContext{ID: "test-tenant", Status: TenantStatusEnabled}
-    pool := setupTestPool(t)
-    defer cleanupTestPool(t, pool)
-
-    // Act
-    result, err := pool.SomeOperation(ctx, tenant, input)
-
-    // Assert
-    require.NoError(t, err)
-    assert.Equal(t, expected, result)
-}
-```
-
-### Table-Driven Tests
-
-```go
-func TestMultipleScenarios(t *testing.T) {
-    tests := []struct {
-        name    string
-        input   string
-        wantErr bool
-    }{
-        {"valid input", "test", false},
-        {"empty input", "", true},
-        {"invalid input", "###", true},
-    }
-
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            err := Validate(tt.input)
-            if tt.wantErr {
-                assert.Error(t, err)
-            } else {
-                assert.NoError(t, err)
-            }
-        })
-    }
-}
-```
-
-### Temporary Directory Pattern
-
-```go
-func setupTestPool(t *testing.T) *StoragePool {
-    tempDir := t.TempDir() // Auto-cleanup on test completion
-
-    pool, err := NewStoragePool(&StoragePoolOptions{
-        RootPath: tempDir,
-        // ... other options
-    })
-    require.NoError(t, err)
-
-    return pool
-}
-```
-
-### Benchmark Structure
-
-```go
-func BenchmarkMetadataGet(b *testing.B) {
-    pool := setupBenchPool(b)
-    defer pool.Close()
-
-    ctx := context.Background()
-    fileKey := "test-file-key"
-
-    b.ResetTimer() // Exclude setup from benchmark
-
-    for i := 0; i < b.N; i++ {
-        _, err := pool.GetFileInfo(ctx, tenant, fileKey)
-        if err != nil {
-            b.Fatal(err)
-        }
-    }
-}
-```
-
-## Performance Guidelines
-
-### Target Benchmarks
-
-Based on C# reference implementation (converted to Go expectations):
-
-| Operation | Target | Notes |
-|-----------|--------|-------|
-| Metadata get (cache hit) | < 50 μs | In-memory read |
-| Metadata get (cache miss) | < 20 ms | Database read |
-| Metadata add/update | < 500 μs | Database write |
-| Tenant get (cache hit) | < 1 μs | sync.Map read |
-| Directory quota check | < 200 μs | Mutex + database |
-| File write | < 1 ms | Excluding I/O |
-
-### Memory Management
-
-1. **Avoid memory leaks**:
-   - Close all `io.ReadCloser` returned from `ReadFile`
-   - Use `defer` for cleanup
-   - Use `t.Cleanup()` in tests
-
-2. **Cache cleanup**:
-   - Remove completed files from cache immediately
-   - Implement TTL for tenant cache (5 minutes)
-
-3. **Buffer pools**:
-   - Use `sync.Pool` for frequently allocated buffers
-   - Reuse byte slices in hot paths
-
-## Common Pitfalls to Avoid
-
-### 1. Race Conditions
-❌ **Bad**:
-```go
-var count int
-go func() { count++ }()
-go func() { count++ }()
-```
-
-✅ **Good**:
-```go
-var count int64
-go func() { atomic.AddInt64(&count, 1) }()
-go func() { atomic.AddInt64(&count, 1) }()
-```
-
-### 2. Forgetting to Close Resources
-❌ **Bad**:
-```go
-file, _ := pool.ReadFile(ctx, tenant, fileKey)
-// ... use file ...
-// Forgot to close!
-```
-
-✅ **Good**:
-```go
-file, err := pool.ReadFile(ctx, tenant, fileKey)
-if err != nil {
-    return err
-}
-defer file.Close()
-```
-
-### 3. Not Checking Context Cancellation
-❌ **Bad**:
-```go
-for {
-    file, _ := pool.GetNextFileForProcessing(ctx, tenant)
-    process(file)
-}
-```
-
-✅ **Good**:
-```go
-for {
-    select {
-    case <-ctx.Done():
-        return ctx.Err()
-    default:
-    }
-
-    file, err := pool.GetNextFileForProcessing(ctx, tenant)
-    if err != nil {
-        return err
-    }
-    process(file)
-}
-```
-
-### 4. Ignoring Errors
-❌ **Bad**:
-```go
-pool.MarkAsCompleted(ctx, fileKey)
-```
-
-✅ **Good**:
-```go
-if err := pool.MarkAsCompleted(ctx, fileKey); err != nil {
-    log.Error("failed to mark file as completed", "fileKey", fileKey, "error", err)
-    return err
-}
-```
-
-## Code Style Guidelines
-
-### Naming Conventions
-- **Interfaces**: Suffix with behavior (e.g., `StoragePool`, `TenantManager`)
-- **Implementations**: Descriptive names (e.g., `LocalFileSystemVolume`)
-- **Private functions**: Use lowercase (e.g., `selectVolumeForWrite`)
-- **Constants**: Use `const` blocks with `iota` for enums
-
-### Documentation
-- **All exported functions** must have godoc comments
-- **Interfaces** must document behavior and error conditions
-- **Complex algorithms** must have inline comments explaining "why"
-
-Example:
-```go
-// WriteFile stores a file in the storage pool and returns a system-generated fileKey.
-// The file is initially in Pending status and will be available for processing via GetNextFileForProcessing.
-//
-// originalFileName is optional but recommended to preserve file extensions for debugging.
-// If tenant is disabled, returns ErrTenantDisabled.
-// If quota is exceeded, returns ErrQuotaExceeded.
-// If no volumes have space, returns ErrInsufficientStorage.
-func (p *StoragePool) WriteFile(ctx context.Context, tenant TenantContext, content io.Reader, originalFileName *string) (string, error) {
-    // Implementation...
-}
-```
-
-### Error Messages
-- Include context (tenant ID, file key, etc.)
-- Use `fmt.Errorf` with `%w` for wrapping
-- Be actionable (user knows what to fix)
-
-Example:
-```go
-return fmt.Errorf("failed to write file for tenant %s: %w", tenant.ID, err)
-```
-
-## Logging Conventions
-
-Use structured logging with `log/slog`:
-
-```go
-slog.Info("file written successfully",
-    "tenantId", tenant.ID,
-    "fileKey", fileKey,
-    "volumeId", volume.ID,
-    "fileSize", fileSize,
-)
-
-slog.Error("failed to mark file as completed",
-    "fileKey", fileKey,
-    "error", err,
-)
-```
-
-**Log levels**:
-- `Debug`: Detailed tracing (disabled in production)
-- `Info`: Normal operations (file written, processing started)
-- `Warn`: Recoverable errors (retry, quota warning)
-- `Error`: Unrecoverable errors (database failure, disk full)
-
-## Configuration Patterns
-
-Use functional options pattern:
-
-```go
-type StoragePoolOptions struct {
-    RootPath             string
-    MaxRetryCount        int
-    InitialRetryDelay    time.Duration
-    MaxRetryDelay        time.Duration
-    EnableAutoTenantCreate bool
-    TenantCacheTTL       time.Duration
-    CleanupInterval      time.Duration
-}
-
-func WithMaxRetryCount(count int) func(*StoragePoolOptions) {
-    return func(o *StoragePoolOptions) {
-        o.MaxRetryCount = count
-    }
-}
-
-// Usage:
-pool := NewStoragePool(
-    WithMaxRetryCount(5),
-    WithCleanupInterval(30*time.Minute),
-)
-```
-
-## Monitoring and Observability
-
-### Metrics to Track (Future)
-- Files written per tenant
-- Files processed per tenant
-- Queue depth per tenant
-- Processing latency (p50, p95, p99)
-- Retry rate
-- Permanent failure rate
-- Volume capacity utilization
-
-### Health Checks
-- Database connectivity
-- Volume health (disk space, I/O errors)
-- Cleanup service running
-
-## Reference Implementation
-
-This project is based on [Locus (C#/.NET)](https://github.com/cocosip/Locus).
-
-When in doubt about design decisions or expected behavior:
-1. Check `doc/README.md` for Locus architecture overview
-2. Check `doc/REQUIREMENTS_AND_PLAN.md` for detailed requirements
-3. Explore `Locus-Code/` directory for C# reference implementation
-4. Maintain API compatibility with Locus (adapted to Go idioms)
-
-## Development Workflow
-
-1. **Start with tests**: Write failing tests first (TDD)
-2. **Run with race detector**: `go test -race ./...`
-3. **Benchmark critical paths**: Metadata, quota, scheduling
-4. **Check coverage**: Aim for 80%+ (`go test -cover ./...`)
-5. **Lint before commit**: `golangci-lint run`
-6. **Update AGENTS.md**: If architecture changes
-
-## Project Status
-
-**Current Phase**: Foundation (Phase 1)
-- ✅ Requirements defined
-- ✅ Architecture designed
-- ⏳ Core interfaces being implemented
-- ⏳ Testing framework being set up
-
-See `doc/REQUIREMENTS_AND_PLAN.md` for full development plan (12-13 weeks, 11 phases).
+- Keep setup and fixture generation outside timed sections.
+- Check every setup error; benchmarks must not continue with partially initialized components.
+- Use `b.ResetTimer`, `b.StopTimer`, or `b.Loop` correctly.
+- Record the Go version, OS/architecture, CPU, command, run count, and payload assumptions with published results.
+- Treat benchmark values as host-specific regression evidence, not universal performance guarantees.
+
+## Formatting And Review
+
+- Run `gofmt` on every changed Go file.
+- Run `git diff --check` before completion.
+- Keep comments focused on why, ownership, or invariants.
+- Preserve unrelated user changes in a dirty worktree.
+- Do not stage, commit, pull, push, create branches, or rewrite history unless explicitly requested.
+- Work on the current branch when requested; do not create a worktree or branch.

@@ -57,7 +57,7 @@ const (
 	// FileStatusProcessing indicates the file is currently being processed.
 	FileStatusProcessing FileProcessingStatus = 1
 
-	// FileStatusCompleted indicates the file was successfully processed (file deleted).
+	// FileStatusCompleted indicates the file was successfully processed and awaits cleanup.
 	FileStatusCompleted FileProcessingStatus = 2
 
 	// FileStatusFailed is a legacy/unused status.
@@ -65,6 +65,15 @@ const (
 
 	// FileStatusPermanentlyFailed indicates the file exceeded max retries.
 	FileStatusPermanentlyFailed FileProcessingStatus = 4
+
+	// FileStatusDeleteRequested indicates cleanup has requested physical deletion.
+	FileStatusDeleteRequested FileProcessingStatus = 5
+
+	// FileStatusDeleteSucceeded indicates physical deletion completed.
+	FileStatusDeleteSucceeded FileProcessingStatus = 6
+
+	// FileStatusDeadLettered indicates a permanently failed file was moved to dead letter storage.
+	FileStatusDeadLettered FileProcessingStatus = 7
 )
 
 // String returns the string representation of FileProcessingStatus.
@@ -80,9 +89,28 @@ func (s FileProcessingStatus) String() string {
 		return "Failed"
 	case FileStatusPermanentlyFailed:
 		return "PermanentlyFailed"
+	case FileStatusDeleteRequested:
+		return "DeleteRequested"
+	case FileStatusDeleteSucceeded:
+		return "DeleteSucceeded"
+	case FileStatusDeadLettered:
+		return "DeadLettered"
 	default:
 		return "Unknown"
 	}
+}
+
+// FileProcessingLease identifies one worker's active claim on a file.
+// Callers must return the lease when completing or failing processing.
+type FileProcessingLease struct {
+	// TenantID is the tenant that owns the leased file.
+	TenantID string
+
+	// FileKey is the leased file identifier.
+	FileKey string
+
+	// ProcessingStartTimeUTC uniquely identifies the processing attempt.
+	ProcessingStartTimeUTC time.Time
 }
 
 // FileLocation contains detailed information about a file's location and status.
@@ -99,6 +127,9 @@ type FileLocation struct {
 
 	// PhysicalPath is the full path to the file on the storage volume.
 	PhysicalPath string
+
+	// DirectoryPath is the normalized logical directory used for quota accounting.
+	DirectoryPath string
 
 	// FileSize is the size of the file in bytes.
 	FileSize int64
@@ -120,6 +151,12 @@ type FileLocation struct {
 
 	// ProcessingStartTime is when processing started (nil if not processing).
 	ProcessingStartTime *time.Time
+
+	// CompletedAt is when processing completed successfully.
+	CompletedAt *time.Time
+
+	// Lease identifies the active processing claim, if one exists.
+	Lease *FileProcessingLease
 
 	// LastFailedAt is when the last failure occurred.
 	LastFailedAt *time.Time
@@ -157,6 +194,7 @@ type FileMetadata struct {
 	TenantID                 string
 	VolumeID                 string
 	PhysicalPath             string
+	DirectoryPath            string
 	FileSize                 int64
 	FileExtension            string
 	OriginalFileName         string
@@ -164,6 +202,7 @@ type FileMetadata struct {
 	RetryCount               int
 	AvailableForProcessingAt *time.Time
 	ProcessingStartTime      *time.Time
+	CompletedAt              *time.Time
 	LastFailedAt             *time.Time
 	LastError                string
 	CreatedAt                time.Time
@@ -172,11 +211,21 @@ type FileMetadata struct {
 
 // ToFileLocation converts FileMetadata to FileLocation.
 func (m *FileMetadata) ToFileLocation() *FileLocation {
+	var lease *FileProcessingLease
+	if m.ProcessingStartTime != nil {
+		lease = &FileProcessingLease{
+			TenantID:               m.TenantID,
+			FileKey:                m.FileKey,
+			ProcessingStartTimeUTC: *m.ProcessingStartTime,
+		}
+	}
+
 	return &FileLocation{
 		FileKey:                  m.FileKey,
 		TenantID:                 m.TenantID,
 		VolumeID:                 m.VolumeID,
 		PhysicalPath:             m.PhysicalPath,
+		DirectoryPath:            m.DirectoryPath,
 		FileSize:                 m.FileSize,
 		FileExtension:            m.FileExtension,
 		OriginalFileName:         m.OriginalFileName,
@@ -184,6 +233,8 @@ func (m *FileMetadata) ToFileLocation() *FileLocation {
 		RetryCount:               m.RetryCount,
 		AvailableForProcessingAt: m.AvailableForProcessingAt,
 		ProcessingStartTime:      m.ProcessingStartTime,
+		CompletedAt:              m.CompletedAt,
+		Lease:                    lease,
 		LastFailedAt:             m.LastFailedAt,
 		LastError:                m.LastError,
 		CreatedAt:                m.CreatedAt,
@@ -286,6 +337,9 @@ func (p *FileRetryPolicy) CalculateRetryDelay(retryCount int) time.Duration {
 type CleanupStatistics struct {
 	// EmptyDirectoriesRemoved is the number of empty directories removed.
 	EmptyDirectoriesRemoved int
+
+	// CompletedRecordsRemoved is the number of completed files and metadata records removed.
+	CompletedRecordsRemoved int
 
 	// PermanentlyFailedFilesRemoved is the number of permanently failed files removed.
 	PermanentlyFailedFilesRemoved int

@@ -14,7 +14,7 @@ venue:
   # Automatically create tenants when referenced
   autoCreateTenants: true
 
-  # Default quota for new tenants (0 = unlimited, in bytes)
+  # Default managed-file count quota for new tenants (0 = unlimited)
   defaultTenantQuota: 0
 
   # Enable database health checking on startup
@@ -29,7 +29,7 @@ venue:
 
   # Tenant manager configuration
   tenantManagerOptions:
-    # Directory for tenant metadata files (empty = use metadataDirectory/.locus/tenants)
+    # Directory for tenant metadata files (empty = use the runtime default)
     metadataPath: ""
     # Cache time-to-live for tenant information
     cacheTTL: 5m
@@ -63,20 +63,20 @@ venue:
       volumeType: LocalFileSystem
       shardingDepth: 2
       # Enable fsync after file writes (true = durable but slower)
-      enableFsync: false
+      enableFsync: true
 
     - volumeId: vol-002
       mountPath: ./venue-data/storage/volume-2
       volumeType: LocalFileSystem
       shardingDepth: 2
-      enableFsync: false
+      enableFsync: true
 
   # Tenant configurations
   tenants:
     # VIP tenant with specific quota
     - tenantId: tenant-001
       enabled: true
-      quota: 10000000  # 10MB
+      quota: 10000000  # managed files
 
     # Regular tenant with default quota
     - tenantId: tenant-002
@@ -144,11 +144,11 @@ venue:
     # Cleanup permanently failed files
     cleanupPermanentlyFailedFiles: true
     # Retention period for failed files
-    failedFileRetentionPeriod: 168h  # 7 days
+    failedFileRetentionPeriod: 72h  # 3 days
     # Cleanup completed file records
-    cleanupCompletedRecords: false
+    cleanupCompletedRecords: true
     # Retention period for completed records
-    completedRecordRetentionPeriod: 720h  # 30 days
+    completedRecordRetentionPeriod: 0s  # Remove during the next cleanup cycle
     # Optimize databases to reclaim space
     optimizeDatabases: true
     # Database optimization interval

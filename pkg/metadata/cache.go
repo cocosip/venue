@@ -48,18 +48,19 @@ func newMetadataCacheWithSize(ttl time.Duration, maxSize int) *metadataCache {
 // Returns nil if not found or expired.
 // Returns a copy to prevent concurrent modification.
 // Updates LRU position on hit.
-func (c *metadataCache) get(fileKey string) *core.FileMetadata {
+func (c *metadataCache) get(tenantID, fileKey string) *core.FileMetadata {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, exists := c.entries[fileKey]
+	key := buildCacheKey(tenantID, fileKey)
+	entry, exists := c.entries[key]
 	if !exists {
 		return nil
 	}
 
 	if entry.isExpired() {
 		// Remove expired entry
-		c.removeEntry(fileKey)
+		c.removeEntry(key)
 		return nil
 	}
 
@@ -74,12 +75,13 @@ func (c *metadataCache) get(fileKey string) *core.FileMetadata {
 // set adds or updates a file metadata in the cache.
 // Stores a copy to prevent concurrent modification.
 // Evicts oldest entries if cache is at capacity.
-func (c *metadataCache) set(fileKey string, metadata *core.FileMetadata) {
+func (c *metadataCache) set(metadata *core.FileMetadata) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	key := buildCacheKey(metadata.TenantID, metadata.FileKey)
 
 	// Check if entry already exists
-	if existing, exists := c.entries[fileKey]; exists {
+	if existing, exists := c.entries[key]; exists {
 		// Update existing entry
 		metadataCopy := *metadata
 		existing.metadata = &metadataCopy
@@ -101,16 +103,16 @@ func (c *metadataCache) set(fileKey string, metadata *core.FileMetadata) {
 	}
 
 	// Add to front of LRU list (most recent)
-	entry.listElem = c.lruList.PushFront(fileKey)
-	c.entries[fileKey] = entry
+	entry.listElem = c.lruList.PushFront(key)
+	c.entries[key] = entry
 }
 
 // delete removes a file metadata from the cache.
-func (c *metadataCache) delete(fileKey string) {
+func (c *metadataCache) delete(tenantID, fileKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.removeEntry(fileKey)
+	c.removeEntry(buildCacheKey(tenantID, fileKey))
 }
 
 // removeEntry removes an entry from both map and LRU list (must hold lock).
@@ -136,7 +138,7 @@ func (c *metadataCache) evictLRU() {
 
 // listByStatus returns all cached metadata with the specified status.
 // Expired entries are automatically removed.
-func (c *metadataCache) listByStatus(status core.FileProcessingStatus) []*core.FileMetadata {
+func (c *metadataCache) listByStatus(tenantID string, status core.FileProcessingStatus) []*core.FileMetadata {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -152,12 +154,17 @@ func (c *metadataCache) listByStatus(status core.FileProcessingStatus) []*core.F
 			continue
 		}
 
-		if entry.metadata.Status == status {
-			results = append(results, entry.metadata)
+		if entry.metadata.TenantID == tenantID && entry.metadata.Status == status {
+			metadataCopy := *entry.metadata
+			results = append(results, &metadataCopy)
 		}
 	}
 
 	return results
+}
+
+func buildCacheKey(tenantID, fileKey string) string {
+	return tenantID + "\x00" + fileKey
 }
 
 // getStats returns cache statistics for monitoring.

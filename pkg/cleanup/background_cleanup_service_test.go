@@ -14,6 +14,9 @@ type mockCleanupService struct {
 	cleanupEmptyDirsCalled        atomic.Int32
 	cleanupTimedOutFilesCalled    atomic.Int32
 	cleanupFailedFilesCalled      atomic.Int32
+	failedRetentionNanos          atomic.Int64
+	cleanupCompletedFilesCalled   atomic.Int32
+	completedRetentionNanos       atomic.Int64
 	cleanupOrphanedMetadataCalled atomic.Int32
 	optimizeDatabasesCalled       atomic.Int32
 }
@@ -28,9 +31,16 @@ func (m *mockCleanupService) CleanupTimedOutProcessingFiles(ctx context.Context,
 	return &core.CleanupStatistics{TimedOutFilesReset: 3}, nil
 }
 
-func (m *mockCleanupService) CleanupPermanentlyFailedFiles(ctx context.Context) (*core.CleanupStatistics, error) {
+func (m *mockCleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
 	m.cleanupFailedFilesCalled.Add(1)
+	m.failedRetentionNanos.Store(int64(retention))
 	return &core.CleanupStatistics{PermanentlyFailedFilesRemoved: 2, SpaceFreed: 1024}, nil
+}
+
+func (m *mockCleanupService) CleanupCompletedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
+	m.cleanupCompletedFilesCalled.Add(1)
+	m.completedRetentionNanos.Store(int64(retention))
+	return &core.CleanupStatistics{CompletedRecordsRemoved: 4, SpaceFreed: 2048}, nil
 }
 
 func (m *mockCleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.CleanupStatistics, error) {
@@ -108,6 +118,9 @@ func TestNewBackgroundCleanupService(t *testing.T) {
 				if svc == nil {
 					t.Error("Expected service to be non-nil")
 				}
+				if tt.name == "valid with defaults" && svc.failedFileRetention != 3*24*time.Hour {
+					t.Errorf("failed retention = %v, want 72h", svc.failedFileRetention)
+				}
 			}
 		})
 	}
@@ -166,12 +179,15 @@ func TestBackgroundCleanupService_CleanupExecution(t *testing.T) {
 	mockSvc := &mockCleanupService{}
 
 	bgSvc, err := NewBackgroundCleanupService(&BackgroundCleanupServiceOptions{
-		CleanupService:                mockSvc,
-		InitialDelay:                  50 * time.Millisecond,
-		CleanupInterval:               200 * time.Millisecond,
-		CleanupEmptyDirectories:       true,
-		CleanupTimedOutFiles:          true,
-		CleanupPermanentlyFailedFiles: true,
+		CleanupService:                 mockSvc,
+		InitialDelay:                   50 * time.Millisecond,
+		CleanupInterval:                200 * time.Millisecond,
+		CleanupEmptyDirectories:        true,
+		CleanupTimedOutFiles:           true,
+		CleanupPermanentlyFailedFiles:  true,
+		FailedFileRetentionPeriod:      7 * 24 * time.Hour,
+		CleanupCompletedRecords:        true,
+		CompletedRecordRetentionPeriod: 6 * time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
@@ -196,6 +212,15 @@ func TestBackgroundCleanupService_CleanupExecution(t *testing.T) {
 	}
 	if mockSvc.cleanupFailedFilesCalled.Load() < 1 {
 		t.Error("CleanupPermanentlyFailedFiles should have been called at least once")
+	}
+	if got := time.Duration(mockSvc.failedRetentionNanos.Load()); got != 7*24*time.Hour {
+		t.Errorf("CleanupPermanentlyFailedFiles retention = %v, want %v", got, 7*24*time.Hour)
+	}
+	if mockSvc.cleanupCompletedFilesCalled.Load() < 1 {
+		t.Error("CleanupCompletedFiles should have been called at least once")
+	}
+	if got := time.Duration(mockSvc.completedRetentionNanos.Load()); got != 6*time.Hour {
+		t.Errorf("CleanupCompletedFiles retention = %v, want %v", got, 6*time.Hour)
 	}
 
 	// Wait for another cycle

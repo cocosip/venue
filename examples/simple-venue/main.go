@@ -20,30 +20,21 @@ func main() {
 	fmt.Println("=== Simple Venue Usage Example ===")
 	fmt.Println()
 
-	// Method 1: Use default configuration
-	fmt.Println("1. Creating Venue with default configuration")
-	cfg := config.DefaultConfig()
-
-	// Override some settings
-	cfg.MetadataDirectory = dataDir + "/metadata"
-	cfg.QuotaDirectory = dataDir + "/quotas"
-	cfg.Volumes[0].MountPath = dataDir + "/storage/default"
-	cfg.EnableBackgroundCleanup = true
-	cfg.EnableDatabaseHealthCheck = true
-
-	// Add a tenant configuration
-	cfg.Tenants = []config.TenantConfig{
-		{
-			TenantId: "demo-tenant",
-			Enabled:  true,
-			Quota:    nil, // unlimited
-		},
-	}
+	// Build the public source-independent configuration.
+	fmt.Println("1. Creating Venue configuration")
+	cfg := config.New().
+		WithMetadataDirectory(dataDir + "/metadata").
+		WithQuotaDirectory(dataDir + "/quotas").
+		WithVolumes(config.NewVolumeConfig().
+			WithVolumeID("default-volume").
+			WithMountPath(dataDir + "/storage/default").
+			WithShardingDepth(2)).
+		WithTenants(config.NewTenantConfig("demo-tenant").WithoutQuota()).
+		WithBackgroundCleanupEnabled(true).
+		WithDatabaseHealthCheckEnabled(true)
 
 	// Create Venue instance
-	v, err := venue.NewVenue(&venue.VenueOptions{
-		Config: cfg,
-	})
+	v, err := venue.NewVenue(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create venue: %v", err)
 	}
@@ -100,7 +91,7 @@ func main() {
 
 	// 5. Get file status
 	fmt.Println("5. Getting file processing status")
-	status, err := storagePool.GetFileStatus(ctx, fileKey)
+	status, err := storagePool.GetFileStatus(ctx, tenantCtx, fileKey)
 	if err != nil {
 		log.Fatalf("Failed to get file status: %v", err)
 	}
@@ -131,9 +122,9 @@ func main() {
 	fmt.Println("✨ Example completed!")
 	fmt.Println()
 	fmt.Println("This example demonstrates:")
-	fmt.Println("  1. Creating Venue instance with configuration (Locus-style)")
+	fmt.Println("  1. Creating a Venue instance with public configuration")
 	fmt.Println("  2. Starting/stopping Venue services")
 	fmt.Println("  3. Getting component instances from Venue (like dependency injection)")
 	fmt.Println("  4. Performing file operations using StoragePool")
-	fmt.Println("  5. Configuration follows Locus structure with Tenants, Volumes, etc.")
+	fmt.Println("  5. Configuring tenants, volumes, cleanup, and health checks")
 }

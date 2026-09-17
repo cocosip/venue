@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -73,6 +74,9 @@ func TestFileProcessingStatus_String(t *testing.T) {
 		{"completed", FileStatusCompleted, "Completed"},
 		{"failed", FileStatusFailed, "Failed"},
 		{"permanently failed", FileStatusPermanentlyFailed, "PermanentlyFailed"},
+		{"delete requested", FileStatusDeleteRequested, "DeleteRequested"},
+		{"delete succeeded", FileStatusDeleteSucceeded, "DeleteSucceeded"},
+		{"dead lettered", FileStatusDeadLettered, "DeadLettered"},
 		{"unknown", FileProcessingStatus(999), "Unknown"},
 	}
 
@@ -111,6 +115,59 @@ func TestFileMetadata_ToFileLocation(t *testing.T) {
 	}
 	if location.Status != metadata.Status {
 		t.Errorf("Status mismatch: got %v, want %v", location.Status, metadata.Status)
+	}
+}
+
+func TestFileMetadata_ToFileLocationIncludesProcessingLease(t *testing.T) {
+	leaseStart := time.Date(2026, time.September, 17, 10, 11, 12, 345, time.UTC)
+	metadata := &FileMetadata{
+		FileKey:             "leased-file",
+		TenantID:            "tenant-001",
+		Status:              FileStatusProcessing,
+		ProcessingStartTime: &leaseStart,
+	}
+
+	location := metadata.ToFileLocation()
+
+	if location.Lease == nil {
+		t.Fatal("processing location has nil lease")
+	}
+	if location.Lease.TenantID != "tenant-001" {
+		t.Errorf("lease TenantID = %q, want tenant-001", location.Lease.TenantID)
+	}
+	if location.Lease.FileKey != "leased-file" {
+		t.Errorf("lease FileKey = %q, want leased-file", location.Lease.FileKey)
+	}
+	if !location.Lease.ProcessingStartTimeUTC.Equal(leaseStart) {
+		t.Errorf("lease ProcessingStartTimeUTC = %v, want %v", location.Lease.ProcessingStartTimeUTC, leaseStart)
+	}
+}
+
+func TestFileProcessingLeaseMismatchErrorSupportsErrorsIsAndAs(t *testing.T) {
+	expectedStart := time.Date(2026, time.September, 17, 10, 0, 0, 0, time.UTC)
+	actualStart := expectedStart.Add(time.Minute)
+	actualStatus := FileStatusProcessing
+	original := &FileProcessingLeaseMismatchError{
+		TenantID:                       "tenant-001",
+		FileKey:                        "file-001",
+		ExpectedProcessingStartTimeUTC: expectedStart,
+		ActualProcessingStartTimeUTC:   &actualStart,
+		ActualStatus:                   &actualStatus,
+	}
+
+	if !errors.Is(original, ErrProcessingLeaseMismatch) {
+		t.Fatal("errors.Is did not match ErrProcessingLeaseMismatch")
+	}
+
+	var details *FileProcessingLeaseMismatchError
+	if !errors.As(original, &details) {
+		t.Fatal("errors.As did not expose FileProcessingLeaseMismatchError")
+	}
+	if details.TenantID != "tenant-001" || details.FileKey != "file-001" {
+		t.Errorf("mismatch identity = (%q, %q), want (tenant-001, file-001)", details.TenantID, details.FileKey)
+	}
+	if details.ActualStatus == nil || *details.ActualStatus != FileStatusProcessing {
+		t.Errorf("ActualStatus = %v, want Processing", details.ActualStatus)
 	}
 }
 

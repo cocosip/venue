@@ -76,16 +76,24 @@ func TestIntegration_CompleteWorkflow(t *testing.T) {
 		}
 
 		// 4. Mark as completed
-		err = pool.MarkAsCompleted(ctx, fileKey)
+		err = pool.MarkAsCompleted(ctx, requirePoolProcessingLease(t, location))
 		if err != nil {
 			t.Fatalf("Failed to mark as completed: %v", err)
 		}
 
-		// 5. Verify file is deleted
-		_, err = pool.GetFileInfo(ctx, tenant, fileKey)
-		if err != core.ErrFileNotFound {
-			t.Errorf("Expected file to be deleted, got error: %v", err)
+		// 5. Verify completion is durable until cleanup removes the file.
+		info, err := pool.GetFileInfo(ctx, tenant, fileKey)
+		if err != nil {
+			t.Fatalf("GetFileInfo after completion failed: %v", err)
 		}
+		if info.Status != core.FileStatusCompleted {
+			t.Errorf("Status after completion = %v, want Completed", info.Status)
+		}
+		reader, err = pool.ReadFile(ctx, tenant, fileKey)
+		if err != nil {
+			t.Fatalf("ReadFile after completion failed: %v", err)
+		}
+		_ = reader.Close()
 	})
 }
 
@@ -130,9 +138,9 @@ func TestIntegration_FailedFileRetry(t *testing.T) {
 	// First attempt
 	location, _ := pool.GetNextFileForProcessing(ctx, tenant)
 
-	// Fail it twice (within max retries)
-	for i := 1; i <= 2; i++ {
-		err := pool.MarkAsFailed(ctx, location.FileKey, "Test failure")
+	// The second failure reaches the configured retry limit.
+	for i := 1; i <= 1; i++ {
+		err := pool.MarkAsFailed(ctx, requirePoolProcessingLease(t, location), "Test failure")
 		if err != nil {
 			t.Fatalf("Attempt %d: Failed to mark as failed: %v", i, err)
 		}
@@ -144,14 +152,14 @@ func TestIntegration_FailedFileRetry(t *testing.T) {
 		location, _ = pool.GetNextFileForProcessing(ctx, tenant)
 	}
 
-	// Third failure should make it permanently failed
-	err := pool.MarkAsFailed(ctx, location.FileKey, "Final failure")
+	// Second failure should make it permanently failed.
+	err := pool.MarkAsFailed(ctx, requirePoolProcessingLease(t, location), "Final failure")
 	if err != nil {
 		t.Fatalf("Failed to mark as failed: %v", err)
 	}
 
 	// Verify status
-	status, _ := pool.GetFileStatus(ctx, fileKey)
+	status, _ := pool.GetFileStatus(ctx, tenant, fileKey)
 	if status != core.FileStatusPermanentlyFailed {
 		t.Errorf("Expected status PermanentlyFailed, got %v", status)
 	}
@@ -205,7 +213,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 
 	// Mark all as completed
 	for _, location := range batch {
-		_ = pool.MarkAsCompleted(ctx, location.FileKey)
+		_ = pool.MarkAsCompleted(ctx, requirePoolProcessingLease(t, location))
 	}
 
 	// Get another batch (remaining 5)
@@ -282,7 +290,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 				time.Sleep(5 * time.Millisecond)
 
 				// Mark as completed
-				_ = pool.MarkAsCompleted(ctx, location.FileKey)
+				_ = pool.MarkAsCompleted(ctx, requirePoolProcessingLease(t, location))
 			}
 		}(workerID)
 	}
@@ -456,4 +464,15 @@ func containsInner(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func requirePoolProcessingLease(t *testing.T, location *core.FileLocation) core.FileProcessingLease {
+	t.Helper()
+	if location == nil {
+		t.Fatal("processing location is nil")
+	}
+	if location.Lease == nil {
+		t.Fatal("processing location has nil lease")
+	}
+	return *location.Lease
 }

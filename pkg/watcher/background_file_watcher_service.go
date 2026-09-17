@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 )
 
 // BackgroundFileWatcherServiceOptions configures the background file watcher service.
@@ -15,9 +16,8 @@ type BackgroundFileWatcherServiceOptions struct {
 	// FileWatcher is the underlying file watcher that performs the actual scans.
 	FileWatcher core.FileWatcher
 
-	// Logger is the logger instance to use.
-	// If nil, uses slog.Default().
-	Logger *slog.Logger
+	// Logging is the instance-scoped logging runtime. Nil disables logging.
+	Logging *logging.Runtime
 
 	// InitialDelay is the delay before the first scan.
 	// Default: 10 seconds
@@ -43,7 +43,7 @@ type BackgroundFileWatcherServiceOptions struct {
 // BackgroundFileWatcherService runs file watcher scans in the background on a scheduled interval.
 type BackgroundFileWatcherService struct {
 	fileWatcher            core.FileWatcher
-	logger                 *slog.Logger
+	logger                 *logging.Runtime
 	initialDelay           time.Duration
 	minimumPollingInterval time.Duration
 	defaultPollingInterval time.Duration
@@ -67,10 +67,9 @@ func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) 
 		return nil, fmt.Errorf("file watcher cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
-	// Set logger (use default if not provided)
-	logger := opts.Logger
+	logger := opts.Logging
 	if logger == nil {
-		logger = slog.Default()
+		logger = logging.Disabled()
 	}
 
 	// Set defaults
@@ -121,7 +120,7 @@ func (s *BackgroundFileWatcherService) Start() error {
 	s.wg.Add(1)
 	go s.run()
 
-	s.logger.Info("Background file watcher service started")
+	s.emit(s.ctx, slog.LevelInfo, "started", "Background file watcher service started")
 
 	return nil
 }
@@ -135,12 +134,12 @@ func (s *BackgroundFileWatcherService) Stop() error {
 		return fmt.Errorf("background file watcher service is not running")
 	}
 
-	s.logger.Info("Stopping background file watcher service...")
+	s.emit(s.ctx, slog.LevelInfo, "stopping", "Stopping background file watcher service")
 	s.cancel()
 	s.wg.Wait()
 	s.running = false
 
-	s.logger.Info("Background file watcher service stopped")
+	s.emit(s.ctx, slog.LevelInfo, "stopped", "Background file watcher service stopped")
 
 	return nil
 }
@@ -171,7 +170,7 @@ func (s *BackgroundFileWatcherService) run() {
 	defer s.wg.Done()
 
 	// Initial delay before first scan
-	s.logger.Info("Background file watcher service waiting for initial delay", "delay", s.initialDelay)
+	s.emit(s.ctx, slog.LevelInfo, "initial_delay", "Background file watcher service waiting for initial delay", slog.Duration("delay", s.initialDelay))
 	select {
 	case <-time.After(s.initialDelay):
 		// Continue
@@ -183,12 +182,12 @@ func (s *BackgroundFileWatcherService) run() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			s.logger.Info("File watcher service shutting down")
+			s.emit(s.ctx, slog.LevelInfo, "shutting_down", "File watcher service shutting down")
 			return
 		default:
 			// Check if service is enabled
 			if !s.IsEnabled() {
-				s.logger.Debug("File watcher service is globally disabled", "checkInterval", s.disabledCheckInterval)
+				s.emit(s.ctx, slog.LevelDebug, "disabled", "File watcher service is globally disabled", slog.Duration("check_interval", s.disabledCheckInterval))
 
 				select {
 				case <-time.After(s.disabledCheckInterval):
@@ -203,7 +202,7 @@ func (s *BackgroundFileWatcherService) run() {
 
 			// Calculate next scan interval
 			interval := s.calculateNextInterval()
-			s.logger.Debug("Next scan cycle", "interval", interval)
+			s.emit(s.ctx, slog.LevelDebug, "next_scan", "Next scan cycle", slog.Duration("interval", interval))
 
 			// Wait for next cycle
 			select {
@@ -218,13 +217,13 @@ func (s *BackgroundFileWatcherService) run() {
 
 // executeScanCycle performs a scan of all enabled watchers.
 func (s *BackgroundFileWatcherService) executeScanCycle() {
-	s.logger.Info("Starting file watcher scan cycle")
+	s.emit(s.ctx, slog.LevelInfo, "cycle_started", "Starting file watcher scan cycle")
 	startTime := time.Now()
 
 	// Get all watchers
 	watchers, err := s.fileWatcher.GetAllWatchers(s.ctx)
 	if err != nil {
-		s.logger.Error("Failed to get watchers", "error", err)
+		s.emit(s.ctx, slog.LevelError, "watchers_get_failed", "Failed to get watchers", errorTypeAttr(err))
 		return
 	}
 
@@ -237,11 +236,11 @@ func (s *BackgroundFileWatcherService) executeScanCycle() {
 	}
 
 	if enabledCount == 0 {
-		s.logger.Debug("No enabled watchers found, skipping scan")
+		s.emit(s.ctx, slog.LevelDebug, "no_enabled_watchers", "No enabled watchers found; skipping scan")
 		return
 	}
 
-	s.logger.Info("Scanning enabled watchers", "count", enabledCount)
+	s.emit(s.ctx, slog.LevelInfo, "watchers_scanning", "Scanning enabled watchers", slog.Int("count", enabledCount))
 
 	// Scan all watchers
 	totalImported := 0
@@ -260,34 +259,28 @@ func (s *BackgroundFileWatcherService) executeScanCycle() {
 
 		result, err := s.fileWatcher.ScanNow(s.ctx, watcher.WatcherID)
 		if err != nil {
-			s.logger.Error("Failed to scan watcher", "watcherID", watcher.WatcherID, "error", err)
+			s.emit(s.ctx, slog.LevelError, "watcher_scan_failed", "Failed to scan watcher", slog.String("watcher_id", watcher.WatcherID), errorTypeAttr(err))
 			continue
 		}
 
 		if result.FilesImported > 0 || result.FilesFailed > 0 {
-			s.logger.Info("Watcher scan completed",
-				"watcherID", watcher.WatcherID,
-				"discovered", result.FilesDiscovered,
-				"imported", result.FilesImported,
-				"skipped", result.FilesSkipped,
-				"failed", result.FilesFailed,
-				"bytes", result.BytesImported,
-				"duration", result.ScanDuration)
+			s.emit(s.ctx, slog.LevelInfo, "watcher_scan_completed", "Watcher scan completed",
+				slog.String("watcher_id", watcher.WatcherID),
+				slog.Int("discovered", result.FilesDiscovered),
+				slog.Int("imported", result.FilesImported),
+				slog.Int("skipped", result.FilesSkipped),
+				slog.Int("failed", result.FilesFailed),
+				slog.Int64("bytes", result.BytesImported),
+				slog.Duration("duration", result.ScanDuration))
 
 			if len(result.Errors) > 0 {
-				// Log first few errors
-				for i, errMsg := range result.Errors {
-					if i >= 5 {
-						s.logger.Warn("Additional errors", "watcherID", watcher.WatcherID, "count", len(result.Errors)-5)
-						break
-					}
-					s.logger.Warn("Watcher error", "watcherID", watcher.WatcherID, "error", errMsg)
-				}
+				s.emit(s.ctx, slog.LevelWarn, "watcher_scan_errors", "Watcher scan reported errors",
+					slog.String("watcher_id", watcher.WatcherID), slog.Int("count", len(result.Errors)))
 			}
 		} else if result.FilesDiscovered > 0 {
-			s.logger.Debug("Watcher found files but all skipped",
-				"watcherID", watcher.WatcherID,
-				"count", result.FilesDiscovered)
+			s.emit(s.ctx, slog.LevelDebug, "watcher_all_skipped", "Watcher found files but all were skipped",
+				slog.String("watcher_id", watcher.WatcherID),
+				slog.Int("count", result.FilesDiscovered))
 		}
 
 		totalImported += result.FilesImported
@@ -297,12 +290,12 @@ func (s *BackgroundFileWatcherService) executeScanCycle() {
 	}
 
 	duration := time.Since(startTime)
-	s.logger.Info("File watcher scan cycle completed",
-		"duration", duration,
-		"total_imported", totalImported,
-		"total_failed", totalFailed,
-		"total_skipped", totalSkipped,
-		"total_bytes", totalBytes)
+	s.emit(s.ctx, slog.LevelInfo, "cycle_completed", "File watcher scan cycle completed",
+		slog.Duration("duration", duration),
+		slog.Int("total_imported", totalImported),
+		slog.Int("total_failed", totalFailed),
+		slog.Int("total_skipped", totalSkipped),
+		slog.Int64("total_bytes", totalBytes))
 }
 
 // calculateNextInterval calculates the next scan interval based on watcher configurations.
@@ -333,11 +326,17 @@ func (s *BackgroundFileWatcherService) calculateNextInterval() time.Duration {
 
 	// Enforce minimum interval limit
 	if minInterval < s.minimumPollingInterval {
-		s.logger.Warn("Polling interval too short, using minimum",
-			"requested", minInterval,
-			"minimum", s.minimumPollingInterval)
+		s.emit(s.ctx, slog.LevelWarn, "polling_interval_clamped", "Polling interval too short; using minimum",
+			slog.Duration("requested", minInterval),
+			slog.Duration("minimum", s.minimumPollingInterval))
 		minInterval = s.minimumPollingInterval
 	}
 
 	return minInterval
+}
+
+func (s *BackgroundFileWatcherService) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {
+	s.logger.Emit(ctx, logging.Record{
+		Level: level, Component: "watcher.background", Event: event, Message: message, Attrs: attrs,
+	})
 }

@@ -29,6 +29,7 @@ func TestNewCleanupService(t *testing.T) {
 		sched, _ := scheduler.NewFileScheduler(repo, volumes, nil)
 
 		opts := &CleanupServiceOptions{
+			TenantManager:      &stubTenantManager{},
 			MetadataRepository: repo,
 			FileScheduler:      sched,
 			Volumes:            volumes,
@@ -82,6 +83,7 @@ func TestCleanupTimedOutProcessingFiles(t *testing.T) {
 	sched, _ := scheduler.NewFileScheduler(repo, volumes, nil)
 
 	opts := &CleanupServiceOptions{
+		TenantManager:            &stubTenantManager{},
 		MetadataRepository:       repo,
 		FileScheduler:            sched,
 		Volumes:                  volumes,
@@ -114,13 +116,13 @@ func TestCleanupTimedOutProcessingFiles(t *testing.T) {
 		}
 
 		// Verify file1 was reset to Pending
-		updated, _ := repo.Get(ctx, "file1")
+		updated, _ := repo.Get(ctx, "test-tenant", "file1")
 		if updated.Status != core.FileStatusPending {
 			t.Errorf("Expected status Pending, got %v", updated.Status)
 		}
 
 		// Verify file2 is still Processing
-		updated2, _ := repo.Get(ctx, "file2")
+		updated2, _ := repo.Get(ctx, "test-tenant", "file2")
 		if updated2.Status != core.FileStatusProcessing {
 			t.Errorf("Expected status Processing, got %v", updated2.Status)
 		}
@@ -147,6 +149,7 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 	dirQuotaMgr, _ := quota.NewDirectoryQuotaManager(dirQuotaRepo)
 
 	opts := &CleanupServiceOptions{
+		TenantManager:         &stubTenantManager{},
 		MetadataRepository:    repo,
 		FileScheduler:         sched,
 		Volumes:               volumes,
@@ -167,14 +170,24 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 		file := createTestFileMetadata("failed1", core.FileStatusPermanentlyFailed)
 		file.PhysicalPath = relativePath
 		file.FileSize = 12
+		oldFailure := time.Now().Add(-2 * time.Hour)
+		file.LastFailedAt = &oldFailure
 		_ = repo.AddOrUpdate(ctx, file)
+
+		recentPath := "tenant1/recent-failed-file.txt"
+		_, _ = vol.WriteFile(ctx, recentPath, bytes.NewReader([]byte("recent")))
+		recent := createTestFileMetadata("failed-recent", core.FileStatusPermanentlyFailed)
+		recent.PhysicalPath = recentPath
+		recentFailure := time.Now()
+		recent.LastFailedAt = &recentFailure
+		_ = repo.AddOrUpdate(ctx, recent)
 
 		// Set quotas
 		_ = tenantQuotaMgr.SetQuota(ctx, "test-tenant", 100)
 		_ = tenantQuotaMgr.IncrementFileCount(ctx, "test-tenant")
 
 		// Cleanup
-		stats, err := service.CleanupPermanentlyFailedFiles(ctx)
+		stats, err := service.CleanupPermanentlyFailedFiles(ctx, time.Hour)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -188,7 +201,7 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 		}
 
 		// Verify metadata was deleted
-		_, err = repo.Get(ctx, "failed1")
+		_, err = repo.Get(ctx, "test-tenant", "failed1")
 		if err != core.ErrFileNotFound {
 			t.Errorf("Expected file metadata to be deleted, got error: %v", err)
 		}
@@ -197,6 +210,14 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 		exists, _ := vol.FileExists(ctx, relativePath)
 		if exists {
 			t.Error("Expected physical file to be deleted")
+		}
+
+		if _, err := repo.Get(ctx, "test-tenant", "failed-recent"); err != nil {
+			t.Fatalf("recent metadata error = %v, want retained", err)
+		}
+		exists, err = vol.FileExists(ctx, recentPath)
+		if err != nil || !exists {
+			t.Fatalf("recent physical file exists = %v, error = %v", exists, err)
 		}
 	})
 }
@@ -217,6 +238,7 @@ func TestCleanupOrphanedMetadata(t *testing.T) {
 	tenantQuotaMgr := quota.NewTenantQuotaManager()
 
 	opts := &CleanupServiceOptions{
+		TenantManager:      &stubTenantManager{},
 		MetadataRepository: repo,
 		FileScheduler:      sched,
 		Volumes:            volumes,
@@ -246,7 +268,7 @@ func TestCleanupOrphanedMetadata(t *testing.T) {
 		}
 
 		// Verify metadata was deleted
-		_, err = repo.Get(ctx, "orphan1")
+		_, err = repo.Get(ctx, "test-tenant", "orphan1")
 		if err != core.ErrFileNotFound {
 			t.Errorf("Expected orphaned metadata to be deleted, got error: %v", err)
 		}
@@ -267,6 +289,7 @@ func TestCleanupEmptyDirectories(t *testing.T) {
 	sched, _ := scheduler.NewFileScheduler(repo, volumes, nil)
 
 	opts := &CleanupServiceOptions{
+		TenantManager:      &stubTenantManager{},
 		MetadataRepository: repo,
 		FileScheduler:      sched,
 		Volumes:            volumes,
@@ -434,15 +457,15 @@ func (r *stubMetadataRepository) AddOrUpdateBatch(ctx context.Context, metadata 
 	return nil
 }
 
-func (r *stubMetadataRepository) Get(ctx context.Context, fileKey string) (*core.FileMetadata, error) {
+func (r *stubMetadataRepository) Get(ctx context.Context, tenantID, fileKey string) (*core.FileMetadata, error) {
 	return nil, core.ErrFileNotFound
 }
 
-func (r *stubMetadataRepository) Delete(ctx context.Context, fileKey string) error {
+func (r *stubMetadataRepository) Delete(ctx context.Context, tenantID, fileKey string) error {
 	return nil
 }
 
-func (r *stubMetadataRepository) DeleteBatch(ctx context.Context, fileKeys []string) error {
+func (r *stubMetadataRepository) DeleteBatch(ctx context.Context, tenantID string, fileKeys []string) error {
 	return nil
 }
 
@@ -454,15 +477,23 @@ func (r *stubMetadataRepository) GetPendingFiles(ctx context.Context, tenantID s
 	return nil, nil
 }
 
-func (r *stubMetadataRepository) UpdateStatus(ctx context.Context, fileKey string, newStatus core.FileProcessingStatus) error {
+func (r *stubMetadataRepository) UpdateStatus(ctx context.Context, tenantID, fileKey string, newStatus core.FileProcessingStatus) error {
 	return nil
 }
 
-func (r *stubMetadataRepository) CompareAndTransitionToProcessing(ctx context.Context, fileKey string) (*core.FileMetadata, error) {
+func (r *stubMetadataRepository) CompareAndTransitionToProcessing(ctx context.Context, tenantID, fileKey string) (*core.FileMetadata, error) {
 	return nil, core.ErrFileNotFound
 }
 
-func (r *stubMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) ([]*core.FileMetadata, error) {
+func (r *stubMetadataRepository) CompareAndUpdateProcessing(
+	ctx context.Context,
+	lease core.FileProcessingLease,
+	update func(*core.FileMetadata) error,
+) (*core.FileMetadata, error) {
+	return nil, core.ErrProcessingLeaseMismatch
+}
+
+func (r *stubMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration) ([]*core.FileMetadata, error) {
 	return nil, nil
 }
 
@@ -475,25 +506,47 @@ func (r *stubMetadataRepository) Close() error {
 	return nil
 }
 
+type stubTenantManager struct{}
+
+func (m *stubTenantManager) GetTenant(ctx context.Context, tenantID string) (core.TenantContext, error) {
+	return core.TenantContext{ID: tenantID, Status: core.TenantStatusEnabled}, nil
+}
+
+func (m *stubTenantManager) IsTenantEnabled(ctx context.Context, tenantID string) (bool, error) {
+	return true, nil
+}
+
+func (m *stubTenantManager) CreateTenant(ctx context.Context, tenantID string) error  { return nil }
+func (m *stubTenantManager) EnableTenant(ctx context.Context, tenantID string) error  { return nil }
+func (m *stubTenantManager) DisableTenant(ctx context.Context, tenantID string) error { return nil }
+
+func (m *stubTenantManager) GetAllTenants(ctx context.Context) ([]core.TenantContext, error) {
+	return []core.TenantContext{{ID: "test-tenant", Status: core.TenantStatusEnabled}}, nil
+}
+
 type stubDirectoryQuotaRepository struct {
 	optimizeCalls int
 	optimizeErr   error
 }
 
-func (r *stubDirectoryQuotaRepository) GetOrCreate(ctx context.Context, directoryPath string) (*core.DirectoryQuota, error) {
+func (r *stubDirectoryQuotaRepository) GetOrCreate(ctx context.Context, tenantID, directoryPath string) (*core.DirectoryQuota, error) {
 	return &core.DirectoryQuota{DirectoryPath: directoryPath}, nil
 }
 
-func (r *stubDirectoryQuotaRepository) Update(ctx context.Context, quota *core.DirectoryQuota) error {
+func (r *stubDirectoryQuotaRepository) Update(ctx context.Context, tenantID string, quota *core.DirectoryQuota) error {
 	return nil
 }
 
-func (r *stubDirectoryQuotaRepository) IncrementCount(ctx context.Context, directoryPath string) error {
+func (r *stubDirectoryQuotaRepository) IncrementCount(ctx context.Context, tenantID, directoryPath string) error {
 	return nil
 }
 
-func (r *stubDirectoryQuotaRepository) DecrementCount(ctx context.Context, directoryPath string) error {
+func (r *stubDirectoryQuotaRepository) DecrementCount(ctx context.Context, tenantID, directoryPath string) error {
 	return nil
+}
+
+func (r *stubDirectoryQuotaRepository) GetAll(ctx context.Context, tenantID string) ([]*core.DirectoryQuota, error) {
+	return nil, nil
 }
 
 func (r *stubDirectoryQuotaRepository) Optimize(ctx context.Context) error {

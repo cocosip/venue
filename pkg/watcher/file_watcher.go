@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 )
 
 // FileWatcherOptions configures the file watcher.
@@ -24,6 +25,9 @@ type FileWatcherOptions struct {
 	// ConfigurationRootDir is the directory for storing watcher state/configuration.
 	// Default: "./.locus/watchers"
 	ConfigurationRootDir string
+
+	// Logging is the instance-scoped logging runtime. Nil disables logging.
+	Logging *logging.Runtime
 }
 
 // fileWatcher implements the FileWatcher interface.
@@ -34,6 +38,7 @@ type fileWatcher struct {
 	configRoot      string       // Configuration root directory
 	importedFiles   sync.Map     // map[string]string: filePath -> fileKey (imported files history)
 	importedFilesMu sync.RWMutex // Lock for persisting imported files
+	logger          *logging.Runtime
 }
 
 // NewFileWatcher creates a new file watcher.
@@ -61,15 +66,21 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 		return nil, fmt.Errorf("failed to create configuration directory: %w", err)
 	}
 
+	logger := opts.Logging
+	if logger == nil {
+		logger = logging.Disabled()
+	}
+
 	fw := &fileWatcher{
 		tenantMgr:   opts.TenantManager,
 		storagePool: opts.StoragePool,
 		configRoot:  configRoot,
+		logger:      logger,
 	}
 
 	// Load imported files history
 	if err := fw.loadImportedFilesHistory(); err != nil {
-		slog.Warn("Failed to load imported files history", "error", err)
+		fw.emit(context.Background(), slog.LevelWarn, "history_load_failed", "Failed to load imported files history", errorTypeAttr(err))
 	}
 
 	return fw, nil
@@ -113,7 +124,7 @@ func (w *fileWatcher) RegisterWatcher(ctx context.Context, config *core.FileWatc
 	// Auto-create tenant directories if enabled
 	if config.MultiTenantMode && config.AutoCreateTenantDirectories {
 		if err := w.createTenantDirectories(ctx, config); err != nil {
-			slog.Warn("Failed to auto-create tenant directories", "watcherID", config.WatcherID, "error", err)
+			w.emit(ctx, slog.LevelWarn, "tenant_directories_create_failed", "Failed to auto-create tenant directories", slog.String("watcher_id", config.WatcherID), errorTypeAttr(err))
 		}
 	}
 
@@ -202,7 +213,7 @@ func (w *fileWatcher) ScanAllWatchers(ctx context.Context) (map[string]*core.Fil
 
 		result, err := w.scanWatcher(ctx, config)
 		if err != nil {
-			slog.Error("Failed to scan watcher", "watcherID", watcherID, "error", err)
+			w.emit(ctx, slog.LevelError, "scan_failed", "Failed to scan watcher", slog.String("watcher_id", watcherID), errorTypeAttr(err))
 			result = &core.FileWatcherScanResult{
 				Errors: []string{err.Error()},
 			}
@@ -294,7 +305,7 @@ func (w *fileWatcher) scanMultiTenant(ctx context.Context, config *core.FileWatc
 	// Auto-create tenant directories if enabled
 	if config.AutoCreateTenantDirectories {
 		if err := w.createTenantDirectories(ctx, config); err != nil {
-			slog.Warn("Failed to create tenant directories", "watcherID", config.WatcherID, "error", err)
+			w.emit(ctx, slog.LevelWarn, "tenant_directories_create_failed", "Failed to create tenant directories", slog.String("watcher_id", config.WatcherID), errorTypeAttr(err))
 		}
 	}
 
@@ -450,7 +461,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 
 	// Post-import action
 	if err := w.performPostImportAction(filePath, config); err != nil {
-		slog.Warn("Failed to perform post-import action", "file", filePath, "action", config.PostImportAction, "error", err)
+		w.emit(ctx, slog.LevelWarn, "post_import_action_failed", "Failed to perform post-import action", slog.Any("action", config.PostImportAction), errorTypeAttr(err))
 	}
 
 	return true, fileInfo.Size(), nil
@@ -502,9 +513,9 @@ func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.
 	for _, tenant := range tenants {
 		tenantPath := filepath.Join(config.WatchPath, tenant.ID)
 		if err := os.MkdirAll(tenantPath, 0755); err != nil {
-			slog.Warn("Failed to create tenant directory", "tenant", tenant.ID, "path", tenantPath, "error", err)
+			w.emit(ctx, slog.LevelWarn, "tenant_directory_create_failed", "Failed to create tenant directory", slog.String("tenant_id", tenant.ID), errorTypeAttr(err))
 		} else {
-			slog.Info("Created tenant directory", "tenant", tenant.ID, "path", tenantPath)
+			w.emit(ctx, slog.LevelInfo, "tenant_directory_created", "Created tenant directory", slog.String("tenant_id", tenant.ID))
 		}
 	}
 
@@ -554,7 +565,7 @@ func (w *fileWatcher) loadImportedFilesHistory() error {
 		w.importedFiles.Store(filePath, fileKey)
 	}
 
-	slog.Info("Loaded imported files history", "count", len(history))
+	w.emit(context.Background(), slog.LevelInfo, "history_loaded", "Loaded imported files history", slog.Int("count", len(history)))
 	return nil
 }
 
@@ -598,7 +609,17 @@ func (w *fileWatcher) markFileAsImported(filePath, fileKey string) {
 	// Persist to disk asynchronously to avoid blocking
 	go func() {
 		if err := w.saveImportedFilesHistory(); err != nil {
-			slog.Error("Failed to save imported files history", "error", err)
+			w.emit(context.Background(), slog.LevelError, "history_save_failed", "Failed to save imported files history", errorTypeAttr(err))
 		}
 	}()
+}
+
+func (w *fileWatcher) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {
+	w.logger.Emit(ctx, logging.Record{
+		Level: level, Component: "watcher.files", Event: event, Message: message, Attrs: attrs,
+	})
+}
+
+func errorTypeAttr(err error) slog.Attr {
+	return slog.String("error_type", fmt.Sprintf("%T", err))
 }

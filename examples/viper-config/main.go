@@ -9,6 +9,7 @@ import (
 
 	"github.com/cocosip/venue"
 	"github.com/cocosip/venue/config"
+	"github.com/cocosip/venue/viperconfig"
 	"github.com/spf13/viper"
 )
 
@@ -23,7 +24,7 @@ func main() {
 
 	// Method 1: Load from configuration file (YAML)
 	fmt.Println("Method 1: Load from YAML file")
-	cfg1, err := config.LoadFromFileWithViper("venue-config.yaml")
+	cfg1, err := viperconfig.LoadFromFile("venue-config.yaml")
 	if err != nil {
 		fmt.Println("   Config file not found, using defaults")
 		cfg1 = config.DefaultConfig()
@@ -34,7 +35,7 @@ func main() {
 
 	// Method 2: Load from JSON file
 	fmt.Println("Method 2: Load from JSON file")
-	cfg2, err := config.LoadFromFileWithViper("venue-config.json")
+	cfg2, err := viperconfig.LoadFromFile("venue-config.json")
 	if err != nil {
 		fmt.Println("   Config file not found, using defaults")
 		cfg2 = config.DefaultConfig()
@@ -45,7 +46,7 @@ func main() {
 
 	// Method 3: Manual configuration using Viper
 	fmt.Println("Method 3: Manual Viper configuration")
-	v := config.NewViperWithDefaults()
+	v := viperconfig.NewWithDefaults()
 
 	// Override some settings
 	v.Set("metadataDirectory", dataDir+"/metadata")
@@ -78,7 +79,7 @@ func main() {
 	v.SetEnvPrefix("VENUE")
 	v.AutomaticEnv()
 
-	_, err = config.LoadWithViper(v)
+	_, err = viperconfig.Load(v)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
@@ -123,9 +124,9 @@ venue:
     cleanupTimedOutFiles: true
     processingTimeout: 30m
     cleanupPermanentlyFailedFiles: true
-    failedFileRetentionPeriod: 168h
-    cleanupCompletedRecords: false
-    completedRecordRetentionPeriod: 720h
+    failedFileRetentionPeriod: 72h
+    cleanupCompletedRecords: true
+    completedRecordRetentionPeriod: 0s
     optimizeDatabases: true
     databaseOptimizationInterval: 24h
   databaseHealthCheckOptions:
@@ -138,7 +139,7 @@ venue:
 
 	_ = appViper.ReadConfig(strings.NewReader(appConfig))
 
-	cfg4, err := config.LoadVenueSectionWithViper(appViper, "venue")
+	cfg4, err := viperconfig.LoadSection(appViper, "venue")
 	if err != nil {
 		log.Fatalf("Failed to load venue section: %v", err)
 	}
@@ -147,9 +148,7 @@ venue:
 
 	// Create Venue instance using the embedded config
 	fmt.Println("Creating Venue instance")
-	venueInstance, err := venue.NewVenue(&venue.VenueOptions{
-		Config: cfg4,
-	})
+	venueInstance, err := venue.NewVenue(cfg4)
 	if err != nil {
 		log.Fatalf("Failed to create venue: %v", err)
 	}
@@ -205,15 +204,8 @@ venue:
 	fmt.Println("  ✓ Configuration hot-reload support")
 	fmt.Println("  ✓ Embedded config section support")
 	fmt.Println("  ✓ Missing config nodes use defaults automatically")
-	fmt.Println("  ✓ Matches Locus configuration structure")
+	fmt.Println("  ✓ Produces the public config.Config model")
 
-	// Save config examples
-	fmt.Println()
-	fmt.Println("Saving configuration to files:")
-	if err := cfg1.SaveToFile("venue-saved.json"); err == nil {
-		fmt.Println("   ✓ Saved to venue-saved.json")
-	}
-	if err := cfg2.SaveToFile("venue-saved.yaml"); err == nil {
-		fmt.Println("   ✓ Saved to venue-saved.yaml")
-	}
+	_ = cfg1
+	_ = cfg2
 }

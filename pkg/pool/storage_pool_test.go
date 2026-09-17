@@ -128,7 +128,7 @@ func TestWriteFile(t *testing.T) {
 		}
 
 		// Verify metadata was saved
-		metadata, err := repo.Get(ctx, fileKey)
+		metadata, err := repo.Get(ctx, "test-tenant", fileKey)
 		if err != nil {
 			t.Fatalf("Expected metadata to exist, got error: %v", err)
 		}
@@ -158,7 +158,7 @@ func TestWriteFile(t *testing.T) {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
-		metadata, _ := repo.Get(ctx, fileKey)
+		metadata, _ := repo.Get(ctx, "test-tenant", fileKey)
 		if metadata.FileExtension != "" {
 			t.Errorf("Expected empty extension, got %s", metadata.FileExtension)
 		}

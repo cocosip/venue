@@ -14,6 +14,9 @@ import (
 
 // CleanupServiceOptions configures the cleanup service.
 type CleanupServiceOptions struct {
+	// TenantManager provides the tenant scope for maintenance scans.
+	TenantManager core.TenantManager
+
 	// MetadataRepository stores file metadata.
 	MetadataRepository core.MetadataRepository
 
@@ -42,6 +45,7 @@ type CleanupServiceOptions struct {
 
 // cleanupService implements the CleanupService interface.
 type cleanupService struct {
+	tenantManager            core.TenantManager
 	metadataRepo             core.MetadataRepository
 	scheduler                core.FileScheduler
 	volumes                  map[string]core.StorageVolume
@@ -61,6 +65,9 @@ func NewCleanupService(opts *CleanupServiceOptions) (core.CleanupService, error)
 	if opts.MetadataRepository == nil {
 		return nil, fmt.Errorf("metadata repository cannot be nil: %w", core.ErrInvalidArgument)
 	}
+	if opts.TenantManager == nil {
+		return nil, fmt.Errorf("tenant manager cannot be nil: %w", core.ErrInvalidArgument)
+	}
 
 	if opts.FileScheduler == nil {
 		return nil, fmt.Errorf("file scheduler cannot be nil: %w", core.ErrInvalidArgument)
@@ -76,6 +83,7 @@ func NewCleanupService(opts *CleanupServiceOptions) (core.CleanupService, error)
 	}
 
 	return &cleanupService{
+		tenantManager:            opts.TenantManager,
 		metadataRepo:             opts.MetadataRepository,
 		scheduler:                opts.FileScheduler,
 		volumes:                  opts.Volumes,
@@ -273,54 +281,134 @@ func (s *cleanupService) CleanupTimedOutProcessingFiles(ctx context.Context, tim
 		timeout = s.defaultProcessingTimeout
 	}
 
-	// Use scheduler to reset timed out files
-	count, err := s.scheduler.ResetTimedOutFiles(ctx, timeout)
+	tenants, err := s.tenantManager.GetAllTenants(ctx)
 	if err != nil {
-		return stats, fmt.Errorf("failed to reset timed out files: %w", err)
+		return stats, fmt.Errorf("failed to list tenants: %w", err)
 	}
-
-	stats.TimedOutFilesReset = count
+	for _, tenant := range tenants {
+		count, err := s.scheduler.ResetTimedOutFiles(ctx, tenant, timeout)
+		if err != nil {
+			return stats, fmt.Errorf("failed to reset timed out files for tenant %s: %w", tenant.ID, err)
+		}
+		stats.TimedOutFilesReset += count
+	}
 
 	return stats, nil
 }
 
-// CleanupPermanentlyFailedFiles deletes files that have permanently failed.
-func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context) (*core.CleanupStatistics, error) {
+// CleanupPermanentlyFailedFiles deletes permanently failed files older than retention.
+func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
 	stats := &core.CleanupStatistics{}
-
-	// Get all permanently failed files
-	// Note: We don't have a tenant filter here, so we need to scan all tenants
-	// This is a limitation - in production you'd want to iterate through known tenants
-	failedFiles, err := s.metadataRepo.GetByStatus(ctx, "", core.FileStatusPermanentlyFailed, 0)
-	if err != nil {
-		return stats, fmt.Errorf("failed to get permanently failed files: %w", err)
+	if retention < 0 {
+		return stats, fmt.Errorf("permanently failed file retention cannot be negative: %w", core.ErrInvalidArgument)
 	}
 
-	for _, file := range failedFiles {
-		// Delete physical file
-		volume, exists := s.volumes[file.VolumeID]
-		if exists {
-			if err := volume.DeleteFile(ctx, file.PhysicalPath); err == nil {
-				stats.SpaceFreed += file.FileSize
+	tenants, err := s.tenantManager.GetAllTenants(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("failed to list tenants: %w", err)
+	}
+
+	for _, tenant := range tenants {
+		failedFiles, err := s.metadataRepo.GetByStatus(ctx, tenant.ID, core.FileStatusPermanentlyFailed, 0)
+		if err != nil {
+			return stats, fmt.Errorf("failed to get permanently failed files for tenant %s: %w", tenant.ID, err)
+		}
+		for _, file := range failedFiles {
+			if file.LastFailedAt != nil && file.LastFailedAt.After(time.Now().Add(-retention)) {
+				continue
 			}
-		}
+			// Delete physical file
+			volume, exists := s.volumes[file.VolumeID]
+			if exists {
+				if err := volume.DeleteFile(ctx, file.PhysicalPath); err == nil {
+					stats.SpaceFreed += file.FileSize
+				}
+			}
 
-		// Delete metadata
-		if err := s.metadataRepo.Delete(ctx, file.FileKey); err != nil {
-			// Log error but continue
-			continue
-		}
+			// Delete metadata
+			if err := s.metadataRepo.Delete(ctx, tenant.ID, file.FileKey); err != nil {
+				// Log error but continue
+				continue
+			}
 
-		// Decrement quotas
-		if s.tenantQuotaMgr != nil {
-			_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
-		}
-		if s.dirQuotaMgr != nil {
-			directoryPath := filepath.Dir(file.PhysicalPath)
-			_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
-		}
+			// Decrement quotas
+			if s.tenantQuotaMgr != nil {
+				_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
+			}
+			if s.dirQuotaMgr != nil {
+				directoryPath := file.DirectoryPath
+				_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
+			}
 
-		stats.PermanentlyFailedFilesRemoved++
+			stats.PermanentlyFailedFilesRemoved++
+		}
+	}
+
+	return stats, nil
+}
+
+// CleanupCompletedFiles deletes completed physical files and finalizes their metadata.
+func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
+	stats := &core.CleanupStatistics{}
+	if retention < 0 {
+		return stats, fmt.Errorf("completed file retention cannot be negative: %w", core.ErrInvalidArgument)
+	}
+
+	tenants, err := s.tenantManager.GetAllTenants(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("failed to list tenants: %w", err)
+	}
+	cutoff := time.Now().Add(-retention)
+	for _, tenant := range tenants {
+		completedFiles, err := s.metadataRepo.GetByStatus(ctx, tenant.ID, core.FileStatusCompleted, 0)
+		if err != nil {
+			return stats, fmt.Errorf("failed to get completed files for tenant %s: %w", tenant.ID, err)
+		}
+		for _, file := range completedFiles {
+			if file.CompletedAt == nil || file.CompletedAt.After(cutoff) {
+				continue
+			}
+			volume, exists := s.volumes[file.VolumeID]
+			if !exists {
+				continue
+			}
+			if err := volume.DeleteFile(ctx, file.PhysicalPath); err != nil {
+				continue
+			}
+
+			directoryPath := file.DirectoryPath
+			directoryQuotaDecremented := false
+			if s.dirQuotaMgr != nil {
+				if err := s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath); err != nil {
+					continue
+				}
+				directoryQuotaDecremented = true
+			}
+
+			tenantQuotaDecremented := false
+			if s.tenantQuotaMgr != nil {
+				if err := s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID); err != nil {
+					if directoryQuotaDecremented {
+						_ = s.dirQuotaMgr.IncrementFileCount(ctx, file.TenantID, directoryPath)
+					}
+					continue
+				}
+				tenantQuotaDecremented = true
+			}
+
+			if err := s.metadataRepo.Delete(ctx, file.TenantID, file.FileKey); err != nil {
+				if tenantQuotaDecremented {
+					_ = s.tenantQuotaMgr.IncrementFileCount(ctx, file.TenantID)
+				}
+				if directoryQuotaDecremented {
+					_ = s.dirQuotaMgr.IncrementFileCount(ctx, file.TenantID, directoryPath)
+				}
+				continue
+			}
+
+			stats.CompletedRecordsRemoved++
+			stats.SpaceFreed += file.FileSize
+		}
 	}
 
 	return stats, nil
@@ -339,38 +427,44 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 		core.FileStatusPermanentlyFailed,
 	}
 
-	for _, status := range allStatuses {
-		files, err := s.metadataRepo.GetByStatus(ctx, "", status, 0)
-		if err != nil {
-			continue
-		}
-
-		for _, file := range files {
-			// Check if physical file exists
-			volume, exists := s.volumes[file.VolumeID]
-			if !exists {
-				// Volume doesn't exist, metadata is orphaned
-				_ = s.metadataRepo.Delete(ctx, file.FileKey)
-				stats.OrphanedMetadataRemoved++
+	tenants, err := s.tenantManager.GetAllTenants(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("failed to list tenants: %w", err)
+	}
+	for _, tenant := range tenants {
+		for _, status := range allStatuses {
+			files, err := s.metadataRepo.GetByStatus(ctx, tenant.ID, status, 0)
+			if err != nil {
 				continue
 			}
 
-			// Check if file exists on volume
-			fileExists, err := volume.FileExists(ctx, file.PhysicalPath)
-			if err != nil || !fileExists {
-				// File doesn't exist, metadata is orphaned
-				_ = s.metadataRepo.Delete(ctx, file.FileKey)
-
-				// Decrement quotas
-				if s.tenantQuotaMgr != nil {
-					_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
-				}
-				if s.dirQuotaMgr != nil {
-					directoryPath := filepath.Dir(file.PhysicalPath)
-					_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
+			for _, file := range files {
+				// Check if physical file exists
+				volume, exists := s.volumes[file.VolumeID]
+				if !exists {
+					// Volume doesn't exist, metadata is orphaned
+					_ = s.metadataRepo.Delete(ctx, tenant.ID, file.FileKey)
+					stats.OrphanedMetadataRemoved++
+					continue
 				}
 
-				stats.OrphanedMetadataRemoved++
+				// Check if file exists on volume
+				fileExists, err := volume.FileExists(ctx, file.PhysicalPath)
+				if err != nil || !fileExists {
+					// File doesn't exist, metadata is orphaned
+					_ = s.metadataRepo.Delete(ctx, tenant.ID, file.FileKey)
+
+					// Decrement quotas
+					if s.tenantQuotaMgr != nil {
+						_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
+					}
+					if s.dirQuotaMgr != nil {
+						directoryPath := file.DirectoryPath
+						_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
+					}
+
+					stats.OrphanedMetadataRemoved++
+				}
 			}
 		}
 	}

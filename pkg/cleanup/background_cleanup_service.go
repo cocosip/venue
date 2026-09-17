@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 )
 
 // BackgroundCleanupServiceOptions configures the background cleanup service.
@@ -15,9 +16,8 @@ type BackgroundCleanupServiceOptions struct {
 	// CleanupService is the underlying cleanup service that performs the actual cleanup operations.
 	CleanupService core.CleanupService
 
-	// Logger is the logger instance to use.
-	// If nil, uses slog.Default().
-	Logger *slog.Logger
+	// Logging is the instance-scoped logging runtime. Nil disables logging.
+	Logging *logging.Runtime
 
 	// CleanupInterval is the interval between cleanup runs.
 	// Default: 1 hour
@@ -45,8 +45,16 @@ type BackgroundCleanupServiceOptions struct {
 	CleanupPermanentlyFailedFiles bool
 
 	// FailedFileRetentionPeriod is how long to keep permanently failed files before cleanup.
-	// Default: 7 days (not implemented yet, reserved for future)
+	// Default: 3 days
 	FailedFileRetentionPeriod time.Duration
+
+	// CleanupCompletedRecords enables completed-file cleanup.
+	// Default: true
+	CleanupCompletedRecords bool
+
+	// CompletedRecordRetentionPeriod is how long completed files remain before cleanup.
+	// Default: 0 (remove during the next cleanup cycle)
+	CompletedRecordRetentionPeriod time.Duration
 
 	// OptimizeDatabases enables database optimization.
 	// Default: true
@@ -60,13 +68,16 @@ type BackgroundCleanupServiceOptions struct {
 // BackgroundCleanupService runs cleanup operations in the background on a scheduled interval.
 type BackgroundCleanupService struct {
 	cleanupService                core.CleanupService
-	logger                        *slog.Logger
+	logger                        *logging.Runtime
 	cleanupInterval               time.Duration
 	initialDelay                  time.Duration
 	cleanupEmptyDirectories       bool
 	cleanupTimedOutFiles          bool
 	processingTimeout             time.Duration
 	cleanupPermanentlyFailedFiles bool
+	failedFileRetention           time.Duration
+	cleanupCompletedRecords       bool
+	completedRecordRetention      time.Duration
 	optimizeDatabases             bool
 	databaseOptimizationInterval  time.Duration
 
@@ -89,10 +100,9 @@ func NewBackgroundCleanupService(opts *BackgroundCleanupServiceOptions) (*Backgr
 		return nil, fmt.Errorf("cleanup service cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
-	// Set logger (use default if not provided)
-	logger := opts.Logger
+	logger := opts.Logging
 	if logger == nil {
-		logger = slog.Default()
+		logger = logging.Disabled()
 	}
 
 	// Set defaults
@@ -116,17 +126,24 @@ func NewBackgroundCleanupService(opts *BackgroundCleanupServiceOptions) (*Backgr
 		databaseOptimizationInterval = 24 * time.Hour
 	}
 
+	failedFileRetention := opts.FailedFileRetentionPeriod
+	if failedFileRetention == 0 {
+		failedFileRetention = 3 * 24 * time.Hour
+	}
+
 	// Default enable all cleanup operations
 	cleanupEmptyDirectories := opts.CleanupEmptyDirectories
 	cleanupTimedOutFiles := opts.CleanupTimedOutFiles
 	cleanupPermanentlyFailedFiles := opts.CleanupPermanentlyFailedFiles
+	cleanupCompletedRecords := opts.CleanupCompletedRecords
 	optimizeDatabases := opts.OptimizeDatabases
 
 	// If all are false, enable them by default
-	if !cleanupEmptyDirectories && !cleanupTimedOutFiles && !cleanupPermanentlyFailedFiles && !optimizeDatabases {
+	if !cleanupEmptyDirectories && !cleanupTimedOutFiles && !cleanupPermanentlyFailedFiles && !cleanupCompletedRecords && !optimizeDatabases {
 		cleanupEmptyDirectories = true
 		cleanupTimedOutFiles = true
 		cleanupPermanentlyFailedFiles = true
+		cleanupCompletedRecords = true
 		optimizeDatabases = true
 	}
 
@@ -139,6 +156,9 @@ func NewBackgroundCleanupService(opts *BackgroundCleanupServiceOptions) (*Backgr
 		cleanupTimedOutFiles:          cleanupTimedOutFiles,
 		processingTimeout:             processingTimeout,
 		cleanupPermanentlyFailedFiles: cleanupPermanentlyFailedFiles,
+		failedFileRetention:           failedFileRetention,
+		cleanupCompletedRecords:       cleanupCompletedRecords,
+		completedRecordRetention:      opts.CompletedRecordRetentionPeriod,
 		optimizeDatabases:             optimizeDatabases,
 		databaseOptimizationInterval:  databaseOptimizationInterval,
 		lastOptimizationTime:          time.Time{},
@@ -161,7 +181,7 @@ func (s *BackgroundCleanupService) Start() error {
 	s.wg.Add(1)
 	go s.run()
 
-	s.logger.Info("Background cleanup service started")
+	s.emit(s.ctx, slog.LevelInfo, "started", "Background cleanup service started")
 
 	return nil
 }
@@ -175,12 +195,12 @@ func (s *BackgroundCleanupService) Stop() error {
 		return fmt.Errorf("background cleanup service is not running")
 	}
 
-	s.logger.Info("Stopping background cleanup service...")
+	s.emit(s.ctx, slog.LevelInfo, "stopping", "Stopping background cleanup service")
 	s.cancel()
 	s.wg.Wait()
 	s.running = false
 
-	s.logger.Info("Background cleanup service stopped")
+	s.emit(s.ctx, slog.LevelInfo, "stopped", "Background cleanup service stopped")
 
 	return nil
 }
@@ -197,7 +217,7 @@ func (s *BackgroundCleanupService) run() {
 	defer s.wg.Done()
 
 	// Initial delay before first cleanup
-	s.logger.Info("Background cleanup service waiting for initial delay", "delay", s.initialDelay)
+	s.emit(s.ctx, slog.LevelInfo, "initial_delay", "Background cleanup service waiting for initial delay", slog.Duration("delay", s.initialDelay))
 	select {
 	case <-time.After(s.initialDelay):
 		// Continue
@@ -218,7 +238,7 @@ func (s *BackgroundCleanupService) run() {
 		case <-ticker.C:
 			s.executeCleanup()
 		case <-s.ctx.Done():
-			s.logger.Info("Cleanup service shutting down")
+			s.emit(s.ctx, slog.LevelInfo, "shutting_down", "Cleanup service shutting down")
 			return
 		}
 	}
@@ -226,7 +246,7 @@ func (s *BackgroundCleanupService) run() {
 
 // executeCleanup performs all configured cleanup operations.
 func (s *BackgroundCleanupService) executeCleanup() {
-	s.logger.Info("Starting cleanup cycle")
+	s.emit(s.ctx, slog.LevelInfo, "cycle_started", "Starting cleanup cycle")
 	startTime := time.Now()
 
 	totalStats := &core.CleanupStatistics{}
@@ -235,11 +255,11 @@ func (s *BackgroundCleanupService) executeCleanup() {
 	if s.cleanupEmptyDirectories {
 		stats, err := s.cleanupService.CleanupEmptyDirectories(s.ctx)
 		if err != nil {
-			s.logger.Error("Failed to cleanup empty directories", "error", err)
+			s.emit(s.ctx, slog.LevelError, "empty_directories_failed", "Failed to cleanup empty directories", errorTypeAttr(err))
 		} else {
 			totalStats.EmptyDirectoriesRemoved += stats.EmptyDirectoriesRemoved
 			if stats.EmptyDirectoriesRemoved > 0 {
-				s.logger.Info("Cleaned up empty directories", "count", stats.EmptyDirectoriesRemoved)
+				s.emit(s.ctx, slog.LevelInfo, "empty_directories_removed", "Cleaned up empty directories", slog.Int("count", stats.EmptyDirectoriesRemoved))
 			}
 		}
 	}
@@ -248,58 +268,85 @@ func (s *BackgroundCleanupService) executeCleanup() {
 	if s.cleanupTimedOutFiles {
 		stats, err := s.cleanupService.CleanupTimedOutProcessingFiles(s.ctx, s.processingTimeout)
 		if err != nil {
-			s.logger.Error("Failed to cleanup timed-out files", "error", err)
+			s.emit(s.ctx, slog.LevelError, "timed_out_files_failed", "Failed to cleanup timed-out files", errorTypeAttr(err))
 		} else {
 			totalStats.TimedOutFilesReset += stats.TimedOutFilesReset
 			if stats.TimedOutFilesReset > 0 {
-				s.logger.Info("Reset timed-out files", "count", stats.TimedOutFilesReset)
+				s.emit(s.ctx, slog.LevelInfo, "timed_out_files_reset", "Reset timed-out files", slog.Int("count", stats.TimedOutFilesReset))
 			}
 		}
 	}
 
-	// 3. Cleanup permanently failed files
-	if s.cleanupPermanentlyFailedFiles {
-		stats, err := s.cleanupService.CleanupPermanentlyFailedFiles(s.ctx)
+	// 3. Cleanup completed files
+	if s.cleanupCompletedRecords {
+		stats, err := s.cleanupService.CleanupCompletedFiles(s.ctx, s.completedRecordRetention)
 		if err != nil {
-			s.logger.Error("Failed to cleanup permanently failed files", "error", err)
+			s.emit(s.ctx, slog.LevelError, "completed_files_failed", "Failed to cleanup completed files", errorTypeAttr(err))
+		} else {
+			totalStats.CompletedRecordsRemoved += stats.CompletedRecordsRemoved
+			totalStats.SpaceFreed += stats.SpaceFreed
+			if stats.CompletedRecordsRemoved > 0 {
+				s.emit(s.ctx, slog.LevelInfo, "completed_files_removed", "Cleaned up completed files",
+					slog.Int("count", stats.CompletedRecordsRemoved),
+					slog.Int64("freed_bytes", stats.SpaceFreed))
+			}
+		}
+	}
+
+	// 4. Cleanup permanently failed files
+	if s.cleanupPermanentlyFailedFiles {
+		stats, err := s.cleanupService.CleanupPermanentlyFailedFiles(s.ctx, s.failedFileRetention)
+		if err != nil {
+			s.emit(s.ctx, slog.LevelError, "permanent_files_failed", "Failed to cleanup permanently failed files", errorTypeAttr(err))
 		} else {
 			totalStats.PermanentlyFailedFilesRemoved += stats.PermanentlyFailedFilesRemoved
 			totalStats.SpaceFreed += stats.SpaceFreed
 			if stats.PermanentlyFailedFilesRemoved > 0 {
-				s.logger.Info("Cleaned up permanently failed files",
-					"count", stats.PermanentlyFailedFilesRemoved,
-					"freed_bytes", stats.SpaceFreed)
+				s.emit(s.ctx, slog.LevelInfo, "permanent_files_removed", "Cleaned up permanently failed files",
+					slog.Int("count", stats.PermanentlyFailedFilesRemoved),
+					slog.Int64("freed_bytes", stats.SpaceFreed))
 			}
 		}
 	}
 
-	// 4. Optimize databases (if enough time has passed)
+	// 5. Optimize databases (if enough time has passed)
 	if s.optimizeDatabases && s.shouldOptimizeDatabases() {
-		s.logger.Info("Starting database optimization")
+		s.emit(s.ctx, slog.LevelInfo, "database_optimization_started", "Starting database optimization")
 		stats, err := s.cleanupService.OptimizeDatabases(s.ctx)
 		if err != nil {
-			s.logger.Error("Failed to optimize databases", "error", err)
+			s.emit(s.ctx, slog.LevelError, "database_optimization_failed", "Failed to optimize databases", errorTypeAttr(err))
 		} else {
 			totalStats.MetadataDatabasesOptimized += stats.MetadataDatabasesOptimized
 			totalStats.QuotaDatabasesOptimized += stats.QuotaDatabasesOptimized
 			s.mu.Lock()
 			s.lastOptimizationTime = time.Now()
 			s.mu.Unlock()
-			s.logger.Info("Database optimization completed",
-				"metadata_databases", stats.MetadataDatabasesOptimized,
-				"quota_databases", stats.QuotaDatabasesOptimized)
+			s.emit(s.ctx, slog.LevelInfo, "database_optimization_completed", "Database optimization completed",
+				slog.Int("metadata_databases", stats.MetadataDatabasesOptimized),
+				slog.Int("quota_databases", stats.QuotaDatabasesOptimized))
 		}
 	}
 
 	duration := time.Since(startTime)
-	s.logger.Info("Cleanup cycle completed",
-		"duration", duration,
-		"empty_dirs_removed", totalStats.EmptyDirectoriesRemoved,
-		"timed_out_reset", totalStats.TimedOutFilesReset,
-		"failed_removed", totalStats.PermanentlyFailedFilesRemoved,
-		"metadata_databases_optimized", totalStats.MetadataDatabasesOptimized,
-		"quota_databases_optimized", totalStats.QuotaDatabasesOptimized,
-		"space_freed_bytes", totalStats.SpaceFreed)
+	s.emit(s.ctx, slog.LevelInfo, "cycle_completed", "Cleanup cycle completed",
+		slog.Duration("duration", duration),
+		slog.Int("empty_dirs_removed", totalStats.EmptyDirectoriesRemoved),
+		slog.Int("timed_out_reset", totalStats.TimedOutFilesReset),
+		slog.Int("completed_removed", totalStats.CompletedRecordsRemoved),
+		slog.Int("failed_removed", totalStats.PermanentlyFailedFilesRemoved),
+		slog.Int("metadata_databases_optimized", totalStats.MetadataDatabasesOptimized),
+		slog.Int("quota_databases_optimized", totalStats.QuotaDatabasesOptimized),
+		slog.Int64("space_freed_bytes", totalStats.SpaceFreed))
+}
+
+func (s *BackgroundCleanupService) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {
+	s.logger.Emit(ctx, logging.Record{
+		Level: level, Component: "cleanup.background", Event: event, Message: message, Attrs: attrs,
+	})
+}
+
+func errorTypeAttr(err error) slog.Attr {
+	return slog.String("error_type", fmt.Sprintf("%T", err))
 }
 
 // shouldOptimizeDatabases returns true if enough time has passed since last optimization.

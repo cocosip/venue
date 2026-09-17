@@ -24,6 +24,17 @@ type StoragePool interface {
 	// - ErrInsufficientStorage if no volumes have available space
 	WriteFile(ctx context.Context, tenant TenantContext, content io.Reader, originalFileName *string) (string, error)
 
+	// WriteFileToDirectory stores a file and associates it with a logical directory.
+	// The logical directory is used for quota accounting and is independent of the
+	// volume's physical sharding layout.
+	WriteFileToDirectory(
+		ctx context.Context,
+		tenant TenantContext,
+		content io.Reader,
+		originalFileName *string,
+		logicalDirectoryPath string,
+	) (string, error)
+
 	// ReadFile retrieves a file by its fileKey.
 	// Returns an io.ReadCloser that must be closed by the caller.
 	//
@@ -61,18 +72,18 @@ type StoragePool interface {
 	GetNextBatchForProcessing(ctx context.Context, tenant TenantContext, batchSize int) ([]*FileLocation, error)
 
 	// MarkAsCompleted marks a file as successfully processed.
-	// This deletes both the physical file and its metadata.
-	MarkAsCompleted(ctx context.Context, fileKey string) error
+	// Physical deletion and final metadata removal are performed by cleanup.
+	MarkAsCompleted(ctx context.Context, lease FileProcessingLease) error
 
 	// MarkAsFailed marks a file as failed and schedules it for retry.
 	// If retry count exceeds the maximum, the file is marked as PermanentlyFailed.
 	//
 	// The retry delay uses exponential backoff:
 	//   delay = InitialDelay * 2^(retryCount-1), capped at MaxRetryDelay
-	MarkAsFailed(ctx context.Context, fileKey string, errorMessage string) error
+	MarkAsFailed(ctx context.Context, lease FileProcessingLease, errorMessage string) error
 
 	// GetFileStatus returns the current processing status of a file.
-	GetFileStatus(ctx context.Context, fileKey string) (FileProcessingStatus, error)
+	GetFileStatus(ctx context.Context, tenant TenantContext, fileKey string) (FileProcessingStatus, error)
 
 	// GetTotalCapacity returns the total capacity across all mounted volumes.
 	GetTotalCapacity(ctx context.Context) (int64, error)
@@ -127,17 +138,17 @@ type FileScheduler interface {
 	GetNextBatchForProcessing(ctx context.Context, tenant TenantContext, batchSize int) ([]*FileLocation, error)
 
 	// MarkAsCompleted marks a file as completed and schedules it for deletion.
-	MarkAsCompleted(ctx context.Context, fileKey string) error
+	MarkAsCompleted(ctx context.Context, lease FileProcessingLease) error
 
 	// MarkAsFailed marks a file as failed and schedules retry or permanent failure.
-	MarkAsFailed(ctx context.Context, fileKey string, errorMessage string) error
+	MarkAsFailed(ctx context.Context, lease FileProcessingLease, errorMessage string) error
 
 	// GetFileStatus returns the current status of a file.
-	GetFileStatus(ctx context.Context, fileKey string) (FileProcessingStatus, error)
+	GetFileStatus(ctx context.Context, tenant TenantContext, fileKey string) (FileProcessingStatus, error)
 
 	// ResetTimedOutFiles finds files in Processing status that exceed timeout
 	// and resets them to Pending status for retry.
-	ResetTimedOutFiles(ctx context.Context, timeout time.Duration) (int, error)
+	ResetTimedOutFiles(ctx context.Context, tenant TenantContext, timeout time.Duration) (int, error)
 }
 
 // StorageVolume represents a storage backend (local filesystem, network drive, cloud storage).
@@ -172,6 +183,12 @@ type StorageVolume interface {
 	FileExists(ctx context.Context, relativePath string) (bool, error)
 }
 
+// StorageVolumePathBuilder exposes a volume-specific physical layout strategy.
+// StoragePool uses it after volume selection so sharding settings are honored.
+type StorageVolumePathBuilder interface {
+	BuildPhysicalPath(tenantID string, fileKey string, fileExtension string) (string, error)
+}
+
 // DirectoryQuotaManager manages file count quotas at the directory level.
 type DirectoryQuotaManager interface {
 	// CanAddFile checks if a file can be added to a directory without exceeding quota.
@@ -195,6 +212,9 @@ type DirectoryQuotaManager interface {
 
 	// GetQuota returns the quota configuration for a directory.
 	GetQuota(ctx context.Context, tenantID string, directoryPath string) (*DirectoryQuota, error)
+
+	// SetFileCount replaces the current count during startup reconciliation.
+	SetFileCount(ctx context.Context, tenantID string, directoryPath string, count int) error
 }
 
 // TenantQuotaManager manages file count quotas at the tenant level.
@@ -216,6 +236,9 @@ type TenantQuotaManager interface {
 
 	// SetQuota sets the maximum file count for a tenant (0 = unlimited).
 	SetQuota(ctx context.Context, tenantID string, maxCount int) error
+
+	// SetFileCount replaces the current count during startup reconciliation.
+	SetFileCount(ctx context.Context, tenantID string, count int) error
 }
 
 // CleanupService handles cleanup of orphaned resources.
@@ -226,8 +249,12 @@ type CleanupService interface {
 	// CleanupTimedOutProcessingFiles resets files that have been in Processing status too long.
 	CleanupTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) (*CleanupStatistics, error)
 
-	// CleanupPermanentlyFailedFiles deletes files that have permanently failed.
-	CleanupPermanentlyFailedFiles(ctx context.Context) (*CleanupStatistics, error)
+	// CleanupPermanentlyFailedFiles deletes permanently failed files older than retention.
+	// A zero retention deletes eligible files immediately.
+	CleanupPermanentlyFailedFiles(ctx context.Context, retention time.Duration) (*CleanupStatistics, error)
+
+	// CleanupCompletedFiles deletes completed files after the retention period.
+	CleanupCompletedFiles(ctx context.Context, retention time.Duration) (*CleanupStatistics, error)
 
 	// CleanupOrphanedMetadata removes metadata for files that no longer exist physically.
 	CleanupOrphanedMetadata(ctx context.Context) (*CleanupStatistics, error)
@@ -247,13 +274,13 @@ type MetadataRepository interface {
 
 	// Get retrieves file metadata by key.
 	// Returns nil if not found.
-	Get(ctx context.Context, fileKey string) (*FileMetadata, error)
+	Get(ctx context.Context, tenantID string, fileKey string) (*FileMetadata, error)
 
 	// Delete removes file metadata.
-	Delete(ctx context.Context, fileKey string) error
+	Delete(ctx context.Context, tenantID string, fileKey string) error
 
 	// DeleteBatch removes multiple file metadata atomically in a single transaction.
-	DeleteBatch(ctx context.Context, fileKeys []string) error
+	DeleteBatch(ctx context.Context, tenantID string, fileKeys []string) error
 
 	// GetByStatus retrieves files by status with optional limit.
 	GetByStatus(ctx context.Context, tenantID string, status FileProcessingStatus, limit int) ([]*FileMetadata, error)
@@ -262,7 +289,7 @@ type MetadataRepository interface {
 	GetPendingFiles(ctx context.Context, tenantID string, limit int) ([]*FileMetadata, error)
 
 	// UpdateStatus atomically updates file status.
-	UpdateStatus(ctx context.Context, fileKey string, newStatus FileProcessingStatus) error
+	UpdateStatus(ctx context.Context, tenantID string, fileKey string, newStatus FileProcessingStatus) error
 
 	// CompareAndTransitionToProcessing atomically transitions a file to Processing status
 	// if and only if it is currently in Pending status.
@@ -271,10 +298,18 @@ type MetadataRepository interface {
 	// - File is not in Pending status
 	// - Database error
 	// This is a compare-and-swap operation to prevent duplicate processing.
-	CompareAndTransitionToProcessing(ctx context.Context, fileKey string) (*FileMetadata, error)
+	CompareAndTransitionToProcessing(ctx context.Context, tenantID string, fileKey string) (*FileMetadata, error)
+
+	// CompareAndUpdateProcessing atomically updates a Processing file only when
+	// its tenant, file key, and processing start time match the supplied lease.
+	CompareAndUpdateProcessing(
+		ctx context.Context,
+		lease FileProcessingLease,
+		update func(*FileMetadata) error,
+	) (*FileMetadata, error)
 
 	// GetTimedOutProcessingFiles retrieves files in Processing status that exceed timeout.
-	GetTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) ([]*FileMetadata, error)
+	GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration) ([]*FileMetadata, error)
 
 	// Optimize triggers repository-level garbage collection / compaction work.
 	Optimize(ctx context.Context) error
@@ -286,16 +321,19 @@ type MetadataRepository interface {
 // DirectoryQuotaRepository manages directory quota persistence.
 type DirectoryQuotaRepository interface {
 	// GetOrCreate retrieves directory quota or creates with defaults.
-	GetOrCreate(ctx context.Context, directoryPath string) (*DirectoryQuota, error)
+	GetOrCreate(ctx context.Context, tenantID string, directoryPath string) (*DirectoryQuota, error)
 
 	// Update updates directory quota atomically.
-	Update(ctx context.Context, quota *DirectoryQuota) error
+	Update(ctx context.Context, tenantID string, quota *DirectoryQuota) error
 
 	// IncrementCount atomically increments the file count.
-	IncrementCount(ctx context.Context, directoryPath string) error
+	IncrementCount(ctx context.Context, tenantID string, directoryPath string) error
 
 	// DecrementCount atomically decrements the file count.
-	DecrementCount(ctx context.Context, directoryPath string) error
+	DecrementCount(ctx context.Context, tenantID string, directoryPath string) error
+
+	// GetAll returns all directory quotas for one tenant.
+	GetAll(ctx context.Context, tenantID string) ([]*DirectoryQuota, error)
 
 	// Optimize triggers repository-level garbage collection / compaction work.
 	Optimize(ctx context.Context) error

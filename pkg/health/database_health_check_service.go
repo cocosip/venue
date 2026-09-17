@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 )
 
 // DatabaseHealthCheckServiceOptions configures the database health check service.
@@ -15,9 +16,8 @@ type DatabaseHealthCheckServiceOptions struct {
 	// DatabaseHealthChecker performs the actual health checks.
 	DatabaseHealthChecker core.DatabaseHealthChecker
 
-	// Logger is the logger instance to use.
-	// If nil, uses slog.Default().
-	Logger *slog.Logger
+	// Logging is the instance-scoped logging runtime. Nil disables logging.
+	Logging *logging.Runtime
 
 	// InitialDelay is the delay before performing the health check.
 	// Default: 2 seconds (to allow other services to initialize)
@@ -43,7 +43,7 @@ type DatabaseHealthCheckServiceOptions struct {
 // DatabaseHealthCheckService performs database health checks on startup.
 type DatabaseHealthCheckService struct {
 	healthChecker         core.DatabaseHealthChecker
-	logger                *slog.Logger
+	logger                *logging.Runtime
 	initialDelay          time.Duration
 	maxRetries            int
 	retryDelay            time.Duration
@@ -67,10 +67,9 @@ func NewDatabaseHealthCheckService(opts *DatabaseHealthCheckServiceOptions) (*Da
 		return nil, fmt.Errorf("database health checker cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
-	// Set logger (use default if not provided)
-	logger := opts.Logger
+	logger := opts.Logging
 	if logger == nil {
-		logger = slog.Default()
+		logger = logging.Disabled()
 	}
 
 	// Set defaults
@@ -121,7 +120,7 @@ func (s *DatabaseHealthCheckService) Start() error {
 	s.wg.Add(1)
 	go s.run()
 
-	s.logger.Info("Database health check service started")
+	s.emit(s.ctx, slog.LevelInfo, "started", "Database health check service started")
 
 	return nil
 }
@@ -135,12 +134,12 @@ func (s *DatabaseHealthCheckService) Stop() error {
 		return fmt.Errorf("database health check service is not running")
 	}
 
-	s.logger.Info("Stopping database health check service...")
+	s.emit(s.ctx, slog.LevelInfo, "stopping", "Stopping database health check service")
 	s.cancel()
 	s.wg.Wait()
 	s.running = false
 
-	s.logger.Info("Database health check service stopped")
+	s.emit(s.ctx, slog.LevelInfo, "stopped", "Database health check service stopped")
 
 	return nil
 }
@@ -157,7 +156,7 @@ func (s *DatabaseHealthCheckService) run() {
 	defer s.wg.Done()
 
 	// Initial delay to allow other services to initialize
-	s.logger.Info("Waiting for other services to initialize", "delay", s.initialDelay)
+	s.emit(s.ctx, slog.LevelInfo, "initial_delay", "Waiting for other services to initialize", slog.Duration("delay", s.initialDelay))
 	select {
 	case <-time.After(s.initialDelay):
 		// Continue
@@ -166,12 +165,12 @@ func (s *DatabaseHealthCheckService) run() {
 	}
 
 	// Perform health check with retry
-	s.logger.Info("Starting database health check")
+	s.emit(s.ctx, slog.LevelInfo, "check_started", "Starting database health check")
 	s.performHealthCheckWithRetry()
 
 	// If startup-only mode, stop here
 	if s.checkOnStartupOnly {
-		s.logger.Info("Database health check completed (startup-only mode)")
+		s.emit(s.ctx, slog.LevelInfo, "startup_check_completed", "Database health check completed")
 		return
 	}
 
@@ -182,10 +181,10 @@ func (s *DatabaseHealthCheckService) run() {
 	for {
 		select {
 		case <-ticker.C:
-			s.logger.Info("Performing periodic database health check")
+			s.emit(s.ctx, slog.LevelInfo, "periodic_check_started", "Performing periodic database health check")
 			s.performHealthCheckWithRetry()
 		case <-s.ctx.Done():
-			s.logger.Info("Database health check service shutting down")
+			s.emit(s.ctx, slog.LevelInfo, "shutting_down", "Database health check service shutting down")
 			return
 		}
 	}
@@ -200,10 +199,10 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 		report, err := s.healthChecker.CheckAllDatabases(s.ctx)
 		if err != nil {
 			lastErr = err
-			s.logger.Warn("Health check failed",
-				"attempt", attempt,
-				"maxRetries", s.maxRetries,
-				"error", err)
+			s.emit(s.ctx, slog.LevelWarn, "check_failed", "Health check failed",
+				slog.Int("attempt", attempt),
+				slog.Int("max_retries", s.maxRetries),
+				errorTypeAttr(err))
 
 			if attempt < s.maxRetries {
 				select {
@@ -222,19 +221,19 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 		// If all healthy, no need to retry
 		if report.AllHealthy {
 			if attempt > 1 {
-				s.logger.Info("Database health check succeeded after retries",
-					"attempt", attempt,
-					"maxRetries", s.maxRetries)
+				s.emit(s.ctx, slog.LevelInfo, "check_recovered", "Database health check succeeded after retries",
+					slog.Int("attempt", attempt),
+					slog.Int("max_retries", s.maxRetries))
 			}
 			break
 		}
 
 		// If not healthy and not last attempt, retry
 		if attempt < s.maxRetries {
-			s.logger.Debug("Health check found issues, retrying to rule out timing conflicts",
-				"attempt", attempt,
-				"maxRetries", s.maxRetries,
-				"corrupted", len(report.CorruptedDatabases))
+			s.emit(s.ctx, slog.LevelDebug, "check_retrying", "Health check found issues, retrying",
+				slog.Int("attempt", attempt),
+				slog.Int("max_retries", s.maxRetries),
+				slog.Int("corrupted", len(report.CorruptedDatabases)))
 
 			select {
 			case <-time.After(s.retryDelay):
@@ -247,12 +246,12 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 
 	// Report results
 	if lastErr != nil {
-		s.logger.Error("Database health check failed after all retries", "error", lastErr)
+		s.emit(s.ctx, slog.LevelError, "check_exhausted", "Database health check failed after all retries", errorTypeAttr(lastErr))
 		return
 	}
 
 	if lastReport == nil {
-		s.logger.Warn("Database health check completed with no report")
+		s.emit(s.ctx, slog.LevelWarn, "report_missing", "Database health check completed with no report")
 		return
 	}
 
@@ -264,38 +263,39 @@ func (s *DatabaseHealthCheckService) reportHealthStatus(report *core.DatabaseHea
 	// Check for no databases
 	if report.HealthyDatabases == 0 && len(report.CorruptedDatabases) == 0 {
 		if len(report.OrphanedTenants) > 0 {
-			s.logger.Warn("METADATA LOSS DETECTED",
-				"orphanedTenants", len(report.OrphanedTenants),
-				"tenants", report.OrphanedTenants)
-			s.logger.Warn("Orphaned tenants have physical files but no metadata database")
-			s.logger.Warn("Consider using recovery procedures to rebuild metadata")
+			s.emit(s.ctx, slog.LevelWarn, "metadata_loss_detected", "Orphaned tenants have physical files but no metadata database",
+				slog.Int("orphaned_tenants", len(report.OrphanedTenants)))
 		} else {
-			s.logger.Info("No database files found. This is normal for first startup.")
+			s.emit(s.ctx, slog.LevelInfo, "no_databases", "No database files found")
 		}
 		return
 	}
 
 	// All healthy
 	if report.AllHealthy {
-		s.logger.Info("Database health check completed. All databases are healthy.",
-			"count", report.HealthyDatabases)
+		s.emit(s.ctx, slog.LevelInfo, "check_healthy", "Database health check completed; all databases are healthy",
+			slog.Int("count", report.HealthyDatabases))
 		return
 	}
 
 	// Some corrupted databases
-	s.logger.Warn("Database health check completed with issues",
-		"healthy", report.HealthyDatabases,
-		"corrupted", len(report.CorruptedDatabases))
+	s.emit(s.ctx, slog.LevelWarn, "check_unhealthy", "Database health check completed with issues",
+		slog.Int("healthy", report.HealthyDatabases),
+		slog.Int("corrupted", len(report.CorruptedDatabases)))
 
 	for _, corrupted := range report.CorruptedDatabases {
-		s.logger.Error("CORRUPTED DATABASE DETECTED",
-			"type", corrupted.DatabaseType,
-			"tenant", corrupted.TenantID,
-			"path", corrupted.DatabasePath,
-			"error", corrupted.Error)
+		s.emit(s.ctx, slog.LevelError, "database_corrupted", "Corrupted database detected",
+			slog.Any("database_type", corrupted.DatabaseType),
+			slog.String("tenant_id", corrupted.TenantID))
 	}
 
-	s.logger.Error("Manual intervention required to repair corrupted databases")
+	s.emit(s.ctx, slog.LevelError, "manual_intervention_required", "Manual intervention required to repair corrupted databases")
+}
+
+func (s *DatabaseHealthCheckService) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {
+	s.logger.Emit(ctx, logging.Record{
+		Level: level, Component: "health.database_service", Event: event, Message: message, Attrs: attrs,
+	})
 }
 
 // CheckNow manually triggers a health check.

@@ -1,4 +1,4 @@
-# Venue Configuration File (matching Locus structure)
+# Venue configuration file
 
 metadataDirectory: ./venue-data/metadata
 quotaDirectory: ./venue-data/quota
@@ -26,7 +26,7 @@ volumes:
 tenants:
   - tenantId: tenant-001
     enabled: true
-    quota: 10000000  # 10MB
+    quota: 10000000  # managed files
   - tenantId: tenant-002
     enabled: true
     quota: null  # use default
@@ -76,7 +76,7 @@ cleanupOptions:
   cleanupTimedOutFiles: true
   processingTimeout: 30m
   cleanupPermanentlyFailedFiles: true
-  failedFileRetentionPeriod: 168h  # 7 days
+  failedFileRetentionPeriod: 72h  # 3 days
   cleanupCompletedRecords: false
   completedRecordRetentionPeriod: 720h  # 30 days
   optimizeDatabases: true

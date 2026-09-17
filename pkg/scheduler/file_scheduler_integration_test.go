@@ -39,15 +39,21 @@ func TestIntegration_FileLifecycle(t *testing.T) {
 		}
 
 		// 3. Mark as completed
-		err = scheduler.MarkAsCompleted(ctx, location.FileKey)
+		err = scheduler.MarkAsCompleted(ctx, requireProcessingLease(t, location))
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
-		// 4. Verify file is deleted
-		_, err = repo.Get(ctx, location.FileKey)
-		if err != core.ErrFileNotFound {
-			t.Errorf("Expected file to be deleted, got error: %v", err)
+		// 4. Verify completion is durable until cleanup removes the file.
+		completed, err := repo.Get(ctx, tenant.ID, location.FileKey)
+		if err != nil {
+			t.Fatalf("Get completed metadata failed: %v", err)
+		}
+		if completed.Status != core.FileStatusCompleted {
+			t.Errorf("Status after completion = %v, want Completed", completed.Status)
+		}
+		if completed.CompletedAt == nil {
+			t.Error("CompletedAt after completion = nil")
 		}
 	})
 }
@@ -82,15 +88,15 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 	// First attempt
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
 
-	// Fail 3 times (within max retries)
-	for i := 1; i <= 3; i++ {
-		err := scheduler.MarkAsFailed(ctx, location.FileKey, "Retry test error")
+	// The third failure reaches the configured retry limit.
+	for i := 1; i <= 2; i++ {
+		err := scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Retry test error")
 		if err != nil {
 			t.Fatalf("Attempt %d: Expected no error, got %v", i, err)
 		}
 
 		// Verify retry count
-		metadata, _ := repo.Get(ctx, location.FileKey)
+		metadata, _ := repo.Get(ctx, tenant.ID, location.FileKey)
 		if metadata.RetryCount != i {
 			t.Errorf("Attempt %d: Expected RetryCount %d, got %d", i, i, metadata.RetryCount)
 		}
@@ -111,20 +117,20 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 		}
 	}
 
-	// 4th failure should permanently fail
-	err := scheduler.MarkAsFailed(ctx, location.FileKey, "Final error")
+	// 3rd failure should permanently fail.
+	err := scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Final error")
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
 	}
 
 	// Verify permanently failed
-	metadata, _ := repo.Get(ctx, location.FileKey)
+	metadata, _ := repo.Get(ctx, tenant.ID, location.FileKey)
 	if metadata.Status != core.FileStatusPermanentlyFailed {
 		t.Errorf("Expected status PermanentlyFailed, got %v", metadata.Status)
 	}
 
-	if metadata.RetryCount != 4 {
-		t.Errorf("Expected RetryCount 4, got %d", metadata.RetryCount)
+	if metadata.RetryCount != 3 {
+		t.Errorf("Expected RetryCount 3, got %d", metadata.RetryCount)
 	}
 }
 
@@ -180,7 +186,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 
 				// Mark as completed
-				_ = scheduler.MarkAsCompleted(ctx, location.FileKey)
+				_ = scheduler.MarkAsCompleted(ctx, requireProcessingLease(t, location))
 			}
 		}(workerID)
 	}
@@ -220,13 +226,13 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
 
 	// Simulate timeout by manually setting old processing start time
-	metadata, _ := repo.Get(ctx, location.FileKey)
+	metadata, _ := repo.Get(ctx, tenant.ID, location.FileKey)
 	longAgo := time.Now().Add(-2 * time.Hour)
 	metadata.ProcessingStartTime = &longAgo
 	_ = repo.AddOrUpdate(ctx, metadata)
 
 	// Reset timed out files
-	count, err := scheduler.ResetTimedOutFiles(ctx, 1*time.Hour)
+	count, err := scheduler.ResetTimedOutFiles(ctx, tenant, 1*time.Hour)
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
 	}
@@ -236,7 +242,7 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 	}
 
 	// Verify file is back to Pending
-	updated, _ := repo.Get(ctx, location.FileKey)
+	updated, _ := repo.Get(ctx, tenant.ID, location.FileKey)
 	if updated.Status != core.FileStatusPending {
 		t.Errorf("Expected status Pending, got %v", updated.Status)
 	}
@@ -354,10 +360,10 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 
 	// Get and fail the file
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
-	_ = scheduler.MarkAsFailed(ctx, location.FileKey, "Test error")
+	_ = scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Test error")
 
 	// Check retry delay after first failure (should be 1 second)
-	metadata, _ := repo.Get(ctx, location.FileKey)
+	metadata, _ := repo.Get(ctx, tenant.ID, location.FileKey)
 	if metadata.AvailableForProcessingAt == nil {
 		t.Fatal("Expected AvailableForProcessingAt to be set")
 	}
@@ -370,10 +376,10 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 	// Fail again
 	time.Sleep(1100 * time.Millisecond)
 	location, _ = scheduler.GetNextFileForProcessing(ctx, tenant)
-	_ = scheduler.MarkAsFailed(ctx, location.FileKey, "Test error 2")
+	_ = scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Test error 2")
 
 	// Check retry delay after second failure (should be 2 seconds)
-	metadata, _ = repo.Get(ctx, location.FileKey)
+	metadata, _ = repo.Get(ctx, tenant.ID, location.FileKey)
 	delay2 := time.Until(*metadata.AvailableForProcessingAt)
 	if delay2 < 1900*time.Millisecond || delay2 > 2100*time.Millisecond {
 		t.Errorf("Expected delay ~2s, got %v", delay2)
@@ -382,12 +388,23 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 	// Fail again
 	time.Sleep(2100 * time.Millisecond)
 	location, _ = scheduler.GetNextFileForProcessing(ctx, tenant)
-	_ = scheduler.MarkAsFailed(ctx, location.FileKey, "Test error 3")
+	_ = scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Test error 3")
 
 	// Check retry delay after third failure (should be 4 seconds)
-	metadata, _ = repo.Get(ctx, location.FileKey)
+	metadata, _ = repo.Get(ctx, tenant.ID, location.FileKey)
 	delay3 := time.Until(*metadata.AvailableForProcessingAt)
 	if delay3 < 3900*time.Millisecond || delay3 > 4100*time.Millisecond {
 		t.Errorf("Expected delay ~4s, got %v", delay3)
 	}
+}
+
+func requireProcessingLease(t *testing.T, location *core.FileLocation) core.FileProcessingLease {
+	t.Helper()
+	if location == nil {
+		t.Fatal("processing location is nil")
+	}
+	if location.Lease == nil {
+		t.Fatal("processing location has nil lease")
+	}
+	return *location.Lease
 }

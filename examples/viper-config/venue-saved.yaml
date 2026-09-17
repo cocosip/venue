@@ -69,7 +69,7 @@ cleanupOptions:
     cleanupTimedOutFiles: true
     processingTimeout: 30m0s
     cleanupPermanentlyFailedFiles: true
-    failedFileRetentionPeriod: 168h0m0s
+    failedFileRetentionPeriod: 72h0m0s
     cleanupCompletedRecords: false
     completedRecordRetentionPeriod: 720h0m0s
     optimizeDatabases: true

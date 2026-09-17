@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -131,7 +132,7 @@ func NewBadgerDirectoryQuotaRepository(opts *BadgerDirectoryQuotaRepositoryOptio
 }
 
 // GetOrCreate retrieves directory quota or creates with defaults.
-func (r *badgerDirectoryQuotaRepository) GetOrCreate(ctx context.Context, directoryPath string) (*core.DirectoryQuota, error) {
+func (r *badgerDirectoryQuotaRepository) GetOrCreate(ctx context.Context, tenantID string, directoryPath string) (*core.DirectoryQuota, error) {
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
@@ -139,6 +140,9 @@ func (r *badgerDirectoryQuotaRepository) GetOrCreate(ctx context.Context, direct
 	}
 	r.mu.RUnlock()
 
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
 	if directoryPath == "" {
 		return nil, fmt.Errorf("directory path cannot be empty: %w", core.ErrInvalidArgument)
 	}
@@ -146,7 +150,7 @@ func (r *badgerDirectoryQuotaRepository) GetOrCreate(ctx context.Context, direct
 	var quota *core.DirectoryQuota
 
 	err := r.db.Update(func(txn *badger.Txn) error {
-		key := r.buildKey(directoryPath)
+		key := r.buildKey(tenantID, directoryPath)
 
 		// Try to get existing quota
 		item, err := txn.Get(key)
@@ -190,7 +194,7 @@ func (r *badgerDirectoryQuotaRepository) GetOrCreate(ctx context.Context, direct
 }
 
 // Update updates directory quota atomically.
-func (r *badgerDirectoryQuotaRepository) Update(ctx context.Context, quota *core.DirectoryQuota) error {
+func (r *badgerDirectoryQuotaRepository) Update(ctx context.Context, tenantID string, quota *core.DirectoryQuota) error {
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
@@ -198,6 +202,9 @@ func (r *badgerDirectoryQuotaRepository) Update(ctx context.Context, quota *core
 	}
 	r.mu.RUnlock()
 
+	if tenantID == "" {
+		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
 	if quota == nil {
 		return fmt.Errorf("quota cannot be nil: %w", core.ErrInvalidArgument)
 	}
@@ -217,7 +224,7 @@ func (r *badgerDirectoryQuotaRepository) Update(ctx context.Context, quota *core
 
 	// Write to BadgerDB
 	err = r.db.Update(func(txn *badger.Txn) error {
-		key := r.buildKey(quota.DirectoryPath)
+		key := r.buildKey(tenantID, quota.DirectoryPath)
 		return txn.Set(key, data)
 	})
 
@@ -229,7 +236,7 @@ func (r *badgerDirectoryQuotaRepository) Update(ctx context.Context, quota *core
 }
 
 // IncrementCount atomically increments the file count.
-func (r *badgerDirectoryQuotaRepository) IncrementCount(ctx context.Context, directoryPath string) error {
+func (r *badgerDirectoryQuotaRepository) IncrementCount(ctx context.Context, tenantID string, directoryPath string) error {
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
@@ -237,12 +244,15 @@ func (r *badgerDirectoryQuotaRepository) IncrementCount(ctx context.Context, dir
 	}
 	r.mu.RUnlock()
 
+	if tenantID == "" {
+		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
 	if directoryPath == "" {
 		return fmt.Errorf("directory path cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
 	err := r.db.Update(func(txn *badger.Txn) error {
-		key := r.buildKey(directoryPath)
+		key := r.buildKey(tenantID, directoryPath)
 
 		// Get current quota
 		item, err := txn.Get(key)
@@ -296,7 +306,7 @@ func (r *badgerDirectoryQuotaRepository) IncrementCount(ctx context.Context, dir
 }
 
 // DecrementCount atomically decrements the file count.
-func (r *badgerDirectoryQuotaRepository) DecrementCount(ctx context.Context, directoryPath string) error {
+func (r *badgerDirectoryQuotaRepository) DecrementCount(ctx context.Context, tenantID string, directoryPath string) error {
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
@@ -304,12 +314,15 @@ func (r *badgerDirectoryQuotaRepository) DecrementCount(ctx context.Context, dir
 	}
 	r.mu.RUnlock()
 
+	if tenantID == "" {
+		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
 	if directoryPath == "" {
 		return fmt.Errorf("directory path cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
 	err := r.db.Update(func(txn *badger.Txn) error {
-		key := r.buildKey(directoryPath)
+		key := r.buildKey(tenantID, directoryPath)
 
 		// Get current quota
 		item, err := txn.Get(key)
@@ -350,6 +363,46 @@ func (r *badgerDirectoryQuotaRepository) DecrementCount(ctx context.Context, dir
 	}
 
 	return nil
+}
+
+// GetAll returns all directory quotas for one tenant.
+func (r *badgerDirectoryQuotaRepository) GetAll(ctx context.Context, tenantID string) ([]*core.DirectoryQuota, error) {
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return nil, fmt.Errorf("repository is closed")
+	}
+	r.mu.RUnlock()
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	prefix := r.buildTenantPrefix(tenantID)
+	quotas := make([]*core.DirectoryQuota, 0)
+	err := r.db.View(func(txn *badger.Txn) error {
+		iterator := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer iterator.Close()
+		for iterator.Seek(prefix); iterator.ValidForPrefix(prefix); iterator.Next() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			var quota core.DirectoryQuota
+			if err := iterator.Item().Value(func(value []byte) error {
+				return json.Unmarshal(value, &quota)
+			}); err != nil {
+				return err
+			}
+			quotaCopy := quota
+			quotas = append(quotas, &quotaCopy)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list directory quotas: %w", err)
+	}
+	return quotas, nil
 }
 
 // Optimize triggers BadgerDB garbage collection to reclaim disk space.
@@ -403,8 +456,13 @@ func (r *badgerDirectoryQuotaRepository) Close() error {
 }
 
 // buildKey builds a BadgerDB key for a directory path.
-func (r *badgerDirectoryQuotaRepository) buildKey(directoryPath string) []byte {
-	return []byte(fmt.Sprintf("dirquota:%s", directoryPath))
+func (r *badgerDirectoryQuotaRepository) buildKey(tenantID string, directoryPath string) []byte {
+	return append(r.buildTenantPrefix(tenantID), directoryPath...)
+}
+
+func (r *badgerDirectoryQuotaRepository) buildTenantPrefix(tenantID string) []byte {
+	encodedTenantID := base64.RawURLEncoding.EncodeToString([]byte(tenantID))
+	return []byte(fmt.Sprintf("dirquota:%s:", encodedTenantID))
 }
 
 // startGC starts the background garbage collection goroutine.

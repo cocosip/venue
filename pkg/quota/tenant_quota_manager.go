@@ -30,15 +30,21 @@ func (q *tenantQuota) canAddFile() bool {
 // tenantQuotaManager implements TenantQuotaManager interface.
 // Uses sync.Map for better concurrent performance with high tenant counts.
 type tenantQuotaManager struct {
-	quotas sync.Map // map[string]*tenantQuota
+	quotas          sync.Map // map[string]*tenantQuota
+	defaultMaxCount int
 	// Note: sync.Map is optimized for frequent reads and infrequent writes
 	// which matches the quota check pattern (many CanAddFile calls,
 	// fewer Increment/Decrement calls)
 }
 
-// NewTenantQuotaManager creates a new tenant quota manager.
-func NewTenantQuotaManager() core.TenantQuotaManager {
-	return &tenantQuotaManager{}
+// NewTenantQuotaManager creates a new tenant quota manager. When supplied,
+// defaultMaxCount applies to tenants without an explicit quota.
+func NewTenantQuotaManager(defaultMaxCount ...int) core.TenantQuotaManager {
+	manager := &tenantQuotaManager{}
+	if len(defaultMaxCount) > 0 && defaultMaxCount[0] > 0 {
+		manager.defaultMaxCount = defaultMaxCount[0]
+	}
+	return manager
 }
 
 // CanAddFile checks if a file can be added to a tenant without exceeding quota.
@@ -65,12 +71,12 @@ func (m *tenantQuotaManager) IncrementFileCount(ctx context.Context, tenantID st
 	for {
 		val, loaded := m.quotas.Load(tenantID)
 		if !loaded {
-			// No quota set, create default (unlimited)
+			// No tenant-specific quota exists, so use the configured default.
 			newQuota := &tenantQuota{
 				tenantID:     tenantID,
 				currentCount: 1,
-				maxCount:     0,
-				enabled:      false,
+				maxCount:     m.defaultMaxCount,
+				enabled:      m.defaultMaxCount > 0,
 			}
 			if _, loaded := m.quotas.LoadOrStore(tenantID, newQuota); !loaded {
 				return nil // Successfully stored
@@ -98,6 +104,43 @@ func (m *tenantQuotaManager) IncrementFileCount(ctx context.Context, tenantID st
 			return nil
 		}
 		// CAS failed, retry
+	}
+}
+
+// SetFileCount replaces the current count during startup reconciliation.
+func (m *tenantQuotaManager) SetFileCount(ctx context.Context, tenantID string, count int) error {
+	if tenantID == "" {
+		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if count < 0 {
+		return fmt.Errorf("count cannot be negative: %w", core.ErrInvalidArgument)
+	}
+
+	for {
+		val, loaded := m.quotas.Load(tenantID)
+		if !loaded {
+			newQuota := &tenantQuota{
+				tenantID:     tenantID,
+				currentCount: count,
+				maxCount:     m.defaultMaxCount,
+				enabled:      m.defaultMaxCount > 0,
+			}
+			if _, loaded := m.quotas.LoadOrStore(tenantID, newQuota); !loaded {
+				return nil
+			}
+			continue
+		}
+
+		quota := val.(*tenantQuota)
+		updated := &tenantQuota{
+			tenantID:     quota.tenantID,
+			currentCount: count,
+			maxCount:     quota.maxCount,
+			enabled:      quota.enabled,
+		}
+		if m.quotas.CompareAndSwap(tenantID, quota, updated) {
+			return nil
+		}
 	}
 }
 

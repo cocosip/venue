@@ -4,129 +4,69 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	venue "github.com/cocosip/venue"
 	"github.com/cocosip/venue/config"
 	"github.com/cocosip/venue/pkg/core"
-	"github.com/cocosip/venue/pkg/metadata"
-	"github.com/cocosip/venue/pkg/pool"
 	"github.com/cocosip/venue/pkg/quota"
-	"github.com/cocosip/venue/pkg/scheduler"
-	"github.com/cocosip/venue/pkg/tenant"
-	"github.com/cocosip/venue/pkg/volume"
 )
 
-// BenchmarkSystem contains the system setup for benchmarks
+// BenchmarkSystem contains the public Venue runtime used by system benchmarks.
 type BenchmarkSystem struct {
-	tenantManager core.TenantManager
-	metadataRepo  core.MetadataRepository
-	fileScheduler core.FileScheduler
-	volumes       map[string]core.StorageVolume
-	storagePool   core.StoragePool
-	tenantCtx     core.TenantContext
-	dataDir       string
+	metadataRepo core.MetadataRepository
+	storagePool  core.StoragePool
+	tenantCtx    core.TenantContext
 }
 
-// setupBenchmarkSystem creates a complete system for benchmarking
+// setupBenchmarkSystem creates a complete system through Venue's public API.
 func setupBenchmarkSystem(b *testing.B) *BenchmarkSystem {
+	b.Helper()
+
 	ctx := context.Background()
-
-	// Create temp directory
-	dataDir, err := os.MkdirTemp("", "bench-*")
-	if err != nil {
-		b.Fatalf("Failed to create temp dir: %v", err)
-	}
-
-	cfg := config.DefaultConfig()
-	cfg.MetadataDirectory = filepath.Join(dataDir, "metadata")
-	cfg.QuotaDirectory = filepath.Join(dataDir, "quotas")
-	cfg.Volumes[0].MountPath = filepath.Join(dataDir, "volumes", "default")
-
-	// Tenant manager
-	tenantMgr, _ := tenant.NewTenantManager(&tenant.TenantManagerOptions{
-		RootPath:         cfg.MetadataDirectory,
-		CacheTTL:         5 * time.Minute, // Use reasonable default
-		EnableAutoCreate: false,
-	})
-
+	dataDir := b.TempDir()
 	tenantID := "bench-tenant"
-	_ = tenantMgr.CreateTenant(ctx, tenantID)
-	tenantCtx, _ := tenantMgr.GetTenant(ctx, tenantID)
+	cfg := config.New().
+		WithMetadataDirectory(filepath.Join(dataDir, "metadata")).
+		WithQuotaDirectory(filepath.Join(dataDir, "quotas")).
+		WithDatabaseHealthCheckEnabled(false).
+		WithBackgroundCleanupEnabled(false).
+		WithVolumes(config.NewVolumeConfig().
+			WithVolumeID("default-volume").
+			WithMountPath(filepath.Join(dataDir, "volumes", "default")).
+			WithShardingDepth(2)).
+		WithTenants(config.NewTenantConfig(tenantID))
 
-	// Storage volume
-	vol, _ := volume.NewLocalFileSystemVolume(&volume.LocalFileSystemVolumeOptions{
-		VolumeID:   cfg.Volumes[0].VolumeId,
-		VolumeType: cfg.Volumes[0].VolumeType,
-		MountPath:  cfg.Volumes[0].MountPath,
-		ShardDepth: cfg.Volumes[0].ShardingDepth,
-	})
-
-	volumes := map[string]core.StorageVolume{
-		cfg.Volumes[0].VolumeId: vol,
+	runtime, err := venue.NewVenue(cfg)
+	if err != nil {
+		b.Fatalf("NewVenue failed: %v", err)
 	}
-
-	// Metadata repository
-	metaRepo, _ := metadata.NewBadgerMetadataRepository(&metadata.BadgerRepositoryOptions{
-		TenantID:       tenantID,
-		DataPath:       filepath.Join(cfg.MetadataDirectory, tenantID),
-		CacheTTL:       cfg.MetadataOptions.CacheTTL,
-		GCInterval:     cfg.BadgerDBOptions.GCInterval,
-		GCDiscardRatio: cfg.BadgerDBOptions.GCDiscardRatio,
+	if err := runtime.Start(); err != nil {
+		b.Fatalf("Venue.Start failed: %v", err)
+	}
+	b.Cleanup(func() {
+		if err := runtime.Stop(); err != nil {
+			b.Errorf("Venue.Stop failed: %v", err)
+		}
 	})
 
-	// Quota managers
-	tenantQuotaMgr := quota.NewTenantQuotaManager()
-	dirQuotaRepo, _ := quota.NewBadgerDirectoryQuotaRepository(&quota.BadgerDirectoryQuotaRepositoryOptions{
-		DataPath:       cfg.QuotaDirectory,
-		GCInterval:     cfg.BadgerDBOptions.GCInterval,
-		GCDiscardRatio: cfg.BadgerDBOptions.GCDiscardRatio,
-	})
-	dirQuotaMgr, _ := quota.NewDirectoryQuotaManager(dirQuotaRepo)
-
-	// File scheduler
-	fileScheduler, _ := scheduler.NewFileScheduler(metaRepo, volumes, &scheduler.FileSchedulerOptions{
-		RetryPolicy: &core.FileRetryPolicy{
-			MaxRetryCount:         cfg.RetryPolicy.MaxRetryCount,
-			InitialRetryDelay:     cfg.RetryPolicy.InitialRetryDelay,
-			UseExponentialBackoff: cfg.RetryPolicy.UseExponentialBackoff,
-			MaxRetryDelay:         cfg.RetryPolicy.MaxRetryDelay,
-		},
-		ProcessingTimeout: cfg.CleanupOptions.ProcessingTimeout,
-	})
-
-	// Storage pool
-	storagePool, _ := pool.NewStoragePool(&pool.StoragePoolOptions{
-		TenantManager:         tenantMgr,
-		MetadataRepository:    metaRepo,
-		FileScheduler:         fileScheduler,
-		Volumes:               volumes,
-		TenantQuotaManager:    tenantQuotaMgr,
-		DirectoryQuotaManager: dirQuotaMgr,
-	})
+	tenantCtx, err := runtime.TenantManager().GetTenant(ctx, tenantID)
+	if err != nil {
+		b.Fatalf("GetTenant failed: %v", err)
+	}
 
 	return &BenchmarkSystem{
-		tenantManager: tenantMgr,
-		metadataRepo:  metaRepo,
-		fileScheduler: fileScheduler,
-		volumes:       volumes,
-		storagePool:   storagePool,
-		tenantCtx:     tenantCtx,
-		dataDir:       dataDir,
+		metadataRepo: runtime.MetadataRepository(),
+		storagePool:  runtime.StoragePool(),
+		tenantCtx:    tenantCtx,
 	}
-}
-
-// cleanup cleans up benchmark system resources
-func (s *BenchmarkSystem) cleanup() {
-	_ = os.RemoveAll(s.dataDir)
 }
 
 // BenchmarkWriteFile benchmarks file upload performance
 func BenchmarkWriteFile(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
 
 	ctx := context.Background()
 	content := []byte("benchmark test content")
@@ -146,7 +86,6 @@ func BenchmarkWriteFile(b *testing.B) {
 // BenchmarkWriteFile_Parallel benchmarks parallel file uploads
 func BenchmarkWriteFile_Parallel(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
 
 	ctx := context.Background()
 	content := []byte("benchmark test content")
@@ -170,7 +109,6 @@ func BenchmarkWriteFile_Parallel(b *testing.B) {
 // BenchmarkReadFile benchmarks file read performance
 func BenchmarkReadFile(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
 
 	ctx := context.Background()
 
@@ -194,7 +132,6 @@ func BenchmarkReadFile(b *testing.B) {
 // BenchmarkGetNextFileForProcessing benchmarks queue retrieval
 func BenchmarkGetNextFileForProcessing(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
 
 	ctx := context.Background()
 
@@ -222,7 +159,6 @@ func BenchmarkGetNextFileForProcessing(b *testing.B) {
 // BenchmarkCompleteWorkflow benchmarks the complete file lifecycle
 func BenchmarkCompleteWorkflow(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
 
 	ctx := context.Background()
 	content := []byte("complete workflow benchmark")
@@ -233,19 +169,22 @@ func BenchmarkCompleteWorkflow(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// 1. Upload
 		fileName := fmt.Sprintf("workflow-%d.txt", i)
-		fileKey, err := sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
+		_, err := sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
 		if err != nil {
 			b.Fatalf("WriteFile failed: %v", err)
 		}
 
 		// 2. Get for processing
-		_, err = sys.storagePool.GetNextFileForProcessing(ctx, sys.tenantCtx)
+		location, err := sys.storagePool.GetNextFileForProcessing(ctx, sys.tenantCtx)
 		if err != nil {
 			b.Fatalf("GetNextFileForProcessing failed: %v", err)
 		}
+		if location.Lease == nil {
+			b.Fatal("GetNextFileForProcessing returned a nil lease")
+		}
 
 		// 3. Mark as completed (deletes)
-		err = sys.storagePool.MarkAsCompleted(ctx, fileKey)
+		err = sys.storagePool.MarkAsCompleted(ctx, *location.Lease)
 		if err != nil {
 			b.Fatalf("MarkAsCompleted failed: %v", err)
 		}
@@ -255,7 +194,6 @@ func BenchmarkCompleteWorkflow(b *testing.B) {
 // BenchmarkMetadataOperations benchmarks metadata operations
 func BenchmarkMetadataOperations(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
 
 	ctx := context.Background()
 
@@ -290,7 +228,7 @@ func BenchmarkMetadataOperations(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_, _ = sys.metadataRepo.Get(ctx, meta.FileKey)
+			_, _ = sys.metadataRepo.Get(ctx, sys.tenantCtx.ID, meta.FileKey)
 		}
 	})
 
@@ -312,9 +250,6 @@ func BenchmarkMetadataOperations(b *testing.B) {
 
 // BenchmarkQuotaOperations benchmarks quota management
 func BenchmarkQuotaOperations(b *testing.B) {
-	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
-
 	ctx := context.Background()
 	tenantQuotaMgr := quota.NewTenantQuotaManager()
 
@@ -349,7 +284,6 @@ func BenchmarkQuotaOperations(b *testing.B) {
 // BenchmarkConcurrentProcessing benchmarks concurrent file processing
 func BenchmarkConcurrentProcessing(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
-	defer sys.cleanup()
 
 	ctx := context.Background()
 
@@ -375,7 +309,9 @@ func BenchmarkConcurrentProcessing(b *testing.B) {
 			_ = reader.Close()
 
 			// Mark as completed
-			_ = sys.storagePool.MarkAsCompleted(ctx, location.FileKey)
+			if location.Lease != nil {
+				_ = sys.storagePool.MarkAsCompleted(ctx, *location.Lease)
+			}
 		}
 	})
 }

@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -125,7 +126,7 @@ func TestBadgerRepository_AddOrUpdate(t *testing.T) {
 		}
 
 		// Verify it was saved
-		retrieved, err := repo.Get(ctx, "file1")
+		retrieved, err := repo.Get(ctx, "test-tenant", "file1")
 		if err != nil {
 			t.Fatalf("Failed to get metadata: %v", err)
 		}
@@ -144,7 +145,7 @@ func TestBadgerRepository_AddOrUpdate(t *testing.T) {
 		}
 
 		// Verify it was updated
-		retrieved, err := repo.Get(ctx, "file1")
+		retrieved, err := repo.Get(ctx, "test-tenant", "file1")
 		if err != nil {
 			t.Fatalf("Failed to get metadata: %v", err)
 		}
@@ -182,7 +183,7 @@ func TestBadgerRepository_Get(t *testing.T) {
 	_ = repo.AddOrUpdate(ctx, metadata)
 
 	t.Run("Get existing file", func(t *testing.T) {
-		retrieved, err := repo.Get(ctx, "file1")
+		retrieved, err := repo.Get(ctx, "test-tenant", "file1")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -193,7 +194,7 @@ func TestBadgerRepository_Get(t *testing.T) {
 	})
 
 	t.Run("Get non-existent file", func(t *testing.T) {
-		_, err := repo.Get(ctx, "non-existent")
+		_, err := repo.Get(ctx, "test-tenant", "non-existent")
 		if err == nil {
 			t.Fatal("Expected error for non-existent file")
 		}
@@ -203,7 +204,7 @@ func TestBadgerRepository_Get(t *testing.T) {
 	})
 
 	t.Run("Empty file key", func(t *testing.T) {
-		_, err := repo.Get(ctx, "")
+		_, err := repo.Get(ctx, "test-tenant", "")
 		if err == nil {
 			t.Fatal("Expected error for empty file key")
 		}
@@ -221,13 +222,13 @@ func TestBadgerRepository_Delete(t *testing.T) {
 	_ = repo.AddOrUpdate(ctx, metadata)
 
 	t.Run("Delete existing file", func(t *testing.T) {
-		err := repo.Delete(ctx, "file1")
+		err := repo.Delete(ctx, "test-tenant", "file1")
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
 		// Verify it was deleted
-		_, err = repo.Get(ctx, "file1")
+		_, err = repo.Get(ctx, "test-tenant", "file1")
 		if err != core.ErrFileNotFound {
 			t.Errorf("Expected ErrFileNotFound after deletion, got %v", err)
 		}
@@ -235,14 +236,14 @@ func TestBadgerRepository_Delete(t *testing.T) {
 
 	t.Run("Delete non-existent file", func(t *testing.T) {
 		// Should not error
-		err := repo.Delete(ctx, "non-existent")
+		err := repo.Delete(ctx, "test-tenant", "non-existent")
 		if err != nil {
 			t.Errorf("Expected no error for deleting non-existent file, got %v", err)
 		}
 	})
 
 	t.Run("Empty file key", func(t *testing.T) {
-		err := repo.Delete(ctx, "")
+		err := repo.Delete(ctx, "test-tenant", "")
 		if err == nil {
 			t.Fatal("Expected error for empty file key")
 		}
@@ -357,20 +358,20 @@ func TestBadgerRepository_UpdateStatus(t *testing.T) {
 	_ = repo.AddOrUpdate(ctx, metadata)
 
 	t.Run("Update to processing", func(t *testing.T) {
-		err := repo.UpdateStatus(ctx, "file1", core.FileStatusProcessing)
+		err := repo.UpdateStatus(ctx, "test-tenant", "file1", core.FileStatusProcessing)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
 		// Verify status was updated
-		retrieved, _ := repo.Get(ctx, "file1")
+		retrieved, _ := repo.Get(ctx, "test-tenant", "file1")
 		if retrieved.Status != core.FileStatusProcessing {
 			t.Errorf("Expected status Processing, got %v", retrieved.Status)
 		}
 	})
 
 	t.Run("Update non-existent file", func(t *testing.T) {
-		err := repo.UpdateStatus(ctx, "non-existent", core.FileStatusCompleted)
+		err := repo.UpdateStatus(ctx, "test-tenant", "non-existent", core.FileStatusCompleted)
 		if err == nil {
 			t.Fatal("Expected error for non-existent file")
 		}
@@ -380,7 +381,7 @@ func TestBadgerRepository_UpdateStatus(t *testing.T) {
 	})
 
 	t.Run("Empty file key", func(t *testing.T) {
-		err := repo.UpdateStatus(ctx, "", core.FileStatusCompleted)
+		err := repo.UpdateStatus(ctx, "test-tenant", "", core.FileStatusCompleted)
 		if err == nil {
 			t.Fatal("Expected error for empty file key")
 		}
@@ -411,7 +412,7 @@ func TestBadgerRepository_GetTimedOutProcessingFiles(t *testing.T) {
 
 	t.Run("Get timed out files", func(t *testing.T) {
 		timeout := 1 * time.Hour
-		results, err := repo.GetTimedOutProcessingFiles(ctx, timeout)
+		results, err := repo.GetTimedOutProcessingFiles(ctx, "test-tenant", timeout)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -428,7 +429,7 @@ func TestBadgerRepository_GetTimedOutProcessingFiles(t *testing.T) {
 
 	t.Run("Short timeout gets more files", func(t *testing.T) {
 		timeout := 10 * time.Second
-		results, err := repo.GetTimedOutProcessingFiles(ctx, timeout)
+		results, err := repo.GetTimedOutProcessingFiles(ctx, "test-tenant", timeout)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -436,6 +437,123 @@ func TestBadgerRepository_GetTimedOutProcessingFiles(t *testing.T) {
 		// Should get 2 files: both timed-out and still-processing
 		if len(results) != 2 {
 			t.Errorf("Expected 2 timed out files, got %d", len(results))
+		}
+	})
+}
+
+func TestBadgerRepository_CompareAndUpdateProcessing(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
+
+	t.Run("matching lease updates metadata and status index", func(t *testing.T) {
+		leaseStart := time.Date(2026, time.September, 17, 11, 0, 0, 0, time.UTC)
+		file := createTestMetadata("matching-lease", core.FileStatusProcessing)
+		file.ProcessingStartTime = &leaseStart
+		if err := repo.AddOrUpdate(ctx, file); err != nil {
+			t.Fatalf("add metadata: %v", err)
+		}
+
+		updated, err := repo.CompareAndUpdateProcessing(ctx, core.FileProcessingLease{
+			TenantID:               "test-tenant",
+			FileKey:                "matching-lease",
+			ProcessingStartTimeUTC: leaseStart,
+		}, func(current *core.FileMetadata) error {
+			current.Status = core.FileStatusPending
+			current.ProcessingStartTime = nil
+			current.RetryCount = 1
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("compare and update: %v", err)
+		}
+		if updated.Status != core.FileStatusPending || updated.RetryCount != 1 {
+			t.Errorf("updated metadata = status %s retry %d, want Pending retry 1", updated.Status, updated.RetryCount)
+		}
+
+		processing, err := repo.GetByStatus(ctx, "test-tenant", core.FileStatusProcessing, 0)
+		if err != nil {
+			t.Fatalf("get processing index: %v", err)
+		}
+		if len(processing) != 0 {
+			t.Errorf("processing index contains %d records, want 0", len(processing))
+		}
+		pending, err := repo.GetByStatus(ctx, "test-tenant", core.FileStatusPending, 0)
+		if err != nil {
+			t.Fatalf("get pending index: %v", err)
+		}
+		if len(pending) != 1 || pending[0].FileKey != "matching-lease" {
+			t.Errorf("pending index = %#v, want matching-lease", pending)
+		}
+	})
+
+	t.Run("stale timestamp returns details and leaves metadata unchanged", func(t *testing.T) {
+		activeStart := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
+		file := createTestMetadata("stale-lease", core.FileStatusProcessing)
+		file.ProcessingStartTime = &activeStart
+		file.RetryCount = 2
+		if err := repo.AddOrUpdate(ctx, file); err != nil {
+			t.Fatalf("add metadata: %v", err)
+		}
+
+		_, err := repo.CompareAndUpdateProcessing(ctx, core.FileProcessingLease{
+			TenantID:               "test-tenant",
+			FileKey:                "stale-lease",
+			ProcessingStartTimeUTC: activeStart.Add(-time.Minute),
+		}, func(current *core.FileMetadata) error {
+			current.Status = core.FileStatusPending
+			current.RetryCount++
+			return nil
+		})
+		if !errors.Is(err, core.ErrProcessingLeaseMismatch) {
+			t.Fatalf("error = %v, want ErrProcessingLeaseMismatch", err)
+		}
+		var mismatch *core.FileProcessingLeaseMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("error type = %T, want FileProcessingLeaseMismatchError", err)
+		}
+		if mismatch.ActualProcessingStartTimeUTC == nil || !mismatch.ActualProcessingStartTimeUTC.Equal(activeStart) {
+			t.Errorf("actual lease start = %v, want %v", mismatch.ActualProcessingStartTimeUTC, activeStart)
+		}
+		if mismatch.ActualStatus == nil || *mismatch.ActualStatus != core.FileStatusProcessing {
+			t.Errorf("actual status = %v, want Processing", mismatch.ActualStatus)
+		}
+
+		current, getErr := repo.Get(ctx, "test-tenant", "stale-lease")
+		if getErr != nil {
+			t.Fatalf("get metadata: %v", getErr)
+		}
+		if current.Status != core.FileStatusProcessing || current.RetryCount != 2 {
+			t.Errorf("metadata changed to status %s retry %d", current.Status, current.RetryCount)
+		}
+	})
+
+	t.Run("wrong tenant cannot mutate the owning tenant", func(t *testing.T) {
+		activeStart := time.Date(2026, time.September, 17, 13, 0, 0, 0, time.UTC)
+		file := createTestMetadata("tenant-isolated-lease", core.FileStatusProcessing)
+		file.ProcessingStartTime = &activeStart
+		if err := repo.AddOrUpdate(ctx, file); err != nil {
+			t.Fatalf("add metadata: %v", err)
+		}
+
+		_, err := repo.CompareAndUpdateProcessing(ctx, core.FileProcessingLease{
+			TenantID:               "other-tenant",
+			FileKey:                "tenant-isolated-lease",
+			ProcessingStartTimeUTC: activeStart,
+		}, func(current *core.FileMetadata) error {
+			current.Status = core.FileStatusPending
+			return nil
+		})
+		if !errors.Is(err, core.ErrProcessingLeaseMismatch) {
+			t.Fatalf("error = %v, want ErrProcessingLeaseMismatch", err)
+		}
+
+		current, getErr := repo.Get(ctx, "test-tenant", "tenant-isolated-lease")
+		if getErr != nil {
+			t.Fatalf("get owning metadata: %v", getErr)
+		}
+		if current.Status != core.FileStatusProcessing {
+			t.Errorf("owning metadata status = %s, want Processing", current.Status)
 		}
 	})
 }
@@ -452,7 +570,7 @@ func TestBadgerRepository_Cache(t *testing.T) {
 		_ = repo.AddOrUpdate(ctx, metadata)
 
 		// First get - should cache it
-		_, _ = repo.Get(ctx, "cached-file")
+		_, _ = repo.Get(ctx, "test-tenant", "cached-file")
 
 		// Check cache stats
 		concreteRepo := repo.(*BadgerMetadataRepository)
@@ -470,11 +588,11 @@ func TestBadgerRepository_Cache(t *testing.T) {
 		_ = repo.AddOrUpdate(ctx, metadata)
 
 		// Get it
-		_, _ = repo.Get(ctx, "completed-file")
+		_, _ = repo.Get(ctx, "test-tenant", "completed-file")
 
 		// It should not be in cache (only active files)
 		concreteRepo := repo.(*BadgerMetadataRepository)
-		cached := concreteRepo.cache.get("completed-file")
+		cached := concreteRepo.cache.get("test-tenant", "completed-file")
 		if cached != nil {
 			t.Error("Completed file should not be cached")
 		}
@@ -486,14 +604,14 @@ func TestBadgerRepository_Cache(t *testing.T) {
 		_ = repo.AddOrUpdate(ctx, metadata)
 
 		// Get it to cache
-		_, _ = repo.Get(ctx, "expiring-file")
+		_, _ = repo.Get(ctx, "test-tenant", "expiring-file")
 
 		// Wait for cache to expire (TTL is 1 second in test)
 		time.Sleep(1500 * time.Millisecond)
 
 		// Should not be in cache anymore
 		concreteRepo := repo.(*BadgerMetadataRepository)
-		cached := concreteRepo.cache.get("expiring-file")
+		cached := concreteRepo.cache.get("test-tenant", "expiring-file")
 		if cached != nil {
 			t.Error("Cache should have expired")
 		}

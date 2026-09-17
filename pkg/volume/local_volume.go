@@ -239,6 +239,18 @@ func (v *LocalFileSystemVolume) BuildFilePath(fileKey string, extension string) 
 	return shardedPath, nil
 }
 
+// BuildPhysicalPath builds the tenant-scoped relative path used by the storage pool.
+func (v *LocalFileSystemVolume) BuildPhysicalPath(tenantID string, fileKey string, extension string) (string, error) {
+	if tenantID == "" {
+		return "", fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	shardedPath, err := v.BuildFilePath(fileKey, extension)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(tenantID, shardedPath), nil
+}
+
 // GetFileSize returns the size of a file in bytes.
 func (v *LocalFileSystemVolume) GetFileSize(ctx context.Context, relativePath string) (int64, error) {
 	// Sanitize and get full path

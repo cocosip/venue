@@ -2,12 +2,14 @@ package pool
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/cocosip/venue/internal/directorypath"
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/google/uuid"
 )
@@ -82,17 +84,12 @@ func NewStoragePool(opts *StoragePoolOptions) (core.StoragePool, error) {
 		return nil, fmt.Errorf("at least one storage volume is required: %w", core.ErrInvalidArgument)
 	}
 
-	pathGen := opts.PathGenerator
-	if pathGen == nil {
-		pathGen = &DateBasedPathGenerator{}
-	}
-
 	pool := &storagePool{
 		tenantManager:  opts.TenantManager,
 		metadataRepo:   opts.MetadataRepository,
 		scheduler:      opts.FileScheduler,
 		volumes:        opts.Volumes,
-		pathGenerator:  pathGen,
+		pathGenerator:  opts.PathGenerator,
 		tenantQuotaMgr: opts.TenantQuotaManager,
 		dirQuotaMgr:    opts.DirectoryQuotaManager,
 		volumeSelector: &MostAvailableSpaceSelector{},
@@ -103,6 +100,27 @@ func NewStoragePool(opts *StoragePoolOptions) (core.StoragePool, error) {
 
 // WriteFile stores a file in the storage pool and returns a system-generated fileKey.
 func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, content io.Reader, originalFileName *string) (string, error) {
+	return p.writeFile(ctx, tenant, content, originalFileName, "/")
+}
+
+// WriteFileToDirectory stores a file with a normalized logical directory.
+func (p *storagePool) WriteFileToDirectory(
+	ctx context.Context,
+	tenant core.TenantContext,
+	content io.Reader,
+	originalFileName *string,
+	logicalDirectoryPath string,
+) (string, error) {
+	return p.writeFile(ctx, tenant, content, originalFileName, directorypath.Normalize(logicalDirectoryPath))
+}
+
+func (p *storagePool) writeFile(
+	ctx context.Context,
+	tenant core.TenantContext,
+	content io.Reader,
+	originalFileName *string,
+	logicalDirectoryPath string,
+) (string, error) {
 	// Validate tenant is enabled
 	if !tenant.IsEnabled() {
 		return "", core.ErrTenantDisabled
@@ -116,10 +134,6 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 	if originalFileName != nil {
 		fileExtension = filepath.Ext(*originalFileName)
 	}
-
-	// Generate storage path
-	relativePath := p.pathGenerator.GeneratePath(tenant.ID, fileKey, fileExtension)
-	directoryPath := filepath.Dir(relativePath)
 
 	// Check tenant quota
 	if p.tenantQuotaMgr != nil {
@@ -135,10 +149,25 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 		}()
 	}
 
+	// Select storage volume
+	volume, err := p.volumeSelector.SelectVolume(ctx, p.volumes)
+	if err != nil {
+		if p.tenantQuotaMgr != nil {
+			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
+		}
+		return "", err
+	}
+
+	relativePath, err := p.buildPhysicalPath(volume, tenant.ID, fileKey, fileExtension)
+	if err != nil {
+		if p.tenantQuotaMgr != nil {
+			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
+		}
+		return "", fmt.Errorf("failed to build physical path: %w", err)
+	}
 	// Check directory quota
 	if p.dirQuotaMgr != nil {
-		if err := p.dirQuotaMgr.IncrementFileCount(ctx, tenant.ID, directoryPath); err != nil {
-			// Rollback tenant quota
+		if err := p.dirQuotaMgr.IncrementFileCount(ctx, tenant.ID, logicalDirectoryPath); err != nil {
 			if p.tenantQuotaMgr != nil {
 				_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
 			}
@@ -146,25 +175,12 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 		}
 	}
 
-	// Select storage volume
-	volume, err := p.volumeSelector.SelectVolume(ctx, p.volumes)
-	if err != nil {
-		// Rollback quotas
-		if p.dirQuotaMgr != nil {
-			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
-		}
-		if p.tenantQuotaMgr != nil {
-			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
-		}
-		return "", err
-	}
-
 	// Write file to volume
 	fileSize, err := volume.WriteFile(ctx, relativePath, content)
 	if err != nil {
 		// Rollback quotas
 		if p.dirQuotaMgr != nil {
-			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
+			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, logicalDirectoryPath)
 		}
 		if p.tenantQuotaMgr != nil {
 			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
@@ -179,6 +195,7 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 		TenantID:         tenant.ID,
 		VolumeID:         volume.VolumeID(),
 		PhysicalPath:     relativePath,
+		DirectoryPath:    logicalDirectoryPath,
 		FileSize:         fileSize,
 		FileExtension:    fileExtension,
 		OriginalFileName: stringValue(originalFileName),
@@ -194,7 +211,7 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 		_ = volume.DeleteFile(ctx, relativePath)
 		// Rollback quotas
 		if p.dirQuotaMgr != nil {
-			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, directoryPath)
+			_ = p.dirQuotaMgr.DecrementFileCount(ctx, tenant.ID, logicalDirectoryPath)
 		}
 		if p.tenantQuotaMgr != nil {
 			_ = p.tenantQuotaMgr.DecrementFileCount(ctx, tenant.ID)
@@ -203,6 +220,16 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 	}
 
 	return fileKey, nil
+}
+
+func (p *storagePool) buildPhysicalPath(volume core.StorageVolume, tenantID, fileKey, fileExtension string) (string, error) {
+	if p.pathGenerator != nil {
+		return p.pathGenerator.GeneratePath(tenantID, fileKey, fileExtension), nil
+	}
+	if builder, ok := volume.(core.StorageVolumePathBuilder); ok {
+		return builder.BuildPhysicalPath(tenantID, fileKey, fileExtension)
+	}
+	return (&DateBasedPathGenerator{}).GeneratePath(tenantID, fileKey, fileExtension), nil
 }
 
 // ReadFile retrieves a file by its fileKey.
@@ -217,7 +244,7 @@ func (p *storagePool) ReadFile(ctx context.Context, tenant core.TenantContext, f
 	}
 
 	// Get file metadata
-	metadata, err := p.metadataRepo.Get(ctx, fileKey)
+	metadata, err := p.metadataRepo.Get(ctx, tenant.ID, fileKey)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +281,7 @@ func (p *storagePool) GetFileInfo(ctx context.Context, tenant core.TenantContext
 	}
 
 	// Get file metadata
-	metadata, err := p.metadataRepo.Get(ctx, fileKey)
+	metadata, err := p.metadataRepo.Get(ctx, tenant.ID, fileKey)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +306,7 @@ func (p *storagePool) GetFileLocation(ctx context.Context, tenant core.TenantCon
 	}
 
 	// Get file metadata
-	metadata, err := p.metadataRepo.Get(ctx, fileKey)
+	metadata, err := p.metadataRepo.Get(ctx, tenant.ID, fileKey)
 	if err != nil {
 		return nil, err
 	}
@@ -303,18 +330,18 @@ func (p *storagePool) GetNextBatchForProcessing(ctx context.Context, tenant core
 }
 
 // MarkAsCompleted marks a file as successfully processed.
-func (p *storagePool) MarkAsCompleted(ctx context.Context, fileKey string) error {
-	return p.scheduler.MarkAsCompleted(ctx, fileKey)
+func (p *storagePool) MarkAsCompleted(ctx context.Context, lease core.FileProcessingLease) error {
+	return p.scheduler.MarkAsCompleted(ctx, lease)
 }
 
 // MarkAsFailed marks a file as failed and schedules it for retry.
-func (p *storagePool) MarkAsFailed(ctx context.Context, fileKey string, errorMessage string) error {
-	return p.scheduler.MarkAsFailed(ctx, fileKey, errorMessage)
+func (p *storagePool) MarkAsFailed(ctx context.Context, lease core.FileProcessingLease, errorMessage string) error {
+	return p.scheduler.MarkAsFailed(ctx, lease, errorMessage)
 }
 
 // GetFileStatus returns the current processing status of a file.
-func (p *storagePool) GetFileStatus(ctx context.Context, fileKey string) (core.FileProcessingStatus, error) {
-	return p.scheduler.GetFileStatus(ctx, fileKey)
+func (p *storagePool) GetFileStatus(ctx context.Context, tenant core.TenantContext, fileKey string) (core.FileProcessingStatus, error) {
+	return p.scheduler.GetFileStatus(ctx, tenant, fileKey)
 }
 
 // GetTotalCapacity returns the total capacity across all mounted volumes.
@@ -357,7 +384,8 @@ func (p *storagePool) GetAvailableSpace(ctx context.Context) (int64, error) {
 
 // generateFileKey generates a unique file key (UUID without dashes).
 func generateFileKey() string {
-	return uuid.New().String()
+	id := uuid.New()
+	return hex.EncodeToString(id[:])
 }
 
 // stringValue returns the string value or empty string if nil.

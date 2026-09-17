@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 	"github.com/dgraph-io/badger/v4"
 )
 
@@ -22,6 +23,9 @@ type DatabaseHealthCheckerOptions struct {
 
 	// VolumePaths are the storage volume paths to check for orphaned files.
 	VolumePaths []string
+
+	// Logging is the instance-scoped logging runtime. Nil disables logging.
+	Logging *logging.Runtime
 }
 
 // databaseHealthChecker implements DatabaseHealthChecker interface.
@@ -29,6 +33,7 @@ type databaseHealthChecker struct {
 	metadataDataPath       string
 	directoryQuotaDataPath string
 	volumePaths            []string
+	logger                 *logging.Runtime
 }
 
 // NewDatabaseHealthChecker creates a new database health checker.
@@ -41,10 +46,16 @@ func NewDatabaseHealthChecker(opts *DatabaseHealthCheckerOptions) (core.Database
 		return nil, fmt.Errorf("metadata data path cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
+	logger := opts.Logging
+	if logger == nil {
+		logger = logging.Disabled()
+	}
+
 	return &databaseHealthChecker{
 		metadataDataPath:       opts.MetadataDataPath,
 		directoryQuotaDataPath: opts.DirectoryQuotaDataPath,
 		volumePaths:            opts.VolumePaths,
+		logger:                 logger,
 	}, nil
 }
 
@@ -58,7 +69,7 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 
 	// Check metadata databases
 	if err := c.checkMetadataDatabases(ctx, report); err != nil {
-		slog.Warn("Error checking metadata databases", "error", err)
+		c.emit(ctx, slog.LevelWarn, "metadata_check_failed", "Error checking metadata databases", errorTypeAttr(err))
 	}
 
 	// Check directory quota database
@@ -76,7 +87,7 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 	if report.HealthyDatabases == 0 && len(report.CorruptedDatabases) == 0 {
 		orphaned, err := c.DetectOrphanedFiles(ctx)
 		if err != nil {
-			slog.Warn("Error detecting orphaned files", "error", err)
+			c.emit(ctx, slog.LevelWarn, "orphan_detection_failed", "Error detecting orphaned files", errorTypeAttr(err))
 		} else {
 			report.OrphanedTenants = orphaned
 		}
@@ -106,7 +117,7 @@ func (c *databaseHealthChecker) checkMetadataDatabases(ctx context.Context, repo
 		tenantID := entry.Name()
 		status, err := c.CheckMetadataDatabase(ctx, tenantID)
 		if err != nil {
-			slog.Warn("Error checking metadata database", "tenant", tenantID, "error", err)
+			c.emit(ctx, slog.LevelWarn, "tenant_metadata_check_failed", "Error checking metadata database", slog.String("tenant_id", tenantID), errorTypeAttr(err))
 			continue
 		}
 
@@ -257,7 +268,7 @@ func (c *databaseHealthChecker) DetectOrphanedFiles(ctx context.Context) ([]stri
 
 		entries, err := os.ReadDir(volumePath)
 		if err != nil {
-			slog.Warn("Failed to read volume directory", "path", volumePath, "error", err)
+			c.emit(ctx, slog.LevelWarn, "volume_scan_failed", "Failed to read volume directory", errorTypeAttr(err))
 			continue
 		}
 
@@ -280,6 +291,16 @@ func (c *databaseHealthChecker) DetectOrphanedFiles(ctx context.Context) ([]stri
 	}
 
 	return orphanedTenants, nil
+}
+
+func (c *databaseHealthChecker) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {
+	c.logger.Emit(ctx, logging.Record{
+		Level: level, Component: "health.database_checker", Event: event, Message: message, Attrs: attrs,
+	})
+}
+
+func errorTypeAttr(err error) slog.Attr {
+	return slog.String("error_type", fmt.Sprintf("%T", err))
 }
 
 // hasFiles checks if a directory has any files (recursively).
