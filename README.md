@@ -26,92 +26,18 @@ go get github.com/cocosip/venue
 
 ## Quick Start
 
-```go
-package main
+Choose one of the two configuration examples below, then create and start a
+Venue instance. The runtime owns storage paths and queue state; callers only
+provide tenant context, file content, and the generated `fileKey`.
 
-import (
-    "context"
-    "fmt"
-    "io"
-    "log"
-    "strings"
-
-    "github.com/cocosip/venue"
-    "github.com/cocosip/venue/config"
-)
-
-func main() {
-    cfg := config.New().
-        WithMetadataDirectory("./data/metadata").
-        WithQuotaDirectory("./data/quota").
-        WithVolumes(
-            config.NewVolumeConfig().
-                WithVolumeID("primary").
-                WithMountPath("./data/storage").
-                WithShardingDepth(2),
-        ).
-        WithTenants(config.NewTenantConfig("tenant-001"))
-
-    runtime, err := venue.NewVenue(cfg)
-    if err != nil {
-        log.Fatal(err)
-    }
-    if err := runtime.Start(); err != nil {
-        log.Fatal(err)
-    }
-    defer func() { _ = runtime.Stop() }()
-
-    ctx := context.Background()
-    tenant, err := runtime.TenantManager().GetTenant(ctx, "tenant-001")
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    originalName := "sample.txt"
-    fileKey, err := runtime.StoragePool().WriteFile(
-        ctx,
-        tenant,
-        strings.NewReader("hello venue"),
-        &originalName,
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    file, err := runtime.StoragePool().GetNextFileForProcessing(ctx, tenant)
-    if err != nil {
-        log.Fatal(err)
-    }
-    if file == nil {
-        log.Fatal("no pending file")
-    }
-    if file.Lease == nil {
-        log.Fatal("processing file has no lease")
-    }
-
-    reader, err := runtime.StoragePool().ReadFile(ctx, tenant, file.FileKey)
-    if err != nil {
-        log.Fatal(err)
-    }
-    _, copyErr := io.Copy(io.Discard, reader)
-    closeErr := reader.Close()
-    if copyErr != nil || closeErr != nil {
-        log.Fatal("read file failed")
-    }
-
-    if err := runtime.StoragePool().MarkAsCompleted(ctx, *file.Lease); err != nil {
-        log.Fatal(err)
-    }
-
-    fmt.Println(fileKey)
-}
-```
+- [Load configuration from YAML](#load-configuration-from-yaml)
+- [Configure directly in Go](#configure-directly-in-go)
 
 `Start` starts the enabled background services. `Stop` stops those services in
 reverse order and closes the repositories. Every `io.ReadCloser` returned by
 `ReadFile` must be closed by the caller.
 
-## Configuration Model
+## Configuration
 
 Venue has one public runtime configuration type:
 `github.com/cocosip/venue/config.Config`. `venue.NewVenue` accepts
@@ -129,116 +55,87 @@ The configuration package provides:
 
 The base `config` package does not import Viper, YAML, JSON, or another source
 library. It does not read files, bind environment variables, watch for changes,
-or own reload policy. Those decisions belong to the application entry point or
-a dedicated integration package.
+or own reload policy. Those decisions belong to the application entry point.
 
-### Configuration Without Viper
+### Load Configuration From YAML
 
-Most library consumers can construct configuration directly and do not need a
-configuration-file dependency.
+The optional `viperconfig` adapter reads a Viper-supported file, prefers a
+top-level `venue` section, applies defaults, validates the result, and returns
+`*config.Config`. Venue never watches or reloads the source by itself.
+
+```go
+cfg, err := viperconfig.LoadFromFile("venue.yaml")
+if err != nil {
+    return err
+}
+
+runtime, err := venue.NewVenue(cfg)
+if err != nil {
+    return err
+}
+if err := runtime.Start(); err != nil {
+    return err
+}
+defer runtime.Stop()
+```
+
+```yaml
+venue:
+  metadataDirectory: ./data/metadata
+  quotaDirectory: ./data/quota
+  volumes:
+    - volumeId: primary
+      mountPath: ./data/storage
+      volumeType: LocalFileSystem
+      shardingDepth: 2
+      enableFsync: true
+  tenants:
+    - tenantId: tenant-001
+      enabled: true
+      quota: 100000
+```
+
+The complete bindable file shape is in
+[`venue-config-example.yaml`](venue-config-example.yaml). Use
+`LoadFromFileSection(path, "")` for a root-level file or
+`LoadSection(source, "venue")` when the application already owns a Viper
+instance. Environment variables, file watching, and replacement of a running
+instance remain application responsibilities.
+
+### Configure Directly In Go
+
+Use `config.New()` to retain boolean and nested defaults, then override only
+the values needed by the application. `WithVolumes`, `WithTenants`, and
+`WithFileWatchers` replace collections; the corresponding `Add...` methods
+append entries.
 
 ```go
 cfg := config.New().
     WithMetadataDirectory("./data/metadata").
     WithQuotaDirectory("./data/quota").
-    WithAutoCreateTenants(false).
-    WithRetryPolicy(
-        config.NewRetryPolicyConfig().
-            WithMaxRetryCount(5).
-            WithInitialRetryDelay(2 * time.Second).
-            WithExponentialBackoff(true).
-            WithMaxRetryDelay(time.Minute),
-    ).
-    WithMetadata(
-        config.NewMetadataConfig().
-            WithCacheTTL(10 * time.Minute).
-            WithMaxCacheEntries(20_000),
-    ).
-    WithBadgerDB(
-        config.NewBadgerDBConfig().
-            WithGCInterval(15 * time.Minute).
-            WithGCDiscardRatio(0.5).
-            WithSyncWrites(true),
-    ).
     WithVolumes(
         config.NewVolumeConfig().
             WithVolumeID("primary").
-            WithMountPath("./data/storage-primary").
-            WithShardingDepth(2).
-            WithFsync(true),
-        config.NewVolumeConfig().
-            WithVolumeID("secondary").
-            WithMountPath("./data/storage-secondary").
+            WithMountPath("./data/storage").
             WithShardingDepth(2),
     ).
     WithTenants(
         config.NewTenantConfig("tenant-001").WithQuota(100_000),
-        config.NewTenantConfig("tenant-002").WithoutQuota(),
     ).
-    WithBackgroundCleanupEnabled(true).
-    WithCleanup(
-        config.NewCleanupConfig().
-            WithCleanupInterval(30 * time.Minute).
-            WithProcessingTimeout(10 * time.Minute).
-            WithPermanentlyFailedFileCleanup(true).
-            WithCompletedRecordCleanup(true).
-            WithCompletedRecordRetention(0),
+    WithRetryPolicy(
+        config.NewRetryPolicyConfig().
+            WithMaxRetryCount(5).
+            WithInitialRetryDelay(2 * time.Second),
     )
 
-runtime, err := venue.NewVenue(cfg)
-```
-
-Direct field assignment is also supported:
-
-```go
-cfg := config.New()
-cfg.MetadataDirectory = "./data/metadata"
-cfg.QuotaDirectory = "./data/quota"
-cfg.Volumes = []config.VolumeConfig{
-    {
-        VolumeID:      "primary",
-        MountPath:     "./data/storage",
-        VolumeType:    "LocalFileSystem",
-        ShardingDepth: 2,
-    },
-}
-```
-
-For a direct JSON decoder, initialize defaults first and decode over them:
-
-```go
-cfg := config.New()
-
-data, err := os.ReadFile("venue.json")
-if err != nil {
-    return err
-}
-if err := json.Unmarshal(data, cfg); err != nil {
-    return err
-}
-
-cfg.ApplyDefaults()
 if err := cfg.Validate(); err != nil {
     return err
 }
-
 runtime, err := venue.NewVenue(cfg)
 ```
 
-The same ownership model applies to a YAML decoder: the application reads the
-source, decodes into `config.Config`, validates it, and passes the result to
-`venue.NewVenue`. Venue never opens or watches the configuration source.
-
-Prefer starting with `config.New()` instead of a zero-value `config.Config`.
-`ApplyDefaults` fills missing paths, durations, and capacities, but it cannot
-distinguish an omitted boolean from an explicitly configured `false`. Starting
-with initialized defaults preserves boolean defaults such as database health
-checks.
-
-Applications may bind another configuration system directly to `config.Config`
-using its `json`, `yaml`, and `mapstructure` tags. When doing so, the application
-must configure duration conversion, call `ApplyDefaults`, call `Validate`, and
-decide how reloads replace Venue instances.
+The runtime clones the configuration during construction, so mutating `cfg`
+after `NewVenue` returns does not reconfigure the running instance.
 
 The configuration lifecycle is:
 
@@ -340,158 +237,11 @@ The important runtime defaults are:
 See [`venue-config-example.yaml`](venue-config-example.yaml) for all bindable
 settings.
 
-## Configuration With Viper
-
 Viper support is optional and lives in the top-level
 `github.com/cocosip/venue/viperconfig` package. The dependency direction is
-`viperconfig -> config`; the Venue runtime and the base configuration package do
-not import Viper.
-
-### Load a File
-
-`LoadFromFile` supports formats understood by Viper and prefers a top-level
-`venue` section. If that section is absent, it loads the root object.
-
-```go
-import (
-    "github.com/cocosip/venue"
-    "github.com/cocosip/venue/viperconfig"
-)
-
-cfg, err := viperconfig.LoadFromFile("venue.yaml")
-if err != nil {
-    return err
-}
-
-runtime, err := venue.NewVenue(cfg)
-```
-
-Example YAML with a `venue` section:
-
-```yaml
-venue:
-  metadataDirectory: ./data/metadata
-  quotaDirectory: ./data/quota
-  autoCreateTenants: false
-
-  retryPolicy:
-    maxRetryCount: 5
-    initialRetryDelay: 2s
-    useExponentialBackoff: true
-    maxRetryDelay: 1m
-
-  volumes:
-    - volumeId: primary
-      mountPath: ./data/storage
-      volumeType: LocalFileSystem
-      shardingDepth: 2
-      enableFsync: true
-
-  tenants:
-    - tenantId: tenant-001
-      enabled: true
-      quota: 100000
-
-  enableBackgroundCleanup: true
-  cleanupOptions:
-    cleanupInterval: 30m
-    processingTimeout: 10m
-    cleanupTimedOutFiles: true
-    cleanupCompletedRecords: true
-    completedRecordRetentionPeriod: 0s
-```
-
-Use `LoadFromFileSection(path, "")` to force root-level loading, or pass another
-section name when Venue is nested under a different application key.
-
-### Use an Existing Viper Instance
-
-Applications that already own a Viper instance can apply files, environment
-variables, command-line overrides, or remote sources before adapting it:
-
-```go
-import (
-    "strings"
-
-    "github.com/cocosip/venue"
-    "github.com/cocosip/venue/viperconfig"
-    "github.com/spf13/viper"
-)
-
-source := viper.New()
-source.SetConfigFile("application.yaml")
-source.SetEnvPrefix("APP")
-source.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-source.AutomaticEnv()
-if err := source.BindEnv("venue.retryPolicy.maxRetryCount"); err != nil {
-    return err
-}
-if err := source.ReadInConfig(); err != nil {
-    return err
-}
-
-cfg, err := viperconfig.LoadSection(source, "venue")
-if err != nil {
-    return err
-}
-runtime, err := venue.NewVenue(cfg)
-```
-
-With this setup, `APP_VENUE_RETRYPOLICY_MAXRETRYCOUNT=9` overrides the file
-value. Register environment-only keys with `BindEnv`; Viper cannot unmarshal a
-key that exists only in the environment unless the key is known to it.
-
-Use `viperconfig.Load(source)` when the supplied Viper instance already points
-at Venue's root configuration. Use `LoadSection(source, "venue")` when Venue is
-nested inside a larger application configuration. Both functions decode into a
-new `config.Config`, apply missing defaults, validate the result, and return an
-error instead of a partially valid configuration.
-
-`viperconfig.NewWithDefaults()` returns a Viper instance with Venue scalar
-defaults registered. The application still owns source precedence, environment
-key mapping, file watching, reload timing, and instance replacement.
-
-`WatchConfig` does not mutate an existing Venue runtime. On a Viper change
-event, load and validate a new `config.Config`, then replace the Venue instance
-using application-controlled lifecycle coordination. This avoids partially
-applying configuration while file operations are active.
-
-### Logging After File Binding
-
-Logging contains a live `slog.Handler` and is deliberately excluded from every
-configuration-file binding tag:
-
-```go
-json:"-" yaml:"-" mapstructure:"-"
-```
-
-Inject logging after loading the file:
-
-```go
-import (
-    "log/slog"
-    "os"
-
-    "github.com/cocosip/venue"
-    "github.com/cocosip/venue/pkg/logging"
-    "github.com/cocosip/venue/viperconfig"
-)
-
-cfg, err := viperconfig.LoadFromFile("venue.yaml")
-if err != nil {
-    return err
-}
-
-cfg.WithLogging(&logging.Config{
-    Handler: slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-        Level: slog.LevelInfo,
-    }),
-})
-
-runtime, err := venue.NewVenue(cfg)
-```
-
-The logging import path is `github.com/cocosip/venue/pkg/logging`.
+`viperconfig -> config`; applications that do not need file binding do not
+depend on Viper. `Logging` is runtime-only (`json:"-" yaml:"-"
+mapstructure:"-"`) and must be injected from Go code after file binding.
 
 ## Logging
 
@@ -507,57 +257,174 @@ one Venue instance and is never installed as the process default.
 This allows multiple Venue instances in one process to use different handlers,
 levels, and destinations.
 
-## Queue Workflow
+## API Usage
+
+Venue is a managed file queue, not a caller-managed filesystem. `WriteFile`
+generates the `fileKey`; callers never choose a physical path or volume.
 
 ```text
-WriteFile
-   |
-   v
-Pending -> Processing -> MarkAsCompleted -> Completed
-              |                              |
-              |                              +-> completed-file cleanup
-              |                                  -> physical file and metadata removed
-              |
-              +-> MarkAsFailed -> Pending after retry delay
-                                   |
-                                   +-> PermanentlyFailed after retry limit
+WriteFile -> Pending -> GetNextFileForProcessing -> Processing
+                                                       |
+                         MarkAsFailed <- retry --------+
+                                                       |
+                                      MarkAsCompleted -> Completed -> cleanup
 ```
 
-Completion is a two-phase operation. `MarkAsCompleted` first commits the
-`Completed` state and releases the processing lease. The physical file and its
-metadata remain available until completed-file cleanup runs after
-`CompletedRecordRetentionPeriod`. The default retention is zero, so an enabled
-background cleanup service removes them on its next cycle. If background
-cleanup is disabled, applications can invoke
-`Venue.CleanupService().CleanupCompletedFiles` explicitly.
+### Runtime Lifecycle
 
-File reads, queue allocation, and status queries use an explicit
-`core.TenantContext`; completion and failure use the tenant identity embedded in
-the processing lease. Metadata and cache entries are isolated by
-`(tenantID, fileKey)`.
+Create one runtime for each independent configuration, start it before using
+background services, and stop it during application shutdown:
 
-Queue allocation returns a `FileLocation` with a `FileProcessingLease`. The
-lease contains the tenant ID, file key, and processing start time for that exact
-claim. Workers must pass the same lease to `MarkAsCompleted` or `MarkAsFailed`.
-If a timeout recovery or another worker has already replaced the claim, Venue
-returns `core.ErrProcessingLeaseMismatch` and leaves the active processing
-attempt unchanged. Use `errors.Is` for classification and `errors.As` with
-`*core.FileProcessingLeaseMismatchError` when the current status and lease time
-are needed for diagnostics.
-
-The main storage-pool operations are:
-
-| Operation | Behavior |
+| Method | Purpose |
 | --- | --- |
-| `WriteFile` | Stores a stream and returns a generated file key |
-| `ReadFile` | Returns an `io.ReadCloser` for an existing file |
-| `GetFileInfo` | Returns caller-safe metadata |
-| `GetFileLocation` | Returns storage diagnostics including volume and path |
-| `GetNextFileForProcessing` | Atomically claims the next pending file and returns its lease |
-| `GetNextBatchForProcessing` | Atomically claims up to the requested batch size with leases |
-| `MarkAsCompleted` | Commits `Completed` for the matching lease; cleanup removes the managed file later |
-| `MarkAsFailed` | Applies retry or permanent-failure state to the matching lease |
-| `GetFileStatus` | Returns the current queue state |
+| `venue.NewVenue(*config.Config)` | Clone, validate, and initialize one runtime |
+| `Venue.Start()` | Start enabled cleanup, watcher, and health services |
+| `Venue.Stop()` | Stop services and close repositories |
+| `Venue.IsRunning()` | Report whether the runtime is started |
+
+`Stop` is safe to call from a deferred shutdown path. The caller owns any
+logging handler and writer configured on the instance.
+
+### StoragePool
+
+`Venue.StoragePool()` returns the unified storage and queue interface. Every
+operation carries an explicit `core.TenantContext` except completion and
+failure, which use the tenant-scoped lease returned by queue allocation.
+
+| Method | Use |
+| --- | --- |
+| `WriteFile(ctx, tenant, content, originalName)` | Store a stream and generate a `fileKey` |
+| `WriteFileToDirectory(ctx, tenant, content, originalName, directory)` | Store a file and account it against a logical directory quota |
+| `ReadFile(ctx, tenant, fileKey)` | Open an `io.ReadCloser`; the caller must close it |
+| `GetFileInfo(ctx, tenant, fileKey)` | Read size, status, and creation time |
+| `GetFileLocation(ctx, tenant, fileKey)` | Read volume and physical-path diagnostics |
+| `GetNextFileForProcessing(ctx, tenant)` | Atomically claim the next available file |
+| `GetNextBatchForProcessing(ctx, tenant, batchSize)` | Atomically claim up to `batchSize` files |
+| `MarkAsCompleted(ctx, lease)` | Commit successful processing; cleanup deletes later |
+| `MarkAsFailed(ctx, lease, message)` | Schedule retry or mark permanently failed |
+| `GetFileStatus(ctx, tenant, fileKey)` | Read the current queue status |
+| `GetTotalCapacity(ctx)` | Sum capacity across configured volumes |
+| `GetAvailableSpace(ctx)` | Sum available space across configured volumes |
+
+`GetNextFileForProcessing` and `GetNextBatchForProcessing` are atomic, so
+concurrent workers do not receive the same pending file. An empty result means
+there is currently no available work; it is not an error.
+
+### TenantManager
+
+`Venue.TenantManager()` returns the tenant lifecycle and isolation interface:
+
+| Method | Use |
+| --- | --- |
+| `GetTenant(ctx, tenantID)` | Resolve a tenant context; may auto-create it |
+| `IsTenantEnabled(ctx, tenantID)` | Check whether a tenant can perform operations |
+| `CreateTenant(ctx, tenantID)` | Create a tenant explicitly |
+| `EnableTenant(ctx, tenantID)` / `DisableTenant(ctx, tenantID)` | Change tenant availability |
+| `GetAllTenants(ctx)` | List all known tenants |
+
+All reads, writes, claims, status changes, and quota operations are scoped by
+tenant. The same `fileKey` in two tenants refers to two different files.
+
+### Process One File
+
+The lease must be passed unchanged to `MarkAsCompleted` or `MarkAsFailed`:
+
+```go
+ctx := context.Background()
+tenant, err := runtime.TenantManager().GetTenant(ctx, "tenant-001")
+if err != nil {
+    return err
+}
+
+originalName := "invoice.pdf"
+fileKey, err := runtime.StoragePool().WriteFile(
+    ctx, tenant, strings.NewReader("file contents"), &originalName,
+)
+if err != nil {
+    return err
+}
+fmt.Printf("queued %s\n", fileKey)
+
+file, err := runtime.StoragePool().GetNextFileForProcessing(ctx, tenant)
+if err != nil {
+    return err
+}
+if file == nil || file.Lease == nil {
+    return fmt.Errorf("no file available for processing")
+}
+
+reader, err := runtime.StoragePool().ReadFile(ctx, tenant, file.FileKey)
+if err != nil {
+    return err
+}
+_, processErr := io.Copy(io.Discard, reader) // replace with application processing
+closeErr := reader.Close()
+if processErr != nil {
+    if markErr := runtime.StoragePool().MarkAsFailed(
+        ctx, *file.Lease, "processing failed",
+    ); markErr != nil {
+        return fmt.Errorf("process %s: %v; mark failed: %w", file.FileKey, processErr, markErr)
+    }
+    return fmt.Errorf("process %s: %w", file.FileKey, processErr)
+}
+if closeErr != nil {
+    if markErr := runtime.StoragePool().MarkAsFailed(
+        ctx, *file.Lease, "close failed",
+    ); markErr != nil {
+        return fmt.Errorf("close %s: %v; mark failed: %w", file.FileKey, closeErr, markErr)
+    }
+    return fmt.Errorf("close %s: %w", file.FileKey, closeErr)
+}
+
+return runtime.StoragePool().MarkAsCompleted(ctx, *file.Lease)
+```
+
+Completion first commits `Completed` and releases the processing lease. The
+physical file and metadata remain until the cleanup service reaches the
+configured `CompletedRecordRetentionPeriod`; with the default zero retention,
+the next cleanup cycle removes them. When background cleanup is disabled,
+invoke `runtime.CleanupService().CleanupCompletedFiles` explicitly.
+
+### Process a Batch
+
+Use the batch method when the worker can process several claims concurrently:
+
+```go
+files, err := runtime.StoragePool().GetNextBatchForProcessing(ctx, tenant, 100)
+if err != nil {
+    return err
+}
+for _, file := range files {
+    if file.Lease == nil {
+        continue
+    }
+    // Read and process file.FileKey, then use this exact lease:
+    if err := runtime.StoragePool().MarkAsCompleted(ctx, *file.Lease); err != nil {
+        return err
+    }
+}
+```
+
+If timeout recovery or another worker has replaced a claim, completion or
+failure returns `core.ErrProcessingLeaseMismatch` and does not change the newer
+claim. Use `errors.Is` for classification and `errors.As` with
+`*core.FileProcessingLeaseMismatchError` for diagnostics.
+
+### Other Runtime Services
+
+The runtime exposes the lower-level services for operational workflows:
+
+| Accessor | Interface |
+| --- | --- |
+| `FileScheduler()` | Queue transitions and timeout recovery |
+| `TenantQuotaManager()` | Tenant file-count quota checks and updates |
+| `DirectoryQuotaManager()` | Logical-directory file-count quotas |
+| `CleanupService()` | Completed, failed, timed-out, orphan, and database cleanup |
+| `FileWatcher()` | Watched-directory import management |
+| `DatabaseHealthChecker()` | Startup and on-demand database health checks |
+| `Volumes()` | Configured storage volumes and their health/capacity |
+| `Config()` | Cloned runtime configuration |
+| `Logging()` | Instance-scoped logging runtime |
 
 ## Build and Verification
 
