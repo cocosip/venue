@@ -594,6 +594,10 @@ func setupFullSystem(t *testing.T) *System {
 		TenantQuotaManager:       tenantQuotaMgr,
 		DirectoryQuotaManager:    dirQuotaMgr,
 		DefaultProcessingTimeout: 30 * time.Minute,
+		// The integration flows below assert the recorded delete ordering; the
+		// disposition is selected explicitly because the zero value is Keep (the
+		// configuration model supplies the Locus default, MoveToDeadLetter).
+		PermanentlyFailedDisposition: core.PermanentlyFailedDelete,
 	}
 
 	cleanupService, err := NewCleanupService(cleanupOpts)

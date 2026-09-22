@@ -155,6 +155,9 @@ func TestCleanupPermanentlyFailedFiles(t *testing.T) {
 		Volumes:               volumes,
 		TenantQuotaManager:    tenantQuotaMgr,
 		DirectoryQuotaManager: dirQuotaMgr,
+		// This test covers the recorded delete ordering; the disposition is
+		// selected explicitly because the zero value is Keep.
+		PermanentlyFailedDisposition: core.PermanentlyFailedDelete,
 	}
 
 	service, _ := NewCleanupService(opts)
@@ -510,6 +513,10 @@ type stubTenantManager struct{}
 
 func (m *stubTenantManager) GetTenant(ctx context.Context, tenantID string) (core.TenantContext, error) {
 	return core.TenantContext{ID: tenantID, Status: core.TenantStatusEnabled}, nil
+}
+
+func (m *stubTenantManager) TryGetTenant(ctx context.Context, tenantID string) (core.TenantContext, bool, error) {
+	return core.TenantContext{ID: tenantID, Status: core.TenantStatusEnabled}, true, nil
 }
 
 func (m *stubTenantManager) IsTenantEnabled(ctx context.Context, tenantID string) (bool, error) {

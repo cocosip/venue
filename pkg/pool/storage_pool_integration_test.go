@@ -165,9 +165,12 @@ func TestIntegration_FailedFileRetry(t *testing.T) {
 	}
 
 	// File should not be available for processing anymore
-	_, err = pool.GetNextFileForProcessing(ctx, tenant)
-	if err != core.ErrNoFilesAvailable {
-		t.Errorf("Expected no files available, got error: %v", err)
+	location, err = pool.GetNextFileForProcessing(ctx, tenant)
+	if err != nil {
+		t.Errorf("Expected no error, got: %v", err)
+	}
+	if location != nil {
+		t.Errorf("Expected no files available, got file %s", location.FileKey)
 	}
 }
 
@@ -269,12 +272,12 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 
 			for {
 				location, err := pool.GetNextFileForProcessing(ctx, tenant)
-				if err == core.ErrNoFilesAvailable {
-					break
-				}
-
 				if err != nil {
 					t.Errorf("Worker %d: Unexpected error: %v", id, err)
+					break
+				}
+				if location == nil {
+					// Empty queue: GetNextFileForProcessing returns (nil, nil).
 					break
 				}
 
@@ -303,9 +306,12 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 	}
 
 	// Verify no files are left
-	_, err := pool.GetNextFileForProcessing(ctx, tenant)
-	if err != core.ErrNoFilesAvailable {
-		t.Errorf("Expected no files available, got error: %v", err)
+	location, err := pool.GetNextFileForProcessing(ctx, tenant)
+	if err != nil {
+		t.Errorf("Expected no error, got: %v", err)
+	}
+	if location != nil {
+		t.Errorf("Expected no files available, got file %s", location.FileKey)
 	}
 }
 

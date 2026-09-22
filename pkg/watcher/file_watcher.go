@@ -55,6 +55,10 @@ type FileWatcherOptions struct {
 
 	// Logging is the instance-scoped logging runtime. Nil disables logging.
 	Logging *logging.Runtime
+
+	// StatisticsRecorder optionally receives in-process scan statistics.
+	// Nil means recording is disabled.
+	StatisticsRecorder core.StatisticsRecorder
 }
 
 // importedFileRecord is the persisted de-duplication state for one source path.
@@ -83,6 +87,9 @@ type fileWatcher struct {
 	watchers    sync.Map // map[string]*watcherEntry
 	configRoot  string   // Configuration root directory
 	logger      *logging.Runtime
+
+	// statistics optionally receives scan statistics. Nil disables recording.
+	statistics core.StatisticsRecorder
 
 	// importedFilesMu guards importedFilesCount and serializes history writes.
 	importedFilesMu sync.Mutex
@@ -143,6 +150,7 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 		storagePool: opts.StoragePool,
 		configRoot:  configRoot,
 		logger:      logger,
+		statistics:  opts.StatisticsRecorder,
 	}
 
 	// Load imported files history
@@ -495,6 +503,11 @@ func (w *fileWatcher) ScanAllWatchers(ctx context.Context) (map[string]*core.Fil
 }
 
 // scanWatcher performs the actual file scan and import for a watcher.
+//
+// This is the single scan-result path: ScanNow, ScanAllWatchers, and the
+// background service's per-watcher scan all funnel through it, so statistics
+// are recorded exactly once per completed scan and only for a scan that
+// actually produced a result.
 func (w *fileWatcher) scanWatcher(ctx context.Context, config *core.FileWatcherConfiguration) (*core.FileWatcherScanResult, error) {
 	startTime := time.Now()
 
@@ -517,11 +530,46 @@ func (w *fileWatcher) scanWatcher(ctx context.Context, config *core.FileWatcherC
 
 	if config.MultiTenantMode {
 		// Multi-tenant mode: scan subdirectories
-		return w.scanMultiTenant(ctx, config, result, startTime)
+		result, err = w.scanMultiTenant(ctx, config, result, startTime)
+	} else {
+		// Single-tenant mode: scan files directly
+		result, err = w.scanSingleTenant(ctx, config, result, startTime)
 	}
 
-	// Single-tenant mode: scan files directly
-	return w.scanSingleTenant(ctx, config, result, startTime)
+	if err != nil {
+		return result, err
+	}
+
+	w.recordScanStatistics(config, result)
+
+	return result, nil
+}
+
+// recordScanStatistics reports one completed scan to the statistics recorder.
+//
+// The tenant dimension is empty-safe: a multi-tenant watcher imports for
+// whichever tenants its subdirectories name, so it carries no single tenant ID.
+func (w *fileWatcher) recordScanStatistics(config *core.FileWatcherConfiguration, result *core.FileWatcherScanResult) {
+	if w.statistics == nil || config == nil || result == nil {
+		return
+	}
+
+	timestamp := time.Now().UTC()
+
+	dimensions := func() map[string]string {
+		return map[string]string{
+			core.StatisticsDimensionTenantID:  config.TenantID,
+			core.StatisticsDimensionWatcherID: config.WatcherID,
+			core.StatisticsDimensionOperation: "scan",
+		}
+	}
+
+	w.statistics.Record(core.StatisticWatcherScanCount, 1, timestamp, dimensions())
+	w.statistics.Record(core.StatisticWatcherFilesDiscovered, int64(result.FilesDiscovered), timestamp, dimensions())
+	w.statistics.Record(core.StatisticWatcherFilesImported, int64(result.FilesImported), timestamp, dimensions())
+	w.statistics.Record(core.StatisticWatcherFilesSkipped, int64(result.FilesSkipped), timestamp, dimensions())
+	w.statistics.Record(core.StatisticWatcherFilesFailed, int64(result.FilesFailed), timestamp, dimensions())
+	w.statistics.Record(core.StatisticWatcherBytesImported, result.BytesImported, timestamp, dimensions())
 }
 
 // scanSingleTenant scans files in single-tenant mode.

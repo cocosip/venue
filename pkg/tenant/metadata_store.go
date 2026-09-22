@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +14,9 @@ import (
 )
 
 // MetadataStore handles persistent storage of tenant metadata using JSON files.
+//
+// Every tenant ID is validated before it is used as a path segment, so a caller
+// cannot read, overwrite or delete files outside rootPath.
 type MetadataStore struct {
 	rootPath string
 	mu       sync.RWMutex
@@ -31,11 +35,21 @@ func NewMetadataStore(rootPath string) (*MetadataStore, error) {
 }
 
 // Save saves tenant metadata to disk.
+//
+// The write is atomic: the payload is written to a unique temporary file in the
+// same directory, flushed to disk, and then renamed over the target.
 func (s *MetadataStore) Save(metadata *core.TenantMetadata) error {
+	if metadata == nil {
+		return fmt.Errorf("tenant metadata cannot be nil: %w", core.ErrInvalidArgument)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	filePath := s.getFilePath(metadata.TenantID)
+	filePath, err := s.getFilePath(metadata.TenantID)
+	if err != nil {
+		return err
+	}
 
 	// Marshal to JSON
 	data, err := json.MarshalIndent(metadata, "", "  ")
@@ -43,10 +57,29 @@ func (s *MetadataStore) Save(metadata *core.TenantMetadata) error {
 		return fmt.Errorf("failed to marshal tenant metadata: %w", err)
 	}
 
-	// Write to temporary file first
-	tmpPath := filePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	// Write to a unique temporary file first so concurrent processes and
+	// concurrent saves cannot interleave on a shared name.
+	dir := filepath.Dir(filePath)
+	tmp, err := os.CreateTemp(dir, filepath.Base(filePath)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create tenant metadata temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("failed to write tenant metadata: %w", err)
+	}
+	// The caller observes a durable tenant record after a successful Save.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to flush tenant metadata: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to close tenant metadata temp file: %w", err)
 	}
 
 	// Atomic rename
@@ -63,7 +96,10 @@ func (s *MetadataStore) Load(tenantID string) (*core.TenantMetadata, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	filePath := s.getFilePath(tenantID)
+	filePath, err := s.getFilePath(tenantID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if file exists
 	if _, err := os.Stat(filePath); errors.Is(err, os.ErrNotExist) {
@@ -90,7 +126,10 @@ func (s *MetadataStore) Delete(tenantID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	filePath := s.getFilePath(tenantID)
+	filePath, err := s.getFilePath(tenantID)
+	if err != nil {
+		return err
+	}
 
 	if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to delete tenant metadata: %w", err)
@@ -104,8 +143,12 @@ func (s *MetadataStore) Exists(tenantID string) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	filePath := s.getFilePath(tenantID)
-	_, err := os.Stat(filePath)
+	filePath, err := s.getFilePath(tenantID)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = os.Stat(filePath)
 	if err == nil {
 		return true, nil
 	}
@@ -127,19 +170,30 @@ func (s *MetadataStore) ListAll() ([]string, error) {
 
 	var tenantIDs []string
 	for _, entry := range entries {
-		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".json" {
-			// Remove .json extension to get tenant ID
-			tenantID := entry.Name()[:len(entry.Name())-5]
-			tenantIDs = append(tenantIDs, tenantID)
+		if entry.IsDir() {
+			continue
 		}
+		name := entry.Name()
+		// Ignore abandoned temporary files and the bare ".json" name.
+		if !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		tenantID := strings.TrimSuffix(name, ".json")
+		if tenantID == "" {
+			continue
+		}
+		tenantIDs = append(tenantIDs, tenantID)
 	}
 
 	return tenantIDs, nil
 }
 
-// getFilePath returns the file path for a tenant's metadata.
-func (s *MetadataStore) getFilePath(tenantID string) string {
-	return filepath.Join(s.rootPath, tenantID+".json")
+// getFilePath returns the validated file path for a tenant's metadata.
+func (s *MetadataStore) getFilePath(tenantID string) (string, error) {
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.rootPath, tenantID+".json"), nil
 }
 
 // createDefaultMetadata creates default tenant metadata.

@@ -47,14 +47,30 @@ var ErrFileNotFound = errors.New("file not found")
 // ErrFileAlreadyProcessing is returned when attempting to process a file that's already processing.
 var ErrFileAlreadyProcessing = errors.New("file is already being processed")
 
-// ErrNoFilesAvailable is returned when no files are available for processing.
+// ErrNoFilesAvailable is retained for compatibility.
+//
+// Deprecated: the runtime no longer returns this error. Queue allocation
+// reports an empty queue as (nil, nil) and an empty slice respectively; use
+// ErrFileNotClaimable to detect that a specific candidate could not be claimed.
 var ErrNoFilesAvailable = errors.New("no files available for processing")
+
+// ErrWatcherNotFound is returned when a file watcher ID is unknown.
+var ErrWatcherNotFound = errors.New("file watcher not found")
 
 // ErrInvalidFileKey is returned when a file key is invalid.
 var ErrInvalidFileKey = errors.New("invalid file key")
 
 // ErrFileAlreadyExists is returned when attempting to create a file that already exists.
 var ErrFileAlreadyExists = errors.New("file already exists")
+
+// ErrFileNotClaimable is returned when a candidate file cannot be claimed
+// because it is no longer Pending or is not yet available for processing.
+//
+// It classifies contention: a competing worker or an unfinished backoff window
+// owns the candidate, so a caller such as the file scheduler can continue with
+// the next candidate instead of aborting. Infrastructure failures are reported
+// separately (see ErrDatabaseError) and must not be swallowed as contention.
+var ErrFileNotClaimable = errors.New("file is not claimable")
 
 // ErrProcessingLeaseMismatch is returned when a processing transition uses a stale lease.
 var ErrProcessingLeaseMismatch = errors.New("processing lease mismatch")

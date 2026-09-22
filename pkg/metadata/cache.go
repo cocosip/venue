@@ -75,6 +75,12 @@ func (c *metadataCache) get(tenantID, fileKey string) *core.FileMetadata {
 // set adds or updates a file metadata in the cache.
 // Stores a copy to prevent concurrent modification.
 // Evicts oldest entries if cache is at capacity.
+//
+// Writes happen after their database transaction commits and therefore have no
+// ordering guarantee, so an older revision must never replace a newer one: an
+// entry whose UpdatedAt is newer than the incoming record is kept as is. Equal
+// timestamps still publish, because several operations legitimately rewrite a
+// record without touching UpdatedAt.
 func (c *metadataCache) set(metadata *core.FileMetadata) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -82,6 +88,10 @@ func (c *metadataCache) set(metadata *core.FileMetadata) {
 
 	// Check if entry already exists
 	if existing, exists := c.entries[key]; exists {
+		if existing.metadata.UpdatedAt.After(metadata.UpdatedAt) {
+			// Stale publish: keep the newer state that is already cached.
+			return
+		}
 		// Update existing entry
 		metadataCopy := *metadata
 		existing.metadata = &metadataCopy
@@ -134,33 +144,6 @@ func (c *metadataCache) evictLRU() {
 	fileKey := elem.Value.(string)
 	c.lruList.Remove(elem)
 	delete(c.entries, fileKey)
-}
-
-// listByStatus returns all cached metadata with the specified status.
-// Expired entries are automatically removed.
-func (c *metadataCache) listByStatus(tenantID string, status core.FileProcessingStatus) []*core.FileMetadata {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	var results []*core.FileMetadata
-	now := time.Now()
-
-	// Collect results and remove expired entries
-	for key, entry := range c.entries {
-		if entry.expiresAt.Before(now) {
-			// Expired, remove it
-			c.lruList.Remove(entry.listElem)
-			delete(c.entries, key)
-			continue
-		}
-
-		if entry.metadata.TenantID == tenantID && entry.metadata.Status == status {
-			metadataCopy := *entry.metadata
-			results = append(results, &metadataCopy)
-		}
-	}
-
-	return results
 }
 
 func buildCacheKey(tenantID, fileKey string) string {

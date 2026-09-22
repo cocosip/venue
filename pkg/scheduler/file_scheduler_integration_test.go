@@ -2,12 +2,14 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	badger "github.com/dgraph-io/badger/v4"
 )
 
 // TestIntegration_FileLifecycle tests the complete lifecycle of a file.
@@ -165,12 +167,16 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 
 			for {
 				location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
-				if err == core.ErrNoFilesAvailable {
+				if err != nil {
+					if isTransientClaimError(err) {
+						// Another worker (or BadgerDB) won this round; retry.
+						continue
+					}
+					t.Errorf("Worker %d: Unexpected error: %v", id, err)
 					break
 				}
-
-				if err != nil {
-					t.Errorf("Worker %d: Unexpected error: %v", id, err)
+				if location == nil {
+					// The queue is momentarily empty; stop this worker.
 					break
 				}
 
@@ -223,7 +229,13 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 	_ = repo.AddOrUpdate(ctx, file)
 
 	// Get file for processing
-	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
+	location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if location == nil {
+		t.Fatal("Expected a pending file to be claimed")
+	}
 
 	// Simulate timeout by manually setting old processing start time
 	metadata, _ := repo.Get(ctx, tenant.ID, location.FileKey)
@@ -251,10 +263,19 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 		t.Error("Expected ProcessingStartTime to be cleared")
 	}
 
+	// Recovery makes the file available immediately, so a stale availability
+	// value can never keep the recovered file out of the queue.
+	if updated.AvailableForProcessingAt != nil && updated.AvailableForProcessingAt.After(time.Now()) {
+		t.Errorf("Expected recovered file to be available now, got %v", updated.AvailableForProcessingAt)
+	}
+
 	// Verify file can be processed again
 	location2, err := scheduler.GetNextFileForProcessing(ctx, tenant)
 	if err != nil {
 		t.Fatalf("Expected file to be available again, got error: %v", err)
+	}
+	if location2 == nil {
+		t.Fatal("Expected recovered file to be claimed")
 	}
 
 	if location2.FileKey != location.FileKey {
@@ -407,4 +428,14 @@ func requireProcessingLease(t *testing.T, location *core.FileLocation) core.File
 		t.Fatal("processing location has nil lease")
 	}
 	return *location.Lease
+}
+
+// isTransientClaimError reports whether err is contention that a worker should
+// retry: another worker won the claim race (core.ErrFileNotClaimable), the
+// candidate disappeared (core.ErrFileNotFound), or BadgerDB rejected an
+// optimistic transaction (badger.ErrConflict).
+func isTransientClaimError(err error) bool {
+	return errors.Is(err, core.ErrFileNotClaimable) ||
+		errors.Is(err, core.ErrFileNotFound) ||
+		errors.Is(err, badger.ErrConflict)
 }

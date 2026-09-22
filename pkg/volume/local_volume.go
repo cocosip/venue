@@ -2,14 +2,32 @@ package volume
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/google/uuid"
 )
+
+// Optional core.StorageVolume capabilities implemented by this volume. Callers
+// type-assert them, so an implementation drift must fail the build here rather
+// than silently degrade a caller to its fallback path.
+var (
+	_ core.FileMover             = (*LocalFileSystemVolume)(nil)
+	_ core.ShardingDepthProvider = (*LocalFileSystemVolume)(nil)
+)
+
+// DefaultHealthCheckCacheTTL is the default lifetime of a cached health probe
+// result. Health probes touch the filesystem, so the result is reused for this
+// window instead of writing and deleting a probe file on every call.
+const DefaultHealthCheckCacheTTL = 30 * time.Second
 
 // LocalFileSystemVolumeOptions configures a local file system volume.
 type LocalFileSystemVolumeOptions struct {
@@ -32,6 +50,11 @@ type LocalFileSystemVolumeOptions struct {
 	// EnableFsync enables fsync after file writes for durability.
 	// Disable for better write performance at the cost of durability.
 	EnableFsync bool
+
+	// HealthCheckCacheTTL is how long a health probe result is reused.
+	// Zero selects DefaultHealthCheckCacheTTL; a negative value disables the
+	// cache so every IsHealthy call probes the volume.
+	HealthCheckCacheTTL time.Duration
 }
 
 // LocalFileSystemVolume implements StorageVolume for local filesystem.
@@ -41,6 +64,21 @@ type LocalFileSystemVolume struct {
 	shardDepth  int
 	enableFsync bool
 	sanitizer   *PathSanitizer
+
+	// healthCacheTTL is the lifetime of a cached probe result. Negative values
+	// disable caching.
+	healthCacheTTL time.Duration
+	// now and probeHealth are seams for deterministic tests. They default to
+	// time.Now and performHealthProbe.
+	now         func() time.Time
+	probeHealth func(context.Context) bool
+
+	// healthMu makes the probe single-flight: callers that arrive while a probe
+	// is running wait for it and then reuse its cached result.
+	healthMu        sync.Mutex
+	healthKnown     bool
+	healthValue     bool
+	healthExpiresAt time.Time
 }
 
 // NewLocalFileSystemVolume creates a new local file system volume.
@@ -71,13 +109,23 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 		return nil, fmt.Errorf("failed to create mount path: %w", err)
 	}
 
-	return &LocalFileSystemVolume{
-		volumeID:    opts.VolumeID,
-		mountPath:   opts.MountPath,
-		shardDepth:  opts.ShardDepth,
-		enableFsync: opts.EnableFsync,
-		sanitizer:   NewPathSanitizer(opts.MountPath),
-	}, nil
+	healthCacheTTL := opts.HealthCheckCacheTTL
+	if healthCacheTTL == 0 {
+		healthCacheTTL = DefaultHealthCheckCacheTTL
+	}
+
+	volume := &LocalFileSystemVolume{
+		volumeID:       opts.VolumeID,
+		mountPath:      opts.MountPath,
+		shardDepth:     opts.ShardDepth,
+		enableFsync:    opts.EnableFsync,
+		sanitizer:      NewPathSanitizer(opts.MountPath),
+		healthCacheTTL: healthCacheTTL,
+		now:            time.Now,
+	}
+	volume.probeHealth = volume.performHealthProbe
+
+	return volume, nil
 }
 
 // VolumeID returns the unique identifier for this volume.
@@ -90,8 +138,45 @@ func (v *LocalFileSystemVolume) MountPath() string {
 	return v.mountPath
 }
 
+// ShardingDepth returns the configured physical directory sharding depth (0-3).
+//
+// It implements core.ShardingDepthProvider so callers that must reason about the
+// directory layout, such as cleanup, can protect shard directories instead of
+// guessing which directories are structural.
+func (v *LocalFileSystemVolume) ShardingDepth() int {
+	return v.shardDepth
+}
+
 // IsHealthy checks if the volume is healthy and available for operations.
+//
+// The probe (mount-path stat plus a small write/delete round trip) is cached
+// for HealthCheckCacheTTL, and a negative TTL disables the cache. Failed probes
+// are cached for the same window. Concurrent callers share a single probe.
 func (v *LocalFileSystemVolume) IsHealthy(ctx context.Context) bool {
+	if v.healthCacheTTL < 0 {
+		return v.probeHealth(ctx)
+	}
+
+	v.healthMu.Lock()
+	defer v.healthMu.Unlock()
+
+	now := v.now()
+	if v.healthKnown && now.Before(v.healthExpiresAt) {
+		return v.healthValue
+	}
+
+	// Only the lock holder probes; callers blocked here reuse the result that
+	// this probe caches before releasing the lock.
+	healthy := v.probeHealth(ctx)
+	v.healthKnown = true
+	v.healthValue = healthy
+	v.healthExpiresAt = now.Add(v.healthCacheTTL)
+
+	return healthy
+}
+
+// performHealthProbe runs the uncached health probe.
+func (v *LocalFileSystemVolume) performHealthProbe(ctx context.Context) bool {
 	// Check if mount path exists
 	if _, err := os.Stat(v.mountPath); err != nil {
 		return false
@@ -201,6 +286,176 @@ func (v *LocalFileSystemVolume) DeleteFile(ctx context.Context, relativePath str
 	return nil
 }
 
+// MoveFile moves a file inside the volume without copying its bytes.
+//
+// Both paths are volume-relative and are sanitized exactly like every other path
+// in this package, so neither of them can leave the volume root. The destination
+// parent directory chain is created when it is missing. The move is attempted
+// with os.Rename, which is atomic and O(1) within one filesystem; when the source
+// and destination live on different filesystems the bytes are staged into a
+// temporary file next to the destination and committed over it before the source
+// is removed.
+//
+// A move onto the same sanitized path is a successful no-op, and is reported
+// without touching the filesystem even when the source is absent. An empty or
+// escaping destination, and a destination that already exists, are rejected with
+// ErrInvalidArgument/ErrPathTraversalAttempt instead of overwriting another
+// payload. A missing source reports ErrFileNotFound.
+func (v *LocalFileSystemVolume) MoveFile(ctx context.Context, fromRelativePath string, toRelativePath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Sanitizing both sides is what keeps a relative path from escaping the
+	// volume root; the sanitizer is the single source of truth for that check.
+	sourcePath, err := v.sanitizer.SanitizeAndJoin(fromRelativePath)
+	if err != nil {
+		return err
+	}
+
+	destinationPath, err := v.sanitizer.SanitizeAndJoin(toRelativePath)
+	if err != nil {
+		return err
+	}
+
+	// The requested end state already holds, so there is nothing to do.
+	if sourcePath == destinationPath {
+		return nil
+	}
+
+	// os.Rename replaces an existing target (on Windows it always does), which
+	// would silently destroy another payload. Refuse instead.
+	if _, err := os.Stat(destinationPath); err == nil {
+		return fmt.Errorf("move destination already exists: %w", core.ErrInvalidArgument)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to inspect move destination: %w", err)
+	}
+
+	if _, err := os.Stat(sourcePath); err != nil {
+		if os.IsNotExist(err) {
+			return core.ErrFileNotFound
+		}
+		return fmt.Errorf("failed to inspect move source: %w", err)
+	}
+
+	// Ensure the destination directory exists.
+	if err := os.MkdirAll(filepath.Dir(destinationPath), 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	if err := os.Rename(sourcePath, destinationPath); err != nil {
+		if isCrossDeviceError(err) {
+			return v.copyFileAndRemoveSource(ctx, sourcePath, destinationPath)
+		}
+		if os.IsNotExist(err) {
+			return core.ErrFileNotFound
+		}
+		return fmt.Errorf("failed to move file: %w", err)
+	}
+
+	return nil
+}
+
+// copyFileAndRemoveSource is the cross-device fallback for MoveFile: the bytes
+// are written to a temporary file in the destination directory so the final
+// rename stays inside one filesystem and therefore publishes the destination
+// atomically. The source is only removed after that rename succeeded.
+//
+// The caller owns the temporary file; every failure path removes it best-effort,
+// because a partially written staging file must never be mistaken for a payload.
+// Full physical paths are deliberately absent from the returned messages.
+func (v *LocalFileSystemVolume) copyFileAndRemoveSource(ctx context.Context, sourceFullPath string, destinationFullPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	sourceInfo, err := os.Stat(sourceFullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return core.ErrFileNotFound
+		}
+		return fmt.Errorf("failed to inspect move source: %w", err)
+	}
+
+	source, err := os.Open(sourceFullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return core.ErrFileNotFound
+		}
+		return fmt.Errorf("failed to open move source: %w", err)
+	}
+	defer func() { _ = source.Close() }()
+
+	staged, err := os.CreateTemp(filepath.Dir(destinationFullPath), ".venue-move-*")
+	if err != nil {
+		return fmt.Errorf("failed to stage move destination: %w", err)
+	}
+	stagedPath := staged.Name()
+
+	// Best-effort release of the staging file: it only exists to be renamed onto
+	// the destination, so it must not outlive a failed move. Closing twice is
+	// harmless and intentionally ignored for the same reason.
+	committed := false
+	defer func() {
+		_ = staged.Close()
+		if !committed {
+			_ = os.Remove(stagedPath)
+		}
+	}()
+
+	copied, err := io.Copy(staged, source)
+	if err != nil {
+		return fmt.Errorf("failed to copy move source: %w", err)
+	}
+	if copied != sourceInfo.Size() {
+		return fmt.Errorf("move copy is incomplete, wrote %d of %d bytes: %w", copied, sourceInfo.Size(), io.ErrUnexpectedEOF)
+	}
+
+	// Release the source handle before it is removed: Windows refuses to delete a
+	// file that is still open, and the deferred Close cannot run early enough.
+	if err := source.Close(); err != nil {
+		return fmt.Errorf("failed to close move source: %w", err)
+	}
+
+	if err := staged.Sync(); err != nil {
+		return fmt.Errorf("failed to sync staged move copy: %w", err)
+	}
+	if err := staged.Close(); err != nil {
+		return fmt.Errorf("failed to close staged move copy: %w", err)
+	}
+
+	if err := os.Rename(stagedPath, destinationFullPath); err != nil {
+		return fmt.Errorf("failed to commit move copy: %w", err)
+	}
+	committed = true
+
+	if err := os.Remove(sourceFullPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to remove move source: %w", err)
+	}
+
+	return nil
+}
+
+// isCrossDeviceError reports whether a rename failed only because the source and
+// the destination are on different filesystems, which is the one rename failure
+// that a copy can still satisfy. Windows reports ERROR_NOT_SAME_DEVICE instead of
+// EXDEV, and its message text is localized, so the platform errno is preferred
+// and the stable English wordings are only a backstop for wrapped errors.
+func isCrossDeviceError(err error) bool {
+	if isNotSameDeviceErrno(err) || errors.Is(err, syscall.EXDEV) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+
+	return strings.Contains(message, "not same device") ||
+		strings.Contains(message, "cross-device link") ||
+		strings.Contains(message, "different disk drive")
+}
+
 // FileExists checks if a file exists at the specified path.
 func (v *LocalFileSystemVolume) FileExists(ctx context.Context, relativePath string) (bool, error) {
 	// Sanitize and get full path
@@ -241,8 +496,10 @@ func (v *LocalFileSystemVolume) BuildFilePath(fileKey string, extension string) 
 
 // BuildPhysicalPath builds the tenant-scoped relative path used by the storage pool.
 func (v *LocalFileSystemVolume) BuildPhysicalPath(tenantID string, fileKey string, extension string) (string, error) {
-	if tenantID == "" {
-		return "", fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	// The tenant ID becomes the first physical directory segment, so it must be
+	// a safe single path segment before it is joined onto the volume root.
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return "", fmt.Errorf("invalid tenant identifier: %w", err)
 	}
 	shardedPath, err := v.BuildFilePath(fileKey, extension)
 	if err != nil {

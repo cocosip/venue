@@ -129,34 +129,48 @@ func BenchmarkReadFile(b *testing.B) {
 	}
 }
 
-// BenchmarkGetNextFileForProcessing benchmarks queue retrieval
+// BenchmarkGetNextFileForProcessing benchmarks queue retrieval.
+//
+// The queue is refilled from the benchmark body so every iteration measures a
+// real claim. An empty queue is a normal result: the pool returns
+// (nil, nil), which is reported as a failed claim here rather than as an error.
 func BenchmarkGetNextFileForProcessing(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
 
 	ctx := context.Background()
 
 	// Upload files
+	uploads := 0
 	for i := 0; i < 100; i++ {
 		content := []byte(fmt.Sprintf("file %d", i))
 		fileName := fmt.Sprintf("file-%d.txt", i)
-		_, _ = sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
+		if _, err := sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName); err != nil {
+			b.Fatalf("WriteFile failed: %v", err)
+		}
+		uploads++
 	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := sys.storagePool.GetNextFileForProcessing(ctx, sys.tenantCtx)
+		location, err := sys.storagePool.GetNextFileForProcessing(ctx, sys.tenantCtx)
 		if err != nil {
-			// No more files, upload more
+			b.Fatalf("GetNextFileForProcessing failed: %v", err)
+		}
+		if location == nil {
+			// The queue is exhausted: replenish so the next iteration claims work.
 			content := []byte("replenish")
-			fileName := "replenish.txt"
-			_, _ = sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
+			fileName := fmt.Sprintf("replenish-%d.txt", uploads)
+			if _, err := sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName); err != nil {
+				b.Fatalf("WriteFile failed: %v", err)
+			}
+			uploads++
 		}
 	}
 }
 
-// BenchmarkCompleteWorkflow benchmarks the complete file lifecycle
+// BenchmarkCompleteWorkflow benchmarks the complete file lifecycle.
 func BenchmarkCompleteWorkflow(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
 
@@ -169,8 +183,7 @@ func BenchmarkCompleteWorkflow(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// 1. Upload
 		fileName := fmt.Sprintf("workflow-%d.txt", i)
-		_, err := sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
-		if err != nil {
+		if _, err := sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName); err != nil {
 			b.Fatalf("WriteFile failed: %v", err)
 		}
 
@@ -179,19 +192,21 @@ func BenchmarkCompleteWorkflow(b *testing.B) {
 		if err != nil {
 			b.Fatalf("GetNextFileForProcessing failed: %v", err)
 		}
+		if location == nil {
+			b.Fatal("GetNextFileForProcessing returned no work right after WriteFile")
+		}
 		if location.Lease == nil {
 			b.Fatal("GetNextFileForProcessing returned a nil lease")
 		}
 
 		// 3. Mark as completed (deletes)
-		err = sys.storagePool.MarkAsCompleted(ctx, *location.Lease)
-		if err != nil {
+		if err := sys.storagePool.MarkAsCompleted(ctx, *location.Lease); err != nil {
 			b.Fatalf("MarkAsCompleted failed: %v", err)
 		}
 	}
 }
 
-// BenchmarkMetadataOperations benchmarks metadata operations
+// BenchmarkMetadataOperations benchmarks metadata operations.
 func BenchmarkMetadataOperations(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
 
@@ -217,18 +232,24 @@ func BenchmarkMetadataOperations(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			meta.FileKey = fmt.Sprintf("key-%d", i)
-			_ = sys.metadataRepo.AddOrUpdate(ctx, meta)
+			if err := sys.metadataRepo.AddOrUpdate(ctx, meta); err != nil {
+				b.Fatalf("AddOrUpdate failed: %v", err)
+			}
 		}
 	})
 
 	b.Run("Get", func(b *testing.B) {
 		// Add one file
-		_ = sys.metadataRepo.AddOrUpdate(ctx, meta)
+		if err := sys.metadataRepo.AddOrUpdate(ctx, meta); err != nil {
+			b.Fatalf("AddOrUpdate failed: %v", err)
+		}
 
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_, _ = sys.metadataRepo.Get(ctx, sys.tenantCtx.ID, meta.FileKey)
+			if _, err := sys.metadataRepo.Get(ctx, sys.tenantCtx.ID, meta.FileKey); err != nil {
+				b.Fatalf("Get failed: %v", err)
+			}
 		}
 	})
 
@@ -237,13 +258,17 @@ func BenchmarkMetadataOperations(b *testing.B) {
 		for i := 0; i < 10; i++ {
 			m := *meta
 			m.FileKey = fmt.Sprintf("pending-%d", i)
-			_ = sys.metadataRepo.AddOrUpdate(ctx, &m)
+			if err := sys.metadataRepo.AddOrUpdate(ctx, &m); err != nil {
+				b.Fatalf("AddOrUpdate failed: %v", err)
+			}
 		}
 
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_, _ = sys.metadataRepo.GetPendingFiles(ctx, "bench-tenant", 10)
+			if _, err := sys.metadataRepo.GetPendingFiles(ctx, "bench-tenant", 10); err != nil {
+				b.Fatalf("GetPendingFiles failed: %v", err)
+			}
 		}
 	})
 }
@@ -281,7 +306,7 @@ func BenchmarkQuotaOperations(b *testing.B) {
 	})
 }
 
-// BenchmarkConcurrentProcessing benchmarks concurrent file processing
+// BenchmarkConcurrentProcessing benchmarks concurrent file processing.
 func BenchmarkConcurrentProcessing(b *testing.B) {
 	sys := setupBenchmarkSystem(b)
 
@@ -291,7 +316,9 @@ func BenchmarkConcurrentProcessing(b *testing.B) {
 	for i := 0; i < 1000; i++ {
 		content := []byte(fmt.Sprintf("file %d", i))
 		fileName := fmt.Sprintf("concurrent-%d.txt", i)
-		_, _ = sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName)
+		if _, err := sys.storagePool.WriteFile(ctx, sys.tenantCtx, bytes.NewReader(content), &fileName); err != nil {
+			b.Fatalf("WriteFile failed: %v", err)
+		}
 	}
 
 	b.ResetTimer()
@@ -301,16 +328,27 @@ func BenchmarkConcurrentProcessing(b *testing.B) {
 		for pb.Next() {
 			location, err := sys.storagePool.GetNextFileForProcessing(ctx, sys.tenantCtx)
 			if err != nil {
+				b.Errorf("GetNextFileForProcessing failed: %v", err)
+				continue
+			}
+			if location == nil {
+				// An exhausted queue returns (nil, nil) rather than an error.
 				continue
 			}
 
 			// Simulate processing
-			reader, _ := sys.storagePool.ReadFile(ctx, sys.tenantCtx, location.FileKey)
+			reader, err := sys.storagePool.ReadFile(ctx, sys.tenantCtx, location.FileKey)
+			if err != nil {
+				b.Errorf("ReadFile failed: %v", err)
+				continue
+			}
 			_ = reader.Close()
 
 			// Mark as completed
 			if location.Lease != nil {
-				_ = sys.storagePool.MarkAsCompleted(ctx, *location.Lease)
+				if err := sys.storagePool.MarkAsCompleted(ctx, *location.Lease); err != nil {
+					b.Errorf("MarkAsCompleted failed: %v", err)
+				}
 			}
 		}
 	})

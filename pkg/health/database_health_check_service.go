@@ -259,6 +259,9 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 }
 
 // reportHealthStatus reports the health check results.
+//
+// Reporting is log-only by design: Start never fails because a database is
+// unhealthy, so the caller decides whether to repair, ignore, or shut down.
 func (s *DatabaseHealthCheckService) reportHealthStatus(report *core.DatabaseHealthReport) {
 	// Check for no databases
 	if report.HealthyDatabases == 0 && len(report.CorruptedDatabases) == 0 {

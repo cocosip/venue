@@ -164,6 +164,15 @@ func newTestWatcher(t *testing.T) (*fileWatcher, *fakeStoragePool) {
 	return newTestWatcherAt(t, filepath.Join(t.TempDir(), "watchers"))
 }
 
+// newTestWatcherWithOptions builds a watcher whose construction options can be
+// adjusted before NewFileWatcher runs (for example to inject a statistics
+// recorder), with state isolated under a temporary configuration root.
+func newTestWatcherWithOptions(t *testing.T, mutate func(*FileWatcherOptions)) (*fileWatcher, *fakeStoragePool) {
+	t.Helper()
+
+	return newTestWatcherAt(t, filepath.Join(t.TempDir(), "watchers"), mutate)
+}
+
 // newTestWatcherAt builds a watcher whose state lives under configRoot, so a
 // test can restart against the same directory. Optional mutators adjust the
 // construction options (for example a capturing logging runtime).

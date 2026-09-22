@@ -10,15 +10,42 @@ import (
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/logging"
-	"github.com/dgraph-io/badger/v4"
 )
+
+// metadataSharedDirectoryName is the shared (tenant-independent) metadata
+// directory below the configured metadata root. The real BadgerDB lives one
+// level deeper, in metadataDatabaseDirectoryName.
+const metadataSharedDirectoryName = "shared"
+
+// metadataDatabaseDirectoryName is the BadgerDB directory name used by the
+// metadata repository below its data path.
+const metadataDatabaseDirectoryName = "metadata"
+
+// directoryQuotaDatabaseDirectoryName is the BadgerDB directory name used by
+// the directory quota repository below its data path.
+const directoryQuotaDatabaseDirectoryName = "quota"
 
 // DatabaseHealthCheckerOptions configures the database health checker.
 type DatabaseHealthCheckerOptions struct {
-	// MetadataDataPath is the root path for metadata databases.
+	// MetadataDatabasePath is the real BadgerDB directory that stores the shared
+	// metadata projection, conventionally "<MetadataDirectory>/shared/metadata".
+	// When empty it is derived from MetadataDataPath as
+	// filepath.Join(MetadataDataPath, "shared", "metadata").
+	MetadataDatabasePath string
+
+	// DirectoryQuotaDatabasePath is the real BadgerDB directory that stores the
+	// directory quota projection, conventionally "<QuotaDirectory>/quota".
+	// When empty it is derived from DirectoryQuotaDataPath as
+	// filepath.Join(DirectoryQuotaDataPath, "quota").
+	DirectoryQuotaDatabasePath string
+
+	// MetadataDataPath is the root path for metadata databases. It is the
+	// legacy fallback for MetadataDatabasePath and is also used to enumerate
+	// tenant IDs for orphan detection.
 	MetadataDataPath string
 
-	// DirectoryQuotaDataPath is the path for directory quota database.
+	// DirectoryQuotaDataPath is the legacy root path for the directory quota
+	// database. It is the fallback for DirectoryQuotaDatabasePath.
 	DirectoryQuotaDataPath string
 
 	// VolumePaths are the storage volume paths to check for orphaned files.
@@ -28,22 +55,42 @@ type DatabaseHealthCheckerOptions struct {
 	Logging *logging.Runtime
 }
 
-// databaseHealthChecker implements DatabaseHealthChecker interface.
+// databaseHealthChecker implements the core.DatabaseHealthChecker interface.
+//
+// The checker is deliberately non-invasive: it never opens a BadgerDB handle,
+// so it can run while the process holds the live database locks. Corruption
+// detection is structural (see checkBadgerStructure).
 type databaseHealthChecker struct {
-	metadataDataPath       string
-	directoryQuotaDataPath string
-	volumePaths            []string
-	logger                 *logging.Runtime
+	metadataDatabasePath       string
+	directoryQuotaDatabasePath string
+	metadataDataPath           string
+	directoryQuotaDataPath     string
+	volumePaths                []string
+	logger                     *logging.Runtime
 }
 
 // NewDatabaseHealthChecker creates a new database health checker.
+//
+// Either the explicit badger database paths (MetadataDatabasePath /
+// DirectoryQuotaDatabasePath) or their legacy roots (MetadataDataPath /
+// DirectoryQuotaDataPath) must identify a metadata database; otherwise
+// core.ErrInvalidArgument is returned.
 func NewDatabaseHealthChecker(opts *DatabaseHealthCheckerOptions) (core.DatabaseHealthChecker, error) {
 	if opts == nil {
 		return nil, fmt.Errorf("options cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
-	if opts.MetadataDataPath == "" {
-		return nil, fmt.Errorf("metadata data path cannot be empty: %w", core.ErrInvalidArgument)
+	metadataDatabasePath := opts.MetadataDatabasePath
+	if metadataDatabasePath == "" {
+		metadataDatabasePath = deriveMetadataDatabasePath(opts.MetadataDataPath)
+	}
+	if metadataDatabasePath == "" {
+		return nil, fmt.Errorf("metadata database path cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	directoryQuotaDatabasePath := opts.DirectoryQuotaDatabasePath
+	if directoryQuotaDatabasePath == "" {
+		directoryQuotaDatabasePath = deriveDirectoryQuotaDatabasePath(opts.DirectoryQuotaDataPath)
 	}
 
 	logger := opts.Logging
@@ -52,216 +99,232 @@ func NewDatabaseHealthChecker(opts *DatabaseHealthCheckerOptions) (core.Database
 	}
 
 	return &databaseHealthChecker{
-		metadataDataPath:       opts.MetadataDataPath,
-		directoryQuotaDataPath: opts.DirectoryQuotaDataPath,
-		volumePaths:            opts.VolumePaths,
-		logger:                 logger,
+		metadataDatabasePath:       metadataDatabasePath,
+		directoryQuotaDatabasePath: directoryQuotaDatabasePath,
+		metadataDataPath:           opts.MetadataDataPath,
+		directoryQuotaDataPath:     opts.DirectoryQuotaDataPath,
+		volumePaths:                opts.VolumePaths,
+		logger:                     logger,
 	}, nil
 }
 
+// deriveMetadataDatabasePath returns the conventional badger directory below a
+// metadata root, or "" when the root is empty.
+func deriveMetadataDatabasePath(root string) string {
+	if root == "" {
+		return ""
+	}
+
+	return filepath.Join(root, metadataSharedDirectoryName, metadataDatabaseDirectoryName)
+}
+
+// deriveDirectoryQuotaDatabasePath returns the conventional badger directory
+// below a directory quota root, or "" when the root is empty.
+func deriveDirectoryQuotaDatabasePath(root string) string {
+	if root == "" {
+		return ""
+	}
+
+	return filepath.Join(root, directoryQuotaDatabaseDirectoryName)
+}
+
 // CheckAllDatabases checks the health of all databases.
+//
+// Orphan detection always runs when volume paths are configured, regardless of
+// how many databases were found or reported as corrupted.
 func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.DatabaseHealthReport, error) {
 	report := &core.DatabaseHealthReport{
 		CorruptedDatabases: make([]*core.DatabaseHealthStatus, 0),
 		OrphanedTenants:    make([]string, 0),
+		DatabaseSizes:      make(map[string]int64),
 		AllHealthy:         true,
 	}
 
-	// Check metadata databases
 	if err := c.checkMetadataDatabases(ctx, report); err != nil {
 		c.emit(ctx, slog.LevelWarn, "metadata_check_failed", "Error checking metadata databases", errorTypeAttr(err))
 	}
 
-	// Check directory quota database
-	if c.directoryQuotaDataPath != "" {
-		status := c.checkDirectoryQuotaDatabaseInternal(ctx)
-		if status.IsHealthy {
+	if c.directoryQuotaDatabasePath != "" {
+		status, err := c.CheckDirectoryQuotaDatabase(ctx)
+		if err != nil {
+			c.emit(ctx, slog.LevelWarn, "quota_check_failed", "Error checking directory quota database", errorTypeAttr(err))
+		} else if status.IsHealthy {
 			report.HealthyDatabases++
-		} else {
+		} else if status.Error != "" {
 			report.CorruptedDatabases = append(report.CorruptedDatabases, status)
 			report.AllHealthy = false
 		}
 	}
 
-	// Detect orphaned files if no databases exist
-	if report.HealthyDatabases == 0 && len(report.CorruptedDatabases) == 0 {
-		orphaned, err := c.DetectOrphanedFiles(ctx)
-		if err != nil {
-			c.emit(ctx, slog.LevelWarn, "orphan_detection_failed", "Error detecting orphaned files", errorTypeAttr(err))
-		} else {
-			report.OrphanedTenants = orphaned
-		}
+	// Orphan detection is independent from the database counts: a deployment can
+	// have healthy databases and still have volume content without metadata.
+	orphaned, err := c.DetectOrphanedFiles(ctx)
+	if err != nil {
+		c.emit(ctx, slog.LevelWarn, "orphan_detection_failed", "Error detecting orphaned files", errorTypeAttr(err))
+	} else {
+		report.OrphanedTenants = orphaned
 	}
+
+	c.collectDatabaseSizes(ctx, report)
 
 	return report, nil
 }
 
-// checkMetadataDatabases checks all metadata databases.
+// checkMetadataDatabases checks the shared metadata database.
 func (c *databaseHealthChecker) checkMetadataDatabases(ctx context.Context, report *core.DatabaseHealthReport) error {
-	// Check if metadata directory exists
-	if _, err := os.Stat(c.metadataDataPath); os.IsNotExist(err) {
-		return nil // No databases yet, this is normal for first startup
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	// List all tenant directories
-	entries, err := os.ReadDir(c.metadataDataPath)
+	status, err := c.CheckMetadataDatabase(ctx, "")
 	if err != nil {
-		return fmt.Errorf("failed to read metadata directory: %w", err)
+		return err
 	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		tenantID := entry.Name()
-		status, err := c.CheckMetadataDatabase(ctx, tenantID)
-		if err != nil {
-			c.emit(ctx, slog.LevelWarn, "tenant_metadata_check_failed", "Error checking metadata database", slog.String("tenant_id", tenantID), errorTypeAttr(err))
-			continue
-		}
-
-		if status.IsHealthy {
-			report.HealthyDatabases++
-		} else {
-			report.CorruptedDatabases = append(report.CorruptedDatabases, status)
-			report.AllHealthy = false
-		}
+	switch {
+	case status.IsHealthy:
+		report.HealthyDatabases++
+	case status.Error != "":
+		report.CorruptedDatabases = append(report.CorruptedDatabases, status)
+		report.AllHealthy = false
 	}
 
 	return nil
 }
 
-// CheckMetadataDatabase checks a specific metadata database.
+// CheckMetadataDatabase checks a database below the metadata root.
+//
+// tenantID is a legacy per-tenant selector. An empty tenantID checks the real
+// shared metadata database (MetadataDatabasePath). A non-empty tenantID must be
+// a plain directory name: separators, "." and ".." are rejected as invalid
+// arguments instead of being joined into an arbitrary path. The check is
+// structural, so the returned status is healthy as soon as the database
+// artifacts are present and readable; it does not prove that the database can
+// be opened or that its write lock is free.
 func (c *databaseHealthChecker) CheckMetadataDatabase(ctx context.Context, tenantID string) (*core.DatabaseHealthStatus, error) {
-	dbPath := filepath.Join(c.metadataDataPath, tenantID)
+	dbPath := c.metadataDatabasePath
+	if tenantID != "" {
+		if err := validateTenantIDSegment(tenantID); err != nil {
+			status := &core.DatabaseHealthStatus{
+				DatabaseType: core.DatabaseTypeMetadata,
+				TenantID:     tenantID,
+				DatabasePath: dbPath,
+				IsHealthy:    false,
+				Error:        fmt.Sprintf("invalid tenant ID: %v", err),
+			}
 
+			return status, fmt.Errorf("invalid tenant ID: %w", err)
+		}
+
+		tenantRoot := filepath.Join(c.metadataDataPath, tenantID)
+		dbPath = filepath.Join(tenantRoot, metadataDatabaseDirectoryName)
+	}
+
+	return c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantID, dbPath), nil
+}
+
+// CheckDirectoryQuotaDatabase checks the directory quota database.
+func (c *databaseHealthChecker) CheckDirectoryQuotaDatabase(ctx context.Context) (*core.DatabaseHealthStatus, error) {
+	if c.directoryQuotaDatabasePath == "" {
+		status := &core.DatabaseHealthStatus{
+			DatabaseType: core.DatabaseTypeDirectoryQuota,
+			DatabasePath: "",
+			IsHealthy:    false,
+			Error:        "directory quota database path not configured",
+		}
+
+		return status, nil
+	}
+
+	return c.checkDatabase(ctx, core.DatabaseTypeDirectoryQuota, "", c.directoryQuotaDatabasePath), nil
+}
+
+// checkDatabase performs a cross-platform structural check of a BadgerDB
+// directory and never opens the database.
+//
+// Rationale: Badger v4 rejects read-only mode on Windows
+// (ErrWindowsNotSupported), so opening the live database is both impossible and
+// undesirable. A missing directory means "no database yet" and is reported as
+// healthy with an empty Error; only a directory that exists but lacks required
+// artifacts is reported as corrupted.
+func (c *databaseHealthChecker) checkDatabase(
+	ctx context.Context,
+	databaseType core.DatabaseType,
+	tenantID string,
+	dbPath string,
+) *core.DatabaseHealthStatus {
 	status := &core.DatabaseHealthStatus{
-		DatabaseType: core.DatabaseTypeMetadata,
+		DatabaseType: databaseType,
 		TenantID:     tenantID,
 		DatabasePath: dbPath,
 		IsHealthy:    false,
 	}
 
-	// Check if database directory exists
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		status.Error = "database directory does not exist"
-		return status, nil
+	_, healthy, err := checkBadgerStructure(ctx, dbPath)
+	switch {
+	case err == nil && healthy:
+		status.IsHealthy = true
+	case err == nil:
+		// Directory is absent: no database has been created yet. This is a
+		// normal state for a new deployment and is not corruption.
+	default:
+		status.Error = err.Error()
 	}
 
-	// Try to open the database
-	opts := badger.DefaultOptions(dbPath).WithReadOnly(true).WithLogger(nil)
-	db, err := badger.Open(opts)
-	if err != nil {
-		status.Error = fmt.Sprintf("failed to open database: %v", err)
-		return status, nil
-	}
-	defer func() { _ = db.Close() }()
-
-	// Try a simple read operation
-	err = db.View(func(txn *badger.Txn) error {
-		// Just iterate to check if database is readable
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		// Read first key to verify database is accessible
-		it.Rewind()
-		return nil
-	})
-
-	if err != nil {
-		status.Error = fmt.Sprintf("database read test failed: %v", err)
-		return status, nil
-	}
-
-	// Database is healthy
-	status.IsHealthy = true
-	return status, nil
-}
-
-// CheckDirectoryQuotaDatabase checks the directory quota database.
-func (c *databaseHealthChecker) CheckDirectoryQuotaDatabase(ctx context.Context) (*core.DatabaseHealthStatus, error) {
-	return c.checkDirectoryQuotaDatabaseInternal(ctx), nil
-}
-
-// checkDirectoryQuotaDatabaseInternal checks the directory quota database (internal).
-func (c *databaseHealthChecker) checkDirectoryQuotaDatabaseInternal(ctx context.Context) *core.DatabaseHealthStatus {
-	status := &core.DatabaseHealthStatus{
-		DatabaseType: core.DatabaseTypeDirectoryQuota,
-		TenantID:     "",
-		DatabasePath: c.directoryQuotaDataPath,
-		IsHealthy:    false,
-	}
-
-	if c.directoryQuotaDataPath == "" {
-		status.Error = "directory quota database path not configured"
-		return status
-	}
-
-	// Check if database directory exists
-	if _, err := os.Stat(c.directoryQuotaDataPath); os.IsNotExist(err) {
-		status.Error = "database directory does not exist"
-		return status
-	}
-
-	// Try to open the database
-	opts := badger.DefaultOptions(c.directoryQuotaDataPath).WithReadOnly(true).WithLogger(nil)
-	db, err := badger.Open(opts)
-	if err != nil {
-		status.Error = fmt.Sprintf("failed to open database: %v", err)
-		return status
-	}
-	defer func() { _ = db.Close() }()
-
-	// Try a simple read operation
-	err = db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		it.Rewind()
-		return nil
-	})
-
-	if err != nil {
-		status.Error = fmt.Sprintf("database read test failed: %v", err)
-		return status
-	}
-
-	// Database is healthy
-	status.IsHealthy = true
 	return status
+}
+
+// collectDatabaseSizes records the on-disk size of each configured database
+// directory so the report carries an operational signal without extra I/O for
+// healthy-only layouts.
+func (c *databaseHealthChecker) collectDatabaseSizes(ctx context.Context, report *core.DatabaseHealthReport) {
+	for _, dbPath := range []string{c.metadataDatabasePath, c.directoryQuotaDatabasePath} {
+		if dbPath == "" {
+			continue
+		}
+
+		if _, err := os.Stat(dbPath); err != nil {
+			continue
+		}
+
+		size, err := contextualDatabaseSize(ctx, dbPath)
+		if err != nil {
+			continue
+		}
+
+		report.DatabaseSizes[dbPath] = size
+	}
 }
 
 // DetectOrphanedFiles detects tenants with physical files but no metadata.
 func (c *databaseHealthChecker) DetectOrphanedFiles(ctx context.Context) ([]string, error) {
 	orphanedTenants := make([]string, 0)
 
-	if len(c.volumePaths) == 0 {
+	if len(c.volumePaths) == 0 || c.metadataDataPath == "" {
 		return orphanedTenants, nil
 	}
 
-	// Get existing tenant IDs from metadata databases
-	existingTenants := make(map[string]bool)
-
-	if _, err := os.Stat(c.metadataDataPath); !os.IsNotExist(err) {
-		entries, err := os.ReadDir(c.metadataDataPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read metadata directory: %w", err)
-		}
-
-		for _, entry := range entries {
-			if entry.IsDir() {
-				existingTenants[entry.Name()] = true
-			}
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	// Check each volume for tenant directories with files
+	// Get existing tenant IDs from the metadata root.
+	tenantIDs, err := GetTenantIDsFromMetadata(c.metadataDataPath)
+	if err != nil {
+		return nil, err
+	}
+
+	existingTenants := make(map[string]bool, len(tenantIDs))
+	for _, tenantID := range tenantIDs {
+		existingTenants[tenantID] = true
+	}
+
+	// Check each volume for tenant directories with files.
 	for _, volumePath := range c.volumePaths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		if _, err := os.Stat(volumePath); os.IsNotExist(err) {
 			continue
 		}
@@ -278,14 +341,12 @@ func (c *databaseHealthChecker) DetectOrphanedFiles(ctx context.Context) ([]stri
 			}
 
 			tenantID := entry.Name()
-			tenantPath := filepath.Join(volumePath, tenantID)
+			if existingTenants[tenantID] {
+				continue
+			}
 
-			// Check if this tenant directory has any files
-			if hasFiles(tenantPath) {
-				// Check if metadata database exists
-				if !existingTenants[tenantID] {
-					orphanedTenants = append(orphanedTenants, tenantID)
-				}
+			if hasFiles(filepath.Join(volumePath, tenantID)) {
+				orphanedTenants = append(orphanedTenants, tenantID)
 			}
 		}
 	}
@@ -314,7 +375,7 @@ func hasFiles(dirPath string) bool {
 
 		if !info.IsDir() {
 			hasAnyFile = true
-			return filepath.SkipDir // Stop walking
+			return filepath.SkipAll
 		}
 
 		return nil
@@ -324,12 +385,26 @@ func hasFiles(dirPath string) bool {
 }
 
 // GetDatabaseSize returns the size of a database directory in bytes.
+// A missing directory yields 0.
 func GetDatabaseSize(dbPath string) (int64, error) {
+	return contextualDatabaseSize(context.Background(), dbPath)
+}
+
+// contextualDatabaseSize is GetDatabaseSize with cancellation support.
+func contextualDatabaseSize(ctx context.Context, dbPath string) (int64, error) {
+	if dbPath == "" {
+		return 0, nil
+	}
+
 	var size int64
 
 	err := filepath.Walk(dbPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
+		}
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 
 		if !info.IsDir() {
@@ -338,38 +413,33 @@ func GetDatabaseSize(dbPath string) (int64, error) {
 
 		return nil
 	})
+	if err != nil {
+		return size, fmt.Errorf("failed to measure database directory: %w", err)
+	}
 
-	return size, err
+	return size, nil
 }
 
-// IsDatabaseCorrupted checks if a database directory appears corrupted.
-// This is a fast check that looks for common corruption indicators.
+// IsDatabaseCorrupted reports whether dbPath looks like a corrupted BadgerDB
+// directory.
+//
+// The check is structural: it never opens the database, so it works on Windows
+// (where Badger rejects read-only mode) and while the database is locked by the
+// running process. A path that does not exist, or that exists but is not a
+// database directory at all, is NOT reported as corrupted.
 func IsDatabaseCorrupted(dbPath string) bool {
-	// Check if directory exists
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return true
-	}
+	_, healthy, err := checkBadgerStructure(context.Background(), dbPath)
 
-	// Try to open database in read-only mode
-	opts := badger.DefaultOptions(dbPath).WithReadOnly(true).WithLogger(nil)
-	db, err := badger.Open(opts)
-	if err != nil {
-		// Cannot open = corrupted
-		return true
-	}
-	defer func() { _ = db.Close() }()
-
-	// Try a simple operation
-	err = db.View(func(txn *badger.Txn) error {
-		return nil
-	})
-
-	return err != nil
+	return err != nil && !healthy
 }
 
 // GetTenantIDsFromMetadata returns all tenant IDs that have metadata databases.
 func GetTenantIDsFromMetadata(metadataDataPath string) ([]string, error) {
 	tenantIDs := make([]string, 0)
+
+	if metadataDataPath == "" {
+		return tenantIDs, nil
+	}
 
 	if _, err := os.Stat(metadataDataPath); os.IsNotExist(err) {
 		return tenantIDs, nil
@@ -391,4 +461,120 @@ func GetTenantIDsFromMetadata(metadataDataPath string) ([]string, error) {
 	}
 
 	return tenantIDs, nil
+}
+
+// badgerManifestPrefix is the file name prefix BadgerDB uses for its MANIFEST.
+const badgerManifestPrefix = "MANIFEST"
+
+// badgerValueLogExtension is the file extension of a BadgerDB value log file.
+const badgerValueLogExtension = ".vlog"
+
+// badgerKeyRegistryName is the BadgerDB key registry file name.
+const badgerKeyRegistryName = "KEYREGISTRY"
+
+// checkBadgerStructure classifies dbPath structurally and never opens the
+// database.
+//
+// It returns:
+//   - (false, false, nil) when dbPath does not exist: no database yet.
+//   - (false, false, nil) when dbPath exists but contains no BadgerDB artifacts:
+//     the directory is not a database (for example a tenant JSON store, a shared
+//     parent directory, or a storage volume root), which is not corruption.
+//   - (true,  true,  nil) when a readable non-empty MANIFEST plus a value log or
+//     key registry are present.
+//   - (true,  false, err) when the directory looks like a database but a required
+//     artifact is missing or unreadable; err names the precise defect.
+func checkBadgerStructure(ctx context.Context, dbPath string) (isDatabase bool, healthy bool, err error) {
+	if dbPath == "" {
+		return false, false, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return false, false, err
+	}
+
+	info, statErr := os.Stat(dbPath)
+	switch {
+	case os.IsNotExist(statErr):
+		return false, false, nil
+	case statErr != nil:
+		return false, false, fmt.Errorf("failed to stat database directory: %w", statErr)
+	case !info.IsDir():
+		return false, false, nil
+	}
+
+	entries, readErr := os.ReadDir(dbPath)
+	if readErr != nil {
+		return false, false, fmt.Errorf("failed to read database directory: %w", readErr)
+	}
+
+	hasManifest := false
+	hasValueLog := false
+	hasKeyRegistry := false
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+
+		switch {
+		case strings.HasPrefix(name, badgerManifestPrefix):
+			hasManifest = true
+		case strings.EqualFold(filepath.Ext(name), badgerValueLogExtension):
+			hasValueLog = true
+		case strings.EqualFold(name, badgerKeyRegistryName):
+			hasKeyRegistry = true
+		}
+	}
+
+	if !hasManifest && !hasValueLog && !hasKeyRegistry {
+		// Not a BadgerDB directory at all.
+		return false, false, nil
+	}
+
+	if !hasManifest {
+		return true, false, fmt.Errorf("required BadgerDB artifact %s is missing from the database directory", badgerManifestPrefix)
+	}
+
+	if !hasValueLog && !hasKeyRegistry {
+		return true, false, fmt.Errorf("required BadgerDB artifact %s or %s is missing from the database directory", badgerValueLogExtension, badgerKeyRegistryName)
+	}
+
+	manifestInfo, manifestErr := readManifestInfo(dbPath, entries)
+	if manifestErr != nil {
+		return true, false, manifestErr
+	}
+
+	if manifestInfo.Size() == 0 {
+		return true, false, fmt.Errorf("BadgerDB artifact %s is empty at %s", badgerManifestPrefix, manifestInfo.Name())
+	}
+
+	return true, true, nil
+}
+
+// readManifestInfo returns the file info of the first MANIFEST entry.
+func readManifestInfo(dbPath string, entries []os.DirEntry) (os.FileInfo, error) {
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), badgerManifestPrefix) {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read BadgerDB artifact %s: %w", badgerManifestPrefix, err)
+		}
+
+		return info, nil
+	}
+
+	return nil, fmt.Errorf("required BadgerDB artifact %s is missing from the database directory %s", badgerManifestPrefix, dbPath)
+}
+
+// validateTenantIDSegment rejects tenant IDs that must never be joined into a
+// filesystem path. It delegates to the single canonical validator so the health
+// package cannot drift from the tenant and storage layers.
+func validateTenantIDSegment(tenantID string) error {
+	return core.ValidateTenantID(tenantID)
 }

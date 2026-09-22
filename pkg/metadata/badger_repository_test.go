@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,6 +56,7 @@ func TestNewBadgerMetadataRepository(t *testing.T) {
 		name      string
 		opts      *BadgerRepositoryOptions
 		wantError bool
+		wantIs    error
 	}{
 		{
 			name: "Valid options",
@@ -75,6 +78,25 @@ func TestNewBadgerMetadataRepository(t *testing.T) {
 				DataPath: t.TempDir(),
 			},
 			wantError: true,
+			wantIs:    core.ErrInvalidArgument,
+		},
+		{
+			name: "Tenant ID cannot escape the data path",
+			opts: &BadgerRepositoryOptions{
+				TenantID: "../../escaped",
+				DataPath: t.TempDir(),
+			},
+			wantError: true,
+			wantIs:    core.ErrPathTraversalAttempt,
+		},
+		{
+			name: "Tenant ID cannot contain a path separator",
+			opts: &BadgerRepositoryOptions{
+				TenantID: "tenant/sub",
+				DataPath: t.TempDir(),
+			},
+			wantError: true,
+			wantIs:    core.ErrPathTraversalAttempt,
 		},
 		{
 			name: "Empty data path",
@@ -93,6 +115,9 @@ func TestNewBadgerMetadataRepository(t *testing.T) {
 			if tc.wantError {
 				if err == nil {
 					t.Fatal("Expected error, got nil")
+				}
+				if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+					t.Errorf("error = %v, want %v", err, tc.wantIs)
 				}
 			} else {
 				if err != nil {
@@ -679,4 +704,629 @@ func TestBadgerRepository_Close(t *testing.T) {
 
 	// Clean up temp directory
 	_ = os.RemoveAll(tempDir)
+}
+
+// TestBadgerRepositoryCloseIsIdempotentAndConcurrencySafe guards the shutdown
+// contract: every Close caller either performs the shutdown or waits for it, so
+// no caller can report success while the database handle is still open.
+func TestBadgerRepositoryCloseIsIdempotentAndConcurrencySafe(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	concrete := repo.(*BadgerMetadataRepository)
+
+	if err := repo.AddOrUpdate(ctx, createTestMetadata("close-guard", core.FileStatusPending)); err != nil {
+		t.Fatalf("add metadata: %v", err)
+	}
+
+	const closers = 8
+	errs := make([]error, closers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < closers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = concrete.Close()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Close #%d = %v, want nil", i, err)
+		}
+	}
+	if !concrete.db.IsClosed() {
+		t.Error("database handle still open after every Close returned")
+	}
+	if err := concrete.Close(); err != nil {
+		t.Errorf("repeated Close = %v, want nil", err)
+	}
+}
+
+// TestGetByStatusReturnsEveryRecordWhenTheCacheIsSmall is the cache
+// short-circuit regression test: an active-status query must read the secondary
+// index rather than an eviction-bounded, unordered cache subset.
+func TestGetByStatusReturnsEveryRecordWhenTheCacheIsSmall(t *testing.T) {
+	ctx := context.Background()
+	repo, err := NewBadgerMetadataRepository(&BadgerRepositoryOptions{
+		TenantID:        "test-tenant",
+		DataPath:        t.TempDir(),
+		CacheTTL:        time.Minute,
+		MaxCacheEntries: 2,
+	})
+	if err != nil {
+		t.Fatalf("create repository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	base := time.Date(2026, time.January, 5, 6, 7, 8, 0, time.UTC)
+	const total = 5
+	for i := 0; i < total; i++ {
+		metadata := createTestMetadata(fmt.Sprintf("cached-%02d", i), core.FileStatusPending)
+		metadata.CreatedAt = base.Add(time.Duration(i) * time.Second)
+		metadata.UpdatedAt = metadata.CreatedAt
+		if err := repo.AddOrUpdate(ctx, metadata); err != nil {
+			t.Fatalf("add record %d: %v", i, err)
+		}
+	}
+
+	concrete := repo.(*BadgerMetadataRepository)
+	if cached := concrete.cache.getStats()["total_entries"].(int); cached > 2 {
+		t.Fatalf("test setup cached %d entries, want at most 2", cached)
+	}
+
+	tests := []struct {
+		name  string
+		limit int
+		want  int
+	}{
+		{"unlimited", 0, total},
+		{"limited", 3, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results, err := repo.GetByStatus(ctx, "test-tenant", core.FileStatusPending, tt.limit)
+			if err != nil {
+				t.Fatalf("GetByStatus failed: %v", err)
+			}
+			if len(results) != tt.want {
+				t.Fatalf("got %d records, want %d", len(results), tt.want)
+			}
+			for i, result := range results {
+				if want := fmt.Sprintf("cached-%02d", i); result.FileKey != want {
+					t.Errorf("result[%d] = %q, want %q (index order)", i, result.FileKey, want)
+				}
+			}
+		})
+	}
+}
+
+// TestAddOrUpdateBatchValidatesTheWholeSlice verifies that batch writes reject
+// the same records as AddOrUpdate, name the offending index, and write nothing.
+func TestAddOrUpdateBatchValidatesTheWholeSlice(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	t.Cleanup(func() { _ = repo.(*BadgerMetadataRepository).Close() })
+
+	tenantless := createTestMetadata("batch-tenantless", core.FileStatusPending)
+	tenantless.TenantID = ""
+
+	tests := []struct {
+		name      string
+		metadata  []*core.FileMetadata
+		wantIndex string
+	}{
+		{
+			name:      "nil entry",
+			metadata:  []*core.FileMetadata{createTestMetadata("batch-nil", core.FileStatusPending), nil},
+			wantIndex: "metadata[1]",
+		},
+		{
+			name: "empty file key",
+			metadata: []*core.FileMetadata{
+				createTestMetadata("batch-empty-key", core.FileStatusPending),
+				createTestMetadata("", core.FileStatusPending),
+			},
+			wantIndex: "metadata[1]",
+		},
+		{
+			name:      "empty tenant ID",
+			metadata:  []*core.FileMetadata{createTestMetadata("batch-empty-tenant", core.FileStatusPending), tenantless},
+			wantIndex: "metadata[1]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := repo.AddOrUpdateBatch(ctx, tt.metadata)
+			if !errors.Is(err, core.ErrInvalidArgument) {
+				t.Fatalf("AddOrUpdateBatch error = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantIndex) {
+				t.Errorf("error %q does not name %s", err, tt.wantIndex)
+			}
+			if _, getErr := repo.Get(ctx, "test-tenant", tt.metadata[0].FileKey); !errors.Is(getErr, core.ErrFileNotFound) {
+				t.Errorf("batch wrote %q despite an invalid entry: %v", tt.metadata[0].FileKey, getErr)
+			}
+		})
+	}
+
+	t.Run("valid slice is written", func(t *testing.T) {
+		batch := []*core.FileMetadata{
+			createTestMetadata("batch-valid-1", core.FileStatusPending),
+			createTestMetadata("batch-valid-2", core.FileStatusProcessing),
+		}
+		if err := repo.AddOrUpdateBatch(ctx, batch); err != nil {
+			t.Fatalf("AddOrUpdateBatch error = %v, want nil", err)
+		}
+		for _, metadata := range batch {
+			got, err := repo.Get(ctx, "test-tenant", metadata.FileKey)
+			if err != nil {
+				t.Fatalf("get %q: %v", metadata.FileKey, err)
+			}
+			if got.Status != metadata.Status {
+				t.Errorf("%q status = %s, want %s", metadata.FileKey, got.Status, metadata.Status)
+			}
+		}
+	})
+}
+
+// TestDeleteBatchValidatesKeysAndPropagatesDeleteFailures verifies batch delete
+// input validation and that a failed primary delete is reported instead of
+// being silently swallowed.
+func TestDeleteBatchValidatesKeysAndPropagatesDeleteFailures(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	t.Cleanup(func() { _ = repo.(*BadgerMetadataRepository).Close() })
+
+	for _, fileKey := range []string{"delete-1", "delete-2"} {
+		if err := repo.AddOrUpdate(ctx, createTestMetadata(fileKey, core.FileStatusPending)); err != nil {
+			t.Fatalf("add %q: %v", fileKey, err)
+		}
+	}
+
+	t.Run("empty tenant ID is rejected", func(t *testing.T) {
+		err := repo.DeleteBatch(ctx, "", []string{"delete-1"})
+		if !errors.Is(err, core.ErrInvalidArgument) {
+			t.Fatalf("DeleteBatch error = %v, want ErrInvalidArgument", err)
+		}
+		if !strings.Contains(err.Error(), "tenant ID") {
+			t.Errorf("error %q does not name the tenant ID", err)
+		}
+	})
+
+	t.Run("empty file key names the offending index", func(t *testing.T) {
+		err := repo.DeleteBatch(ctx, "test-tenant", []string{"delete-1", ""})
+		if !errors.Is(err, core.ErrInvalidArgument) {
+			t.Fatalf("DeleteBatch error = %v, want ErrInvalidArgument", err)
+		}
+		if !strings.Contains(err.Error(), "fileKeys[1]") {
+			t.Errorf("error %q does not name fileKeys[1]", err)
+		}
+	})
+
+	t.Run("primary delete failure is propagated", func(t *testing.T) {
+		oversized := strings.Repeat("k", 70000)
+		err := repo.DeleteBatch(ctx, "test-tenant", []string{"delete-1", oversized})
+		if err == nil {
+			t.Fatal("DeleteBatch error = nil, want the oversized key failure")
+		}
+		if _, getErr := repo.Get(ctx, "test-tenant", "delete-1"); getErr != nil {
+			t.Errorf("failed batch delete removed delete-1: %v", getErr)
+		}
+	})
+
+	t.Run("valid batch deletes every key", func(t *testing.T) {
+		if err := repo.DeleteBatch(ctx, "test-tenant", []string{"delete-1", "delete-2"}); err != nil {
+			t.Fatalf("DeleteBatch error = %v, want nil", err)
+		}
+		for _, fileKey := range []string{"delete-1", "delete-2"} {
+			if _, err := repo.Get(ctx, "test-tenant", fileKey); !errors.Is(err, core.ErrFileNotFound) {
+				t.Errorf("%q still present after batch delete: %v", fileKey, err)
+			}
+		}
+	})
+}
+
+// TestCompareAndTransitionToProcessingClassifiesClaimFailures verifies that
+// contention is distinguishable from infrastructure failure so a scheduler can
+// continue on contention only.
+func TestCompareAndTransitionToProcessingClassifiesClaimFailures(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	t.Cleanup(func() { _ = repo.(*BadgerMetadataRepository).Close() })
+
+	future := time.Now().Add(time.Hour)
+	past := time.Now().Add(-time.Minute)
+	notAvailable := createTestMetadata("claim-not-available", core.FileStatusPending)
+	notAvailable.AvailableForProcessingAt = &future
+	alreadyProcessing := createTestMetadata("claim-already-processing", core.FileStatusProcessing)
+	available := createTestMetadata("claim-available", core.FileStatusPending)
+	available.AvailableForProcessingAt = &past
+	for _, metadata := range []*core.FileMetadata{notAvailable, alreadyProcessing, available} {
+		if err := repo.AddOrUpdate(ctx, metadata); err != nil {
+			t.Fatalf("add %s: %v", metadata.FileKey, err)
+		}
+	}
+
+	tests := []struct {
+		name    string
+		fileKey string
+		want    error
+	}{
+		{"not pending is contention", "claim-already-processing", core.ErrFileNotClaimable},
+		{"not yet available is contention", "claim-not-available", core.ErrFileNotClaimable},
+		{"missing record stays ErrFileNotFound", "claim-missing", core.ErrFileNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := repo.CompareAndTransitionToProcessing(ctx, "test-tenant", tt.fileKey)
+			if !errors.Is(err, tt.want) {
+				t.Errorf("error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+
+	t.Run("available pending record is claimed", func(t *testing.T) {
+		updated, err := repo.CompareAndTransitionToProcessing(ctx, "test-tenant", "claim-available")
+		if err != nil {
+			t.Fatalf("claim error = %v, want nil", err)
+		}
+		if updated.Status != core.FileStatusProcessing {
+			t.Errorf("claimed status = %s, want Processing", updated.Status)
+		}
+	})
+
+	t.Run("closed repository is an infrastructure failure", func(t *testing.T) {
+		closed, err := NewBadgerMetadataRepository(&BadgerRepositoryOptions{
+			TenantID: "test-tenant",
+			DataPath: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("create repository: %v", err)
+		}
+		if err := closed.Close(); err != nil {
+			t.Fatalf("close repository: %v", err)
+		}
+		if _, err := closed.CompareAndTransitionToProcessing(ctx, "test-tenant", "claim-missing"); !errors.Is(err, core.ErrDatabaseError) {
+			t.Errorf("error = %v, want ErrDatabaseError", err)
+		}
+	})
+}
+
+// TestConcurrentClaimsOnlyReportClaimContention verifies that racing workers see
+// contention (including BadgerDB write conflicts) rather than an infrastructure
+// failure, and that exactly one worker wins the claim.
+func TestConcurrentClaimsOnlyReportClaimContention(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	t.Cleanup(func() { _ = repo.(*BadgerMetadataRepository).Close() })
+
+	if err := repo.AddOrUpdate(ctx, createTestMetadata("contended-claim", core.FileStatusPending)); err != nil {
+		t.Fatalf("add metadata: %v", err)
+	}
+
+	const workers = 8
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = repo.CompareAndTransitionToProcessing(ctx, "test-tenant", "contended-claim")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+		case errors.Is(err, core.ErrFileNotClaimable):
+			// Lost the race: contention is expected and skippable.
+		default:
+			t.Errorf("claimer %d error = %v, want nil or ErrFileNotClaimable", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Errorf("%d claimers succeeded, want exactly 1", winners)
+	}
+}
+
+// TestCompareAndUpdateProcessingRepeatedReleaseIsIdempotent verifies that
+// releasing the same lease twice is a no-op while a superseded lease is still
+// rejected.
+func TestCompareAndUpdateProcessingRepeatedReleaseIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	t.Cleanup(func() { _ = repo.(*BadgerMetadataRepository).Close() })
+
+	leaseStart := time.Date(2026, time.September, 17, 10, 0, 0, 0, time.UTC)
+	lease := core.FileProcessingLease{
+		TenantID:               "test-tenant",
+		FileKey:                "idempotent-lease",
+		ProcessingStartTimeUTC: leaseStart,
+	}
+	seed := func(t *testing.T) {
+		t.Helper()
+		file := createTestMetadata(lease.FileKey, core.FileStatusProcessing)
+		file.ProcessingStartTime = &leaseStart
+		if err := repo.AddOrUpdate(ctx, file); err != nil {
+			t.Fatalf("seed metadata: %v", err)
+		}
+	}
+
+	t.Run("repeated complete is a no-op", func(t *testing.T) {
+		seed(t)
+		completedAt := time.Date(2026, time.September, 17, 10, 5, 0, 0, time.UTC)
+		release := func() (*core.FileMetadata, error) {
+			return repo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
+				current.Status = core.FileStatusCompleted
+				current.ProcessingStartTime = nil
+				current.CompletedAt = &completedAt
+				current.UpdatedAt = completedAt
+				return nil
+			})
+		}
+
+		if _, err := release(); err != nil {
+			t.Fatalf("first release: %v", err)
+		}
+		second, err := release()
+		if err != nil {
+			t.Fatalf("repeated release = %v, want success", err)
+		}
+		if second.Status != core.FileStatusCompleted || second.CompletedAt == nil || !second.CompletedAt.Equal(completedAt) {
+			t.Errorf("repeated release changed metadata: status %s completedAt %v", second.Status, second.CompletedAt)
+		}
+
+		current, err := repo.Get(ctx, lease.TenantID, lease.FileKey)
+		if err != nil {
+			t.Fatalf("get metadata: %v", err)
+		}
+		if current.ReleasedProcessingStartTimeUTC == nil || !current.ReleasedProcessingStartTimeUTC.Equal(leaseStart) {
+			t.Errorf("released lease marker = %v, want %v", current.ReleasedProcessingStartTimeUTC, leaseStart)
+		}
+	})
+
+	t.Run("repeated failure does not retry again", func(t *testing.T) {
+		seed(t)
+		failedAt := time.Date(2026, time.September, 17, 11, 0, 0, 0, time.UTC)
+		release := func() (*core.FileMetadata, error) {
+			return repo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
+				current.RetryCount++
+				current.Status = core.FileStatusPermanentlyFailed
+				current.ProcessingStartTime = nil
+				current.LastFailedAt = &failedAt
+				current.UpdatedAt = failedAt
+				return nil
+			})
+		}
+
+		if _, err := release(); err != nil {
+			t.Fatalf("first release: %v", err)
+		}
+		second, err := release()
+		if err != nil {
+			t.Fatalf("repeated release = %v, want success", err)
+		}
+		if second.RetryCount != 1 {
+			t.Errorf("RetryCount = %d after repeated failure release, want 1", second.RetryCount)
+		}
+		if second.Status != core.FileStatusPermanentlyFailed {
+			t.Errorf("status = %s, want PermanentlyFailed", second.Status)
+		}
+	})
+
+	t.Run("superseded lease is rejected", func(t *testing.T) {
+		seed(t)
+		if _, err := repo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
+			current.Status = core.FileStatusPending
+			current.ProcessingStartTime = nil
+			return nil
+		}); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+
+		newLeaseStart := leaseStart.Add(time.Minute)
+		reclaimed, err := repo.Get(ctx, lease.TenantID, lease.FileKey)
+		if err != nil {
+			t.Fatalf("get metadata: %v", err)
+		}
+		reclaimed.Status = core.FileStatusProcessing
+		reclaimed.ProcessingStartTime = &newLeaseStart
+		reclaimed.UpdatedAt = newLeaseStart
+		if err := repo.AddOrUpdate(ctx, reclaimed); err != nil {
+			t.Fatalf("re-claim metadata: %v", err)
+		}
+
+		called := false
+		_, err = repo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
+			called = true
+			return nil
+		})
+		if !errors.Is(err, core.ErrProcessingLeaseMismatch) {
+			t.Fatalf("stale lease error = %v, want ErrProcessingLeaseMismatch", err)
+		}
+		if called {
+			t.Error("update callback ran for a superseded lease")
+		}
+	})
+}
+
+// TestMetadataQueriesHonorContextCancellation verifies that the index scans
+// stop when the caller cancels.
+func TestMetadataQueriesHonorContextCancellation(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	t.Cleanup(func() { _ = repo.(*BadgerMetadataRepository).Close() })
+
+	if err := repo.AddOrUpdate(ctx, createTestMetadata("ctx-pending", core.FileStatusPending)); err != nil {
+		t.Fatalf("add pending metadata: %v", err)
+	}
+	timedOut := createTestMetadata("ctx-timed-out", core.FileStatusProcessing)
+	longAgo := time.Now().Add(-2 * time.Hour)
+	timedOut.ProcessingStartTime = &longAgo
+	if err := repo.AddOrUpdate(ctx, timedOut); err != nil {
+		t.Fatalf("add processing metadata: %v", err)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	tests := []struct {
+		name  string
+		query func(context.Context) ([]*core.FileMetadata, error)
+	}{
+		{
+			name: "GetByStatus",
+			query: func(c context.Context) ([]*core.FileMetadata, error) {
+				return repo.GetByStatus(c, "test-tenant", core.FileStatusPending, 0)
+			},
+		},
+		{
+			name: "GetPendingFiles",
+			query: func(c context.Context) ([]*core.FileMetadata, error) {
+				return repo.GetPendingFiles(c, "test-tenant", 0)
+			},
+		},
+		{
+			name: "GetTimedOutProcessingFiles",
+			query: func(c context.Context) ([]*core.FileMetadata, error) {
+				return repo.GetTimedOutProcessingFiles(c, "test-tenant", time.Minute)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results, err := tt.query(canceled)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v (%d results), want context.Canceled", err, len(results))
+			}
+		})
+	}
+}
+
+// TestNewBadgerMetadataRepositoryClampsGCDiscardRatio verifies that a configured
+// discard ratio outside (0,1) cannot make every GC run fail with
+// badger.ErrInvalidRequest.
+func TestNewBadgerMetadataRepositoryClampsGCDiscardRatio(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		ratio     float64
+		wantExact float64
+	}{
+		{"zero falls back to the default", 0, 0.5},
+		{"negative falls back to the default", -0.25, 0.5},
+		{"one is clamped below one", 1, 0},
+		{"above one is clamped below one", 1.5, 0},
+		{"valid ratio is preserved", 0.7, 0.7},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, err := NewBadgerMetadataRepository(&BadgerRepositoryOptions{
+				TenantID:       "test-tenant",
+				DataPath:       t.TempDir(),
+				GCDiscardRatio: tt.ratio,
+			})
+			if err != nil {
+				t.Fatalf("create repository: %v", err)
+			}
+			concrete := repo.(*BadgerMetadataRepository)
+			t.Cleanup(func() { _ = concrete.Close() })
+
+			if tt.wantExact != 0 && concrete.gcDiscardRatio != tt.wantExact {
+				t.Errorf("gcDiscardRatio = %v, want %v", concrete.gcDiscardRatio, tt.wantExact)
+			}
+			if concrete.gcDiscardRatio <= 0 || concrete.gcDiscardRatio >= 1 {
+				t.Fatalf("gcDiscardRatio = %v, want a value strictly inside (0,1)", concrete.gcDiscardRatio)
+			}
+			if err := repo.Optimize(ctx); err != nil {
+				t.Errorf("Optimize with discard ratio %v: %v", concrete.gcDiscardRatio, err)
+			}
+		})
+	}
+}
+
+// TestBadgerRepositoryInvalidArgumentErrorsNameTheArgument verifies that
+// validation errors distinguish an empty tenant ID from an empty file key.
+func TestBadgerRepositoryInvalidArgumentErrorsNameTheArgument(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := createTestRepository(t)
+	t.Cleanup(func() { _ = repo.(*BadgerMetadataRepository).Close() })
+
+	tests := []struct {
+		name string
+		call func() error
+		want string
+	}{
+		{
+			name: "Get rejects an empty tenant ID",
+			call: func() error { _, err := repo.Get(ctx, "", "file-1"); return err },
+			want: "tenant ID",
+		},
+		{
+			name: "Get rejects an empty file key",
+			call: func() error { _, err := repo.Get(ctx, "test-tenant", ""); return err },
+			want: "file key",
+		},
+		{
+			name: "Delete rejects an empty tenant ID",
+			call: func() error { return repo.Delete(ctx, "", "file-1") },
+			want: "tenant ID",
+		},
+		{
+			name: "UpdateStatus rejects an empty tenant ID",
+			call: func() error {
+				return repo.UpdateStatus(ctx, "", "file-1", core.FileStatusPending)
+			},
+			want: "tenant ID",
+		},
+		{
+			name: "UpdateStatus rejects an empty file key",
+			call: func() error {
+				return repo.UpdateStatus(ctx, "test-tenant", "", core.FileStatusPending)
+			},
+			want: "file key",
+		},
+		{
+			name: "CompareAndTransitionToProcessing rejects an empty tenant ID",
+			call: func() error {
+				_, err := repo.CompareAndTransitionToProcessing(ctx, "", "file-1")
+				return err
+			},
+			want: "tenant ID",
+		},
+		{
+			name: "CompareAndTransitionToProcessing rejects an empty file key",
+			call: func() error {
+				_, err := repo.CompareAndTransitionToProcessing(ctx, "test-tenant", "")
+				return err
+			},
+			want: "file key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.call()
+			if !errors.Is(err, core.ErrInvalidArgument) {
+				t.Fatalf("error = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error %q does not mention %q", err, tt.want)
+			}
+		})
+	}
 }

@@ -4,30 +4,68 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/logging"
+)
+
+// Statistics series bounds. The default keeps a bounded amount of in-memory
+// state for a busy runtime; the range matches the in-memory recorder's own
+// validation so a configuration cannot ask for something the recorder rejects.
+const (
+	defaultStatisticsMaxSeries = 16384
+	minStatisticsMaxSeries     = 1024
+	maxStatisticsMaxSeries     = 262144
+)
+
+// Volume startup health-check defaults. The initial delay exists so a network
+// volume can finish mounting; a volume that answers the first probe is never
+// delayed.
+const (
+	defaultVolumeInitialDelay     = 2 * time.Second
+	defaultVolumeHealthCheckDelay = 500 * time.Millisecond
+)
+
+// Advanced watcher defaults, applied by ApplyDefaults only to zero values.
+const (
+	defaultAutoCreateTenantDirectoriesCacheTTL = 60 * time.Second
+	defaultFileStabilityCheckDelay             = 100 * time.Millisecond
+	defaultSkipStabilityCheckAfterAge          = time.Minute
+	defaultImportedFilesPruneInterval          = 5 * time.Minute
+	defaultImportedFilesHistoryFlushInterval   = 2 * time.Second
 )
 
 // Config configures one Venue runtime instance.
 type Config struct {
-	MetadataDirectory                 string                    `json:"metadataDirectory" yaml:"metadataDirectory" mapstructure:"metadataDirectory"`
-	QuotaDirectory                    string                    `json:"quotaDirectory" yaml:"quotaDirectory" mapstructure:"quotaDirectory"`
-	FileWatcherConfigurationDirectory string                    `json:"fileWatcherConfigurationDirectory" yaml:"fileWatcherConfigurationDirectory" mapstructure:"fileWatcherConfigurationDirectory"`
-	AutoCreateTenants                 bool                      `json:"autoCreateTenants" yaml:"autoCreateTenants" mapstructure:"autoCreateTenants"`
-	DefaultTenantQuota                int64                     `json:"defaultTenantQuota" yaml:"defaultTenantQuota" mapstructure:"defaultTenantQuota"`
-	EnableDatabaseHealthCheck         bool                      `json:"enableDatabaseHealthCheck" yaml:"enableDatabaseHealthCheck" mapstructure:"enableDatabaseHealthCheck"`
-	RetryPolicy                       RetryPolicyConfig         `json:"retryPolicy" yaml:"retryPolicy" mapstructure:"retryPolicy"`
-	TenantManager                     TenantManagerConfig       `json:"tenantManagerOptions" yaml:"tenantManagerOptions" mapstructure:"tenantManagerOptions"`
-	Metadata                          MetadataConfig            `json:"metadataOptions" yaml:"metadataOptions" mapstructure:"metadataOptions"`
-	BadgerDB                          BadgerDBConfig            `json:"badgerDBOptions" yaml:"badgerDBOptions" mapstructure:"badgerDBOptions"`
-	Volumes                           []VolumeConfig            `json:"volumes" yaml:"volumes" mapstructure:"volumes"`
-	Tenants                           []TenantConfig            `json:"tenants" yaml:"tenants" mapstructure:"tenants"`
-	FileWatchers                      []FileWatcherConfig       `json:"fileWatchers" yaml:"fileWatchers" mapstructure:"fileWatchers"`
-	EnableBackgroundCleanup           bool                      `json:"enableBackgroundCleanup" yaml:"enableBackgroundCleanup" mapstructure:"enableBackgroundCleanup"`
-	Cleanup                           CleanupConfig             `json:"cleanupOptions" yaml:"cleanupOptions" mapstructure:"cleanupOptions"`
-	DatabaseHealthCheck               DatabaseHealthCheckConfig `json:"databaseHealthCheckOptions" yaml:"databaseHealthCheckOptions" mapstructure:"databaseHealthCheckOptions"`
-	Logging                           *logging.Config           `json:"-" yaml:"-" mapstructure:"-"`
+	MetadataDirectory                 string `json:"metadataDirectory" yaml:"metadataDirectory" mapstructure:"metadataDirectory"`
+	QuotaDirectory                    string `json:"quotaDirectory" yaml:"quotaDirectory" mapstructure:"quotaDirectory"`
+	FileWatcherConfigurationDirectory string `json:"fileWatcherConfigurationDirectory" yaml:"fileWatcherConfigurationDirectory" mapstructure:"fileWatcherConfigurationDirectory"`
+	AutoCreateTenants                 bool   `json:"autoCreateTenants" yaml:"autoCreateTenants" mapstructure:"autoCreateTenants"`
+	DefaultTenantQuota                int64  `json:"defaultTenantQuota" yaml:"defaultTenantQuota" mapstructure:"defaultTenantQuota"`
+	EnableDatabaseHealthCheck         bool   `json:"enableDatabaseHealthCheck" yaml:"enableDatabaseHealthCheck" mapstructure:"enableDatabaseHealthCheck"`
+
+	// FailFastOnStartupRecoveryFailure makes startup fail when a database had to
+	// be quarantined and could not be restored from a backup. When false (the
+	// default), the runtime continues in a degraded state and reports it.
+	FailFastOnStartupRecoveryFailure bool                      `json:"failFastOnStartupRecoveryFailure" yaml:"failFastOnStartupRecoveryFailure" mapstructure:"failFastOnStartupRecoveryFailure"`
+	RetryPolicy                      RetryPolicyConfig         `json:"retryPolicy" yaml:"retryPolicy" mapstructure:"retryPolicy"`
+	TenantManager                    TenantManagerConfig       `json:"tenantManagerOptions" yaml:"tenantManagerOptions" mapstructure:"tenantManagerOptions"`
+	Metadata                         MetadataConfig            `json:"metadataOptions" yaml:"metadataOptions" mapstructure:"metadataOptions"`
+	BadgerDB                         BadgerDBConfig            `json:"badgerDBOptions" yaml:"badgerDBOptions" mapstructure:"badgerDBOptions"`
+	Volumes                          []VolumeConfig            `json:"volumes" yaml:"volumes" mapstructure:"volumes"`
+	Tenants                          []TenantConfig            `json:"tenants" yaml:"tenants" mapstructure:"tenants"`
+	FileWatchers                     []FileWatcherConfig       `json:"fileWatchers" yaml:"fileWatchers" mapstructure:"fileWatchers"`
+	FileWatcherRoots                 []FileWatcherRootConfig   `json:"watcherRoots" yaml:"watcherRoots" mapstructure:"watcherRoots"`
+	FileWatcherService               FileWatcherServiceConfig  `json:"watcherServiceOptions" yaml:"watcherServiceOptions" mapstructure:"watcherServiceOptions"`
+	EnableBackgroundCleanup          bool                      `json:"enableBackgroundCleanup" yaml:"enableBackgroundCleanup" mapstructure:"enableBackgroundCleanup"`
+	Cleanup                          CleanupConfig             `json:"cleanupOptions" yaml:"cleanupOptions" mapstructure:"cleanupOptions"`
+	OrphanRecovery                   OrphanRecoveryConfig      `json:"orphanRecoveryOptions" yaml:"orphanRecoveryOptions" mapstructure:"orphanRecoveryOptions"`
+	DatabaseHealthCheck              DatabaseHealthCheckConfig `json:"databaseHealthCheckOptions" yaml:"databaseHealthCheckOptions" mapstructure:"databaseHealthCheckOptions"`
+	Statistics                       StatisticsConfig          `json:"statisticsOptions" yaml:"statisticsOptions" mapstructure:"statisticsOptions"`
+	Logging                          *logging.Config           `json:"-" yaml:"-" mapstructure:"-"`
 }
 
 // TenantManagerConfig configures tenant metadata and caching.
@@ -50,6 +88,38 @@ type BadgerDBConfig struct {
 	ValueLogFileSize int           `json:"valueLogFileSize" yaml:"valueLogFileSize" mapstructure:"valueLogFileSize"`
 	BlockCacheSize   int           `json:"blockCacheSize" yaml:"blockCacheSize" mapstructure:"blockCacheSize"`
 	SyncWrites       bool          `json:"syncWrites" yaml:"syncWrites" mapstructure:"syncWrites"`
+
+	// RecoverCorruptedDatabase quarantines a database directory that cannot be
+	// opened and recreates an empty one, instead of failing startup. The
+	// quarantine directory is kept for CorruptedDatabaseRetention.
+	//
+	// This is a destructive repair: the quarantined data is not automatically
+	// re-imported. Enable it only when an operator can restore from it or when
+	// the alternative (a runtime that cannot start) is worse.
+	RecoverCorruptedDatabase bool `json:"recoverCorruptedDatabase" yaml:"recoverCorruptedDatabase" mapstructure:"recoverCorruptedDatabase"`
+
+	// CorruptedDatabaseRetention is how long a quarantined database directory is
+	// kept before it is removed during startup.
+	CorruptedDatabaseRetention time.Duration `json:"corruptedDatabaseRetention" yaml:"corruptedDatabaseRetention" mapstructure:"corruptedDatabaseRetention"`
+
+	// BackupDirectory is where periodic consistent backups of the metadata
+	// database are written. An empty value disables periodic backups.
+	BackupDirectory string `json:"backupDirectory" yaml:"backupDirectory" mapstructure:"backupDirectory"`
+
+	// BackupInterval is the delay between periodic metadata backups.
+	BackupInterval time.Duration `json:"backupInterval" yaml:"backupInterval" mapstructure:"backupInterval"`
+
+	// BackupRetention is how long backup files are kept. A backup older than
+	// this is removed by the next backup cycle. Zero disables pruning.
+	BackupRetention time.Duration `json:"backupRetention" yaml:"backupRetention" mapstructure:"backupRetention"`
+
+	// AutoRestoreFromBackup loads the newest valid backup into a database that
+	// had to be quarantined, instead of leaving it empty. It only applies when
+	// RecoverCorruptedDatabase is enabled and BackupDirectory is set.
+	//
+	// This is a recovery aid, not a substitute for an operator: the restored
+	// state is only as new as the newest backup.
+	AutoRestoreFromBackup bool `json:"autoRestoreFromBackup" yaml:"autoRestoreFromBackup" mapstructure:"autoRestoreFromBackup"`
 }
 
 // RetryPolicyConfig configures failed-file retry behavior.
@@ -67,6 +137,26 @@ type VolumeConfig struct {
 	VolumeType    string `json:"volumeType" yaml:"volumeType" mapstructure:"volumeType"`
 	ShardingDepth int    `json:"shardingDepth" yaml:"shardingDepth" mapstructure:"shardingDepth"`
 	EnableFsync   bool   `json:"enableFsync" yaml:"enableFsync" mapstructure:"enableFsync"`
+
+	// HealthCheckCacheTTL caches the volume health probe for this long, so a busy
+	// write path does not perform a probe write per volume per operation.
+	// Zero selects the runtime default (30s); a negative value disables caching.
+	HealthCheckCacheTTL time.Duration `json:"healthCheckCacheTTL" yaml:"healthCheckCacheTTL" mapstructure:"healthCheckCacheTTL"`
+
+	// InitialDelay is how long startup waits before the first health-check retry
+	// for this volume, so a network volume such as a Kubernetes PVC can finish
+	// mounting. A volume that is healthy immediately is never delayed; the wait
+	// only happens before a retry. Zero disables the delay.
+	InitialDelay time.Duration `json:"initialDelay" yaml:"initialDelay" mapstructure:"initialDelay"`
+
+	// HealthCheckDelay is the delay between health-check attempts at startup.
+	// Zero disables the inter-attempt delay.
+	HealthCheckDelay time.Duration `json:"healthCheckDelay" yaml:"healthCheckDelay" mapstructure:"healthCheckDelay"`
+
+	// WarmupOnStartup performs one throwaway write after the volume passed its
+	// startup health checks, so the first real write does not pay for a cold
+	// write path.
+	WarmupOnStartup bool `json:"warmupOnStartup" yaml:"warmupOnStartup" mapstructure:"warmupOnStartup"`
 }
 
 // TenantConfig configures one tenant.
@@ -92,21 +182,263 @@ type FileWatcherConfig struct {
 	MaxFileSizeBytes            int64         `json:"maxFileSizeBytes" yaml:"maxFileSizeBytes" mapstructure:"maxFileSizeBytes"`
 	MinFileAge                  time.Duration `json:"minFileAge" yaml:"minFileAge" mapstructure:"minFileAge"`
 	MaxConcurrentImports        int           `json:"maxConcurrentImports" yaml:"maxConcurrentImports" mapstructure:"maxConcurrentImports"`
+
+	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
+	// AutoCreateTenantDirectories. Zero selects the default (60s).
+	AutoCreateTenantDirectoriesCacheTTL time.Duration `json:"autoCreateTenantDirectoriesCacheTtl" yaml:"autoCreateTenantDirectoriesCacheTtl" mapstructure:"autoCreateTenantDirectoriesCacheTtl"`
+
+	// FileStabilityCheckDelay is the delay before the second stability probe.
+	// Zero selects the default (100ms); a negative value disables the probe.
+	FileStabilityCheckDelay time.Duration `json:"fileStabilityCheckDelay" yaml:"fileStabilityCheckDelay" mapstructure:"fileStabilityCheckDelay"`
+
+	// SkipStabilityCheckAfterAge skips the second stability probe for files at
+	// least this old. Zero selects the default (1m); a negative value always
+	// probes.
+	SkipStabilityCheckAfterAge time.Duration `json:"skipStabilityCheckAfterAge" yaml:"skipStabilityCheckAfterAge" mapstructure:"skipStabilityCheckAfterAge"`
+
+	// DisableImportedFilesPruneThrottle turns off the throttle that limits how
+	// often stale import-history pruning rewrites the history file. The throttle
+	// is enabled by default, so the zero value keeps the default behavior.
+	DisableImportedFilesPruneThrottle bool `json:"disableImportedFilesPruneThrottle" yaml:"disableImportedFilesPruneThrottle" mapstructure:"disableImportedFilesPruneThrottle"`
+
+	// ImportedFilesPruneInterval is the minimum delay between prune runs while
+	// the throttle is enabled. Zero selects the default (5m).
+	ImportedFilesPruneInterval time.Duration `json:"importedFilesPruneInterval" yaml:"importedFilesPruneInterval" mapstructure:"importedFilesPruneInterval"`
+
+	// DisableImportedFilesHistoryFlushDebounce turns off the debounce that
+	// coalesces import-history writes. The debounce is enabled by default, so
+	// the zero value keeps the default behavior.
+	DisableImportedFilesHistoryFlushDebounce bool `json:"disableImportedFilesHistoryFlushDebounce" yaml:"disableImportedFilesHistoryFlushDebounce" mapstructure:"disableImportedFilesHistoryFlushDebounce"`
+
+	// ImportedFilesHistoryFlushInterval is the minimum delay between
+	// import-history persistence writes while the debounce is enabled. Zero
+	// selects the default (2s).
+	ImportedFilesHistoryFlushInterval time.Duration `json:"importedFilesHistoryFlushInterval" yaml:"importedFilesHistoryFlushInterval" mapstructure:"importedFilesHistoryFlushInterval"`
+}
+
+// FileWatcherRootConfig is a template that derives one watcher per tenant
+// directory under RootPath, so a multi-tenant deployment does not have to
+// enumerate every tenant by hand.
+type FileWatcherRootConfig struct {
+	// RootPath is the directory whose immediate subdirectories are tenants.
+	RootPath string `json:"rootPath" yaml:"rootPath" mapstructure:"rootPath"`
+
+	// MultiTenantMode derives one watcher per immediate subdirectory. When
+	// false, RootPath itself becomes a single-tenant watcher.
+	MultiTenantMode bool `json:"multiTenantMode" yaml:"multiTenantMode" mapstructure:"multiTenantMode"`
+
+	// Enabled applies to every derived watcher.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
+
+	// IncludeSubdirectories applies to every derived watcher.
+	IncludeSubdirectories bool `json:"includeSubdirectories" yaml:"includeSubdirectories" mapstructure:"includeSubdirectories"`
+
+	// FilePatterns filters imported files.
+	FilePatterns []string `json:"filePatterns" yaml:"filePatterns" mapstructure:"filePatterns"`
+
+	// PostImportAction is "Delete", "Move", or "Keep".
+	PostImportAction string `json:"postImportAction" yaml:"postImportAction" mapstructure:"postImportAction"`
+
+	// MoveToDirectory is the target directory for PostImportAction "Move".
+	MoveToDirectory string `json:"moveToDirectory" yaml:"moveToDirectory" mapstructure:"moveToDirectory"`
+
+	// PollingInterval is the scan interval for derived watchers.
+	PollingInterval time.Duration `json:"pollingInterval" yaml:"pollingInterval" mapstructure:"pollingInterval"`
+
+	// MaxFileSizeBytes limits the imported file size; 0 means unlimited.
+	MaxFileSizeBytes int64 `json:"maxFileSizeBytes" yaml:"maxFileSizeBytes" mapstructure:"maxFileSizeBytes"`
+
+	// MinFileAge is the minimum file age before import.
+	MinFileAge time.Duration `json:"minFileAge" yaml:"minFileAge" mapstructure:"minFileAge"`
+
+	// MaxConcurrentImports limits concurrent imports per derived watcher.
+	MaxConcurrentImports int `json:"maxConcurrentImports" yaml:"maxConcurrentImports" mapstructure:"maxConcurrentImports"`
+
+	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
+	// AutoCreateTenantDirectories. Zero selects the default (60s).
+	AutoCreateTenantDirectoriesCacheTTL time.Duration `json:"autoCreateTenantDirectoriesCacheTtl" yaml:"autoCreateTenantDirectoriesCacheTtl" mapstructure:"autoCreateTenantDirectoriesCacheTtl"`
+
+	// FileStabilityCheckDelay is the delay before the second stability probe.
+	// Zero selects the default (100ms); a negative value disables the probe.
+	FileStabilityCheckDelay time.Duration `json:"fileStabilityCheckDelay" yaml:"fileStabilityCheckDelay" mapstructure:"fileStabilityCheckDelay"`
+
+	// SkipStabilityCheckAfterAge skips the second stability probe for files at
+	// least this old. Zero selects the default (1m); a negative value always
+	// probes.
+	SkipStabilityCheckAfterAge time.Duration `json:"skipStabilityCheckAfterAge" yaml:"skipStabilityCheckAfterAge" mapstructure:"skipStabilityCheckAfterAge"`
+
+	// DisableImportedFilesPruneThrottle turns off the import-history prune
+	// throttle for every derived watcher. It is enabled by default.
+	DisableImportedFilesPruneThrottle bool `json:"disableImportedFilesPruneThrottle" yaml:"disableImportedFilesPruneThrottle" mapstructure:"disableImportedFilesPruneThrottle"`
+
+	// ImportedFilesPruneInterval is the minimum delay between prune runs while
+	// the throttle is enabled. Zero selects the default (5m).
+	ImportedFilesPruneInterval time.Duration `json:"importedFilesPruneInterval" yaml:"importedFilesPruneInterval" mapstructure:"importedFilesPruneInterval"`
+
+	// DisableImportedFilesHistoryFlushDebounce turns off the import-history
+	// write debounce for every derived watcher. It is enabled by default.
+	DisableImportedFilesHistoryFlushDebounce bool `json:"disableImportedFilesHistoryFlushDebounce" yaml:"disableImportedFilesHistoryFlushDebounce" mapstructure:"disableImportedFilesHistoryFlushDebounce"`
+
+	// ImportedFilesHistoryFlushInterval is the minimum delay between
+	// import-history persistence writes while the debounce is enabled. Zero
+	// selects the default (2s).
+	ImportedFilesHistoryFlushInterval time.Duration `json:"importedFilesHistoryFlushInterval" yaml:"importedFilesHistoryFlushInterval" mapstructure:"importedFilesHistoryFlushInterval"`
+}
+
+// FileWatcherServiceConfig configures the background file watcher service
+// globally, independently of the individual watchers.
+type FileWatcherServiceConfig struct {
+	// Enabled controls whether the background service scans at all. When false,
+	// every watcher is dormant until the service is re-enabled.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
+
+	// DefaultPollingInterval applies when a watcher does not set one.
+	DefaultPollingInterval time.Duration `json:"defaultPollingInterval" yaml:"defaultPollingInterval" mapstructure:"defaultPollingInterval"`
+
+	// MinimumPollingInterval clamps short per-watcher intervals.
+	MinimumPollingInterval time.Duration `json:"minimumPollingInterval" yaml:"minimumPollingInterval" mapstructure:"minimumPollingInterval"`
+
+	// MaximumPollingInterval clamps long per-watcher intervals.
+	MaximumPollingInterval time.Duration `json:"maximumPollingInterval" yaml:"maximumPollingInterval" mapstructure:"maximumPollingInterval"`
+
+	// DisabledCheckInterval is how often a disabled service rechecks whether it
+	// should resume.
+	DisabledCheckInterval time.Duration `json:"disabledCheckInterval" yaml:"disabledCheckInterval" mapstructure:"disabledCheckInterval"`
+
+	// MaxParallelWatcherScans bounds how many watchers one cycle scans in
+	// parallel. Zero selects the runtime default; a negative value means
+	// sequential scanning.
+	MaxParallelWatcherScans int `json:"maxParallelWatcherScans" yaml:"maxParallelWatcherScans" mapstructure:"maxParallelWatcherScans"`
+}
+
+// StatisticsConfig configures in-process runtime statistics.
+//
+// Statistics are disabled by default. When enabled, Venue records bounded
+// windowed counters for the storage, metadata, and watcher paths, and callers
+// can read aggregated snapshots through Venue.Statistics().
+type StatisticsConfig struct {
+	// Enabled turns in-process statistics collection on. When false, recording
+	// costs one call per instrumented operation and allocates nothing.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
+
+	// WindowSize is the aggregation bucket size.
+	WindowSize time.Duration `json:"windowSize" yaml:"windowSize" mapstructure:"windowSize"`
+
+	// Retention is how long in-memory buckets are kept.
+	Retention time.Duration `json:"retention" yaml:"retention" mapstructure:"retention"`
+
+	// MaxSeries bounds the number of retained time-bucket and dimension series
+	// so a high-cardinality workload cannot grow memory without limit.
+	// Valid range: 1024 to 262144.
+	MaxSeries int `json:"maxSeries" yaml:"maxSeries" mapstructure:"maxSeries"`
+
+	// Dimensions selects which low-cardinality dimensions are retained.
+	Dimensions StatisticsDimensionConfig `json:"dimensions" yaml:"dimensions" mapstructure:"dimensions"`
+
+	// Output configures optional periodic log output of a statistics summary.
+	Output StatisticsOutputConfig `json:"output" yaml:"output" mapstructure:"output"`
+}
+
+// StatisticsDimensionConfig selects which statistics dimensions are retained.
+// Retaining tenant_id is disabled by default because it is high-cardinality.
+type StatisticsDimensionConfig struct {
+	// TenantID retains the tenant_id dimension.
+	TenantID bool `json:"tenantId" yaml:"tenantId" mapstructure:"tenantId"`
+
+	// VolumeID retains the volume_id dimension.
+	VolumeID bool `json:"volumeId" yaml:"volumeId" mapstructure:"volumeId"`
+
+	// WatcherID retains the watcher_id dimension.
+	WatcherID bool `json:"watcherId" yaml:"watcherId" mapstructure:"watcherId"`
+
+	// Operation retains the operation dimension.
+	Operation bool `json:"operation" yaml:"operation" mapstructure:"operation"`
+}
+
+// StatisticsOutputConfig configures periodic log output of statistics.
+type StatisticsOutputConfig struct {
+	// Enabled turns periodic output on. It requires Statistics.Enabled.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
+
+	// Sink is the output kind. Only "Logging" is supported.
+	Sink string `json:"sink" yaml:"sink" mapstructure:"sink"`
+
+	// Interval is the delay between summaries.
+	Interval time.Duration `json:"interval" yaml:"interval" mapstructure:"interval"`
+
+	// QueryWindow is the time range included in each summary.
+	QueryWindow time.Duration `json:"queryWindow" yaml:"queryWindow" mapstructure:"queryWindow"`
+
+	// IncludeEmptySnapshots logs a summary even when every counter is zero.
+	IncludeEmptySnapshots bool `json:"includeEmptySnapshots" yaml:"includeEmptySnapshots" mapstructure:"includeEmptySnapshots"`
 }
 
 // CleanupConfig configures background cleanup.
 type CleanupConfig struct {
-	CleanupInterval                time.Duration `json:"cleanupInterval" yaml:"cleanupInterval" mapstructure:"cleanupInterval"`
-	InitialDelay                   time.Duration `json:"initialDelay" yaml:"initialDelay" mapstructure:"initialDelay"`
-	CleanupEmptyDirectories        bool          `json:"cleanupEmptyDirectories" yaml:"cleanupEmptyDirectories" mapstructure:"cleanupEmptyDirectories"`
-	CleanupTimedOutFiles           bool          `json:"cleanupTimedOutFiles" yaml:"cleanupTimedOutFiles" mapstructure:"cleanupTimedOutFiles"`
-	ProcessingTimeout              time.Duration `json:"processingTimeout" yaml:"processingTimeout" mapstructure:"processingTimeout"`
-	CleanupPermanentlyFailedFiles  bool          `json:"cleanupPermanentlyFailedFiles" yaml:"cleanupPermanentlyFailedFiles" mapstructure:"cleanupPermanentlyFailedFiles"`
-	FailedFileRetentionPeriod      time.Duration `json:"failedFileRetentionPeriod" yaml:"failedFileRetentionPeriod" mapstructure:"failedFileRetentionPeriod"`
-	CleanupCompletedRecords        bool          `json:"cleanupCompletedRecords" yaml:"cleanupCompletedRecords" mapstructure:"cleanupCompletedRecords"`
-	CompletedRecordRetentionPeriod time.Duration `json:"completedRecordRetentionPeriod" yaml:"completedRecordRetentionPeriod" mapstructure:"completedRecordRetentionPeriod"`
-	OptimizeDatabases              bool          `json:"optimizeDatabases" yaml:"optimizeDatabases" mapstructure:"optimizeDatabases"`
-	DatabaseOptimizationInterval   time.Duration `json:"databaseOptimizationInterval" yaml:"databaseOptimizationInterval" mapstructure:"databaseOptimizationInterval"`
+	CleanupInterval                time.Duration         `json:"cleanupInterval" yaml:"cleanupInterval" mapstructure:"cleanupInterval"`
+	InitialDelay                   time.Duration         `json:"initialDelay" yaml:"initialDelay" mapstructure:"initialDelay"`
+	CleanupEmptyDirectories        bool                  `json:"cleanupEmptyDirectories" yaml:"cleanupEmptyDirectories" mapstructure:"cleanupEmptyDirectories"`
+	CleanupTimedOutFiles           bool                  `json:"cleanupTimedOutFiles" yaml:"cleanupTimedOutFiles" mapstructure:"cleanupTimedOutFiles"`
+	ProcessingTimeout              time.Duration         `json:"processingTimeout" yaml:"processingTimeout" mapstructure:"processingTimeout"`
+	RecoverTimedOutOnEmptyQueue    bool                  `json:"recoverTimedOutOnEmptyQueue" yaml:"recoverTimedOutOnEmptyQueue" mapstructure:"recoverTimedOutOnEmptyQueue"`
+	TimedOutReclaimCooldown        time.Duration         `json:"timedOutReclaimCooldown" yaml:"timedOutReclaimCooldown" mapstructure:"timedOutReclaimCooldown"`
+	CleanupPermanentlyFailedFiles  bool                  `json:"cleanupPermanentlyFailedFiles" yaml:"cleanupPermanentlyFailedFiles" mapstructure:"cleanupPermanentlyFailedFiles"`
+	PermanentlyFailedDisposition   string                `json:"permanentlyFailedDisposition" yaml:"permanentlyFailedDisposition" mapstructure:"permanentlyFailedDisposition"`
+	DeadLetter                     DeadLetterConfig      `json:"deadLetter" yaml:"deadLetter" mapstructure:"deadLetter"`
+	FailedFileRetentionPeriod      time.Duration         `json:"failedFileRetentionPeriod" yaml:"failedFileRetentionPeriod" mapstructure:"failedFileRetentionPeriod"`
+	CleanupCompletedRecords        bool                  `json:"cleanupCompletedRecords" yaml:"cleanupCompletedRecords" mapstructure:"cleanupCompletedRecords"`
+	CompletedRecordRetentionPeriod time.Duration         `json:"completedRecordRetentionPeriod" yaml:"completedRecordRetentionPeriod" mapstructure:"completedRecordRetentionPeriod"`
+	CleanupOrphanedMetadata        bool                  `json:"cleanupOrphanedMetadata" yaml:"cleanupOrphanedMetadata" mapstructure:"cleanupOrphanedMetadata"`
+	CleanupJunkFiles               bool                  `json:"cleanupJunkFiles" yaml:"cleanupJunkFiles" mapstructure:"cleanupJunkFiles"`
+	JunkFileCleanupInterval        time.Duration         `json:"junkFileCleanupInterval" yaml:"junkFileCleanupInterval" mapstructure:"junkFileCleanupInterval"`
+	CleanupInvalidDatabaseBackups  bool                  `json:"cleanupInvalidDatabaseBackups" yaml:"cleanupInvalidDatabaseBackups" mapstructure:"cleanupInvalidDatabaseBackups"`
+	RetiredVolumes                 []RetiredVolumeConfig `json:"retiredVolumes" yaml:"retiredVolumes" mapstructure:"retiredVolumes"`
+	OptimizeDatabases              bool                  `json:"optimizeDatabases" yaml:"optimizeDatabases" mapstructure:"optimizeDatabases"`
+	DatabaseOptimizationInterval   time.Duration         `json:"databaseOptimizationInterval" yaml:"databaseOptimizationInterval" mapstructure:"databaseOptimizationInterval"`
+
+	// EmptyQueueReclaimBatchSize bounds how many timed-out files are reclaimed
+	// synchronously when a claim finds an empty queue. Zero selects the runtime
+	// default (32); a negative value disables immediate reclaim.
+	EmptyQueueReclaimBatchSize int `json:"emptyQueueReclaimBatchSize" yaml:"emptyQueueReclaimBatchSize" mapstructure:"emptyQueueReclaimBatchSize"`
+
+	// EnableBackgroundTimedOutReclaim lets a successful claim opportunistically
+	// reclaim timed-out files in the background, so timed-out records are
+	// recovered even when cleanup is disabled or its interval is long.
+	EnableBackgroundTimedOutReclaim bool `json:"enableBackgroundTimedOutReclaim" yaml:"enableBackgroundTimedOutReclaim" mapstructure:"enableBackgroundTimedOutReclaim"`
+
+	// BackgroundTimedOutReclaimBatchSize bounds how many timed-out files one
+	// background reclaim pass recovers. Zero selects the runtime default (8); a
+	// negative value disables the background pass.
+	BackgroundTimedOutReclaimBatchSize int `json:"backgroundTimedOutReclaimBatchSize" yaml:"backgroundTimedOutReclaimBatchSize" mapstructure:"backgroundTimedOutReclaimBatchSize"`
+}
+
+// DeadLetterConfig configures where permanently failed payloads are moved when// PermanentlyFailedDisposition is "MoveToDeadLetter".
+//
+// Relative paths are resolved under the owning volume's mount path, so a
+// dead-letter area never leaves the volume that holds the payload.
+type DeadLetterConfig struct {
+	// RootPath is the dead-letter root, relative to the volume mount path.
+	RootPath string `json:"rootPath" yaml:"rootPath" mapstructure:"rootPath"`
+
+	// IncludeTenantInPath inserts the tenant ID below the root.
+	IncludeTenantInPath bool `json:"includeTenantInPath" yaml:"includeTenantInPath" mapstructure:"includeTenantInPath"`
+
+	// IncludeDatePartition inserts a yyyyMMdd partition directory.
+	IncludeDatePartition bool `json:"includeDatePartition" yaml:"includeDatePartition" mapstructure:"includeDatePartition"`
+
+	// ShardingDepth is the number of two-character hexadecimal shard segments
+	// inserted below the (optional) partition directory.
+	ShardingDepth int `json:"shardingDepth" yaml:"shardingDepth" mapstructure:"shardingDepth"`
+}
+
+// RetiredVolumeConfig declares a storage volume that was intentionally retired
+// and how cleanup should treat metadata that still references it.
+type RetiredVolumeConfig struct {
+	// VolumeID is the retired volume identifier.
+	VolumeID string `json:"volumeId" yaml:"volumeId" mapstructure:"volumeId"`
+
+	// Disposition is "Keep" (default) or "PurgeMetadataOnly".
+	Disposition string `json:"disposition" yaml:"disposition" mapstructure:"disposition"`
 }
 
 // DatabaseHealthCheckConfig configures startup and periodic database checks.
@@ -116,6 +448,26 @@ type DatabaseHealthCheckConfig struct {
 	RetryDelay            time.Duration `json:"retryDelay" yaml:"retryDelay" mapstructure:"retryDelay"`
 	CheckOnStartupOnly    bool          `json:"checkOnStartupOnly" yaml:"checkOnStartupOnly" mapstructure:"checkOnStartupOnly"`
 	PeriodicCheckInterval time.Duration `json:"periodicCheckInterval" yaml:"periodicCheckInterval" mapstructure:"periodicCheckInterval"`
+}
+
+// OrphanRecoveryConfig configures the optional orphan-file recovery service.
+// Recovery scans storage volumes for physical files that have no metadata
+// record (for example after a crash between the physical write and the metadata
+// commit) and re-registers them as Pending so they re-enter the queue.
+//
+// Recovery is disabled by default: it must be enabled explicitly.
+type OrphanRecoveryConfig struct {
+	// Enabled starts the orphan recovery service.
+	Enabled bool `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
+
+	// RunOnStartup runs one recovery scan after InitialDelay during startup.
+	RunOnStartup bool `json:"runOnStartup" yaml:"runOnStartup" mapstructure:"runOnStartup"`
+
+	// RecoveryInterval is the delay between periodic recovery scans.
+	RecoveryInterval time.Duration `json:"recoveryInterval" yaml:"recoveryInterval" mapstructure:"recoveryInterval"`
+
+	// InitialDelay delays the first scan so storage volumes can finish mounting.
+	InitialDelay time.Duration `json:"initialDelay" yaml:"initialDelay" mapstructure:"initialDelay"`
 }
 
 // New returns a Config initialized with Venue defaults.
@@ -148,26 +500,67 @@ func DefaultConfig() *Config {
 			MemTableSize:     32,
 			ValueLogFileSize: 64,
 			BlockCacheSize:   64,
+			// Destructive repair stays off unless an operator opts in.
+			RecoverCorruptedDatabase:   false,
+			CorruptedDatabaseRetention: 72 * time.Hour,
+			// Consistent metadata backups are opt-in: they require a directory
+			// the operator owns.
+			BackupDirectory:       "",
+			BackupInterval:        time.Hour,
+			BackupRetention:       7 * 24 * time.Hour,
+			AutoRestoreFromBackup: false,
 		},
 		Volumes: []VolumeConfig{{
 			VolumeID: "default-volume", MountPath: "./venue-storage/default",
 			VolumeType: "LocalFileSystem", ShardingDepth: 2, EnableFsync: true,
+			InitialDelay: 2 * time.Second, HealthCheckDelay: 500 * time.Millisecond,
 		}},
-		Tenants:                 []TenantConfig{},
-		FileWatchers:            []FileWatcherConfig{},
+		Tenants:          []TenantConfig{},
+		FileWatchers:     []FileWatcherConfig{},
+		FileWatcherRoots: []FileWatcherRootConfig{},
+		FileWatcherService: FileWatcherServiceConfig{
+			Enabled:                 true,
+			DefaultPollingInterval:  30 * time.Second,
+			MinimumPollingInterval:  5 * time.Second,
+			MaximumPollingInterval:  time.Hour,
+			DisabledCheckInterval:   time.Minute,
+			MaxParallelWatcherScans: 4,
+		},
 		EnableBackgroundCleanup: true,
 		Cleanup: CleanupConfig{
-			CleanupInterval:                time.Hour,
-			InitialDelay:                   time.Minute,
-			CleanupEmptyDirectories:        true,
-			CleanupTimedOutFiles:           true,
-			ProcessingTimeout:              30 * time.Minute,
-			CleanupPermanentlyFailedFiles:  true,
+			CleanupInterval:               time.Hour,
+			InitialDelay:                  time.Minute,
+			CleanupEmptyDirectories:       true,
+			CleanupTimedOutFiles:          true,
+			ProcessingTimeout:             30 * time.Minute,
+			RecoverTimedOutOnEmptyQueue:   true,
+			TimedOutReclaimCooldown:       30 * time.Second,
+			CleanupPermanentlyFailedFiles: true,
+			PermanentlyFailedDisposition:  "MoveToDeadLetter",
+			DeadLetter: DeadLetterConfig{
+				RootPath:             ".deadletter",
+				IncludeTenantInPath:  true,
+				IncludeDatePartition: true,
+				ShardingDepth:        2,
+			},
 			FailedFileRetentionPeriod:      3 * 24 * time.Hour,
 			CleanupCompletedRecords:        true,
 			CompletedRecordRetentionPeriod: 0,
-			OptimizeDatabases:              true,
-			DatabaseOptimizationInterval:   24 * time.Hour,
+			// Opt-in: the orphaned-metadata sweep performs one file-existence
+			// check per tracked record.
+			CleanupOrphanedMetadata:       false,
+			CleanupJunkFiles:              true,
+			JunkFileCleanupInterval:       20 * time.Minute,
+			CleanupInvalidDatabaseBackups: true,
+			RetiredVolumes:                []RetiredVolumeConfig{},
+			OptimizeDatabases:             true,
+			DatabaseOptimizationInterval:  24 * time.Hour,
+			// Locus bounds both the immediate and the background reclaim passes;
+			// the background pass is what recovers timed-out records when the
+			// cleanup interval is long or cleanup is disabled.
+			EmptyQueueReclaimBatchSize:         32,
+			EnableBackgroundTimedOutReclaim:    true,
+			BackgroundTimedOutReclaimBatchSize: 8,
 		},
 		DatabaseHealthCheck: DatabaseHealthCheckConfig{
 			InitialDelay:          2 * time.Second,
@@ -175,6 +568,33 @@ func DefaultConfig() *Config {
 			RetryDelay:            time.Second,
 			CheckOnStartupOnly:    true,
 			PeriodicCheckInterval: time.Hour,
+		},
+		OrphanRecovery: OrphanRecoveryConfig{
+			Enabled:          false,
+			RunOnStartup:     false,
+			RecoveryInterval: 6 * time.Hour,
+			InitialDelay:     10 * time.Second,
+		},
+		Statistics: StatisticsConfig{
+			// Statistics stay off unless a caller opts in.
+			Enabled:    false,
+			WindowSize: 5 * time.Minute,
+			Retention:  time.Hour,
+			MaxSeries:  defaultStatisticsMaxSeries,
+			Dimensions: StatisticsDimensionConfig{
+				// tenant_id is high-cardinality and stays off by default.
+				TenantID:  false,
+				VolumeID:  true,
+				WatcherID: true,
+				Operation: true,
+			},
+			Output: StatisticsOutputConfig{
+				Enabled:               false,
+				Sink:                  "Logging",
+				Interval:              time.Minute,
+				QueryWindow:           15 * time.Minute,
+				IncludeEmptySnapshots: false,
+			},
 		},
 	}
 }
@@ -237,11 +657,59 @@ func (c *Config) ApplyDefaults() {
 	if c.Cleanup.ProcessingTimeout == 0 {
 		c.Cleanup.ProcessingTimeout = d.Cleanup.ProcessingTimeout
 	}
+	if c.Cleanup.TimedOutReclaimCooldown == 0 {
+		c.Cleanup.TimedOutReclaimCooldown = d.Cleanup.TimedOutReclaimCooldown
+	}
 	if c.Cleanup.FailedFileRetentionPeriod == 0 {
 		c.Cleanup.FailedFileRetentionPeriod = d.Cleanup.FailedFileRetentionPeriod
 	}
 	if c.Cleanup.DatabaseOptimizationInterval == 0 {
 		c.Cleanup.DatabaseOptimizationInterval = d.Cleanup.DatabaseOptimizationInterval
+	}
+	if c.Cleanup.JunkFileCleanupInterval == 0 {
+		c.Cleanup.JunkFileCleanupInterval = d.Cleanup.JunkFileCleanupInterval
+	}
+	if c.Cleanup.EmptyQueueReclaimBatchSize == 0 {
+		c.Cleanup.EmptyQueueReclaimBatchSize = d.Cleanup.EmptyQueueReclaimBatchSize
+	}
+	if c.Cleanup.BackgroundTimedOutReclaimBatchSize == 0 {
+		c.Cleanup.BackgroundTimedOutReclaimBatchSize = d.Cleanup.BackgroundTimedOutReclaimBatchSize
+	}
+	if c.Cleanup.PermanentlyFailedDisposition == "" {
+		c.Cleanup.PermanentlyFailedDisposition = d.Cleanup.PermanentlyFailedDisposition
+	}
+	if c.Cleanup.DeadLetter.RootPath == "" {
+		c.Cleanup.DeadLetter.RootPath = d.Cleanup.DeadLetter.RootPath
+	}
+	if c.Cleanup.DeadLetter.ShardingDepth == 0 {
+		c.Cleanup.DeadLetter.ShardingDepth = d.Cleanup.DeadLetter.ShardingDepth
+	}
+	if c.BadgerDB.CorruptedDatabaseRetention == 0 {
+		c.BadgerDB.CorruptedDatabaseRetention = d.BadgerDB.CorruptedDatabaseRetention
+	}
+	if c.BadgerDB.BackupInterval == 0 {
+		c.BadgerDB.BackupInterval = d.BadgerDB.BackupInterval
+	}
+	if c.BadgerDB.BackupRetention == 0 {
+		c.BadgerDB.BackupRetention = d.BadgerDB.BackupRetention
+	}
+	if c.Statistics.WindowSize == 0 {
+		c.Statistics.WindowSize = d.Statistics.WindowSize
+	}
+	if c.Statistics.Retention == 0 {
+		c.Statistics.Retention = d.Statistics.Retention
+	}
+	if c.Statistics.MaxSeries == 0 {
+		c.Statistics.MaxSeries = d.Statistics.MaxSeries
+	}
+	if c.Statistics.Output.Sink == "" {
+		c.Statistics.Output.Sink = d.Statistics.Output.Sink
+	}
+	if c.Statistics.Output.Interval == 0 {
+		c.Statistics.Output.Interval = d.Statistics.Output.Interval
+	}
+	if c.Statistics.Output.QueryWindow == 0 {
+		c.Statistics.Output.QueryWindow = d.Statistics.Output.QueryWindow
 	}
 	if c.DatabaseHealthCheck.InitialDelay == 0 {
 		c.DatabaseHealthCheck.InitialDelay = d.DatabaseHealthCheck.InitialDelay
@@ -255,9 +723,55 @@ func (c *Config) ApplyDefaults() {
 	if c.DatabaseHealthCheck.PeriodicCheckInterval == 0 {
 		c.DatabaseHealthCheck.PeriodicCheckInterval = d.DatabaseHealthCheck.PeriodicCheckInterval
 	}
+	if c.OrphanRecovery.RecoveryInterval == 0 {
+		c.OrphanRecovery.RecoveryInterval = d.OrphanRecovery.RecoveryInterval
+	}
+	if c.OrphanRecovery.InitialDelay == 0 {
+		c.OrphanRecovery.InitialDelay = d.OrphanRecovery.InitialDelay
+	}
+	if c.FileWatcherService.DefaultPollingInterval == 0 {
+		c.FileWatcherService.DefaultPollingInterval = d.FileWatcherService.DefaultPollingInterval
+	}
+	if c.FileWatcherService.MinimumPollingInterval == 0 {
+		c.FileWatcherService.MinimumPollingInterval = d.FileWatcherService.MinimumPollingInterval
+	}
+	if c.FileWatcherService.MaximumPollingInterval == 0 {
+		c.FileWatcherService.MaximumPollingInterval = d.FileWatcherService.MaximumPollingInterval
+	}
+	if c.FileWatcherService.DisabledCheckInterval == 0 {
+		c.FileWatcherService.DisabledCheckInterval = d.FileWatcherService.DisabledCheckInterval
+	}
+	if c.FileWatcherService.MaxParallelWatcherScans == 0 {
+		c.FileWatcherService.MaxParallelWatcherScans = d.FileWatcherService.MaxParallelWatcherScans
+	}
+	for i := range c.FileWatcherRoots {
+		root := &c.FileWatcherRoots[i]
+		if root.PollingInterval == 0 {
+			root.PollingInterval = 30 * time.Second
+		}
+		if root.MinFileAge == 0 {
+			root.MinFileAge = 5 * time.Second
+		}
+		if root.MaxConcurrentImports == 0 {
+			root.MaxConcurrentImports = 4
+		}
+		if len(root.FilePatterns) == 0 {
+			root.FilePatterns = []string{"*.*"}
+		}
+		if root.PostImportAction == "" {
+			root.PostImportAction = "Delete"
+		}
+		applyFileWatcherRootAdvancedDefaults(root)
+	}
 	for i := range c.Volumes {
 		if c.Volumes[i].VolumeType == "" {
 			c.Volumes[i].VolumeType = "LocalFileSystem"
+		}
+		if c.Volumes[i].InitialDelay == 0 {
+			c.Volumes[i].InitialDelay = defaultVolumeInitialDelay
+		}
+		if c.Volumes[i].HealthCheckDelay == 0 {
+			c.Volumes[i].HealthCheckDelay = defaultVolumeHealthCheckDelay
 		}
 	}
 	for i := range c.FileWatchers {
@@ -265,7 +779,7 @@ func (c *Config) ApplyDefaults() {
 			c.FileWatchers[i].PollingInterval = 30 * time.Second
 		}
 		if c.FileWatchers[i].MinFileAge == 0 {
-			c.FileWatchers[i].MinFileAge = 3 * time.Second
+			c.FileWatchers[i].MinFileAge = 5 * time.Second
 		}
 		if c.FileWatchers[i].MaxConcurrentImports == 0 {
 			c.FileWatchers[i].MaxConcurrentImports = 4
@@ -276,6 +790,48 @@ func (c *Config) ApplyDefaults() {
 		if c.FileWatchers[i].PostImportAction == "" {
 			c.FileWatchers[i].PostImportAction = "Delete"
 		}
+		applyFileWatcherAdvancedDefaults(&c.FileWatchers[i])
+	}
+}
+
+// applyFileWatcherAdvancedDefaults fills the zero-valued advanced watcher
+// settings. A negative duration is preserved: it selects the documented
+// "disabled" behavior rather than the default.
+func applyFileWatcherAdvancedDefaults(watcher *FileWatcherConfig) {
+	if watcher.AutoCreateTenantDirectoriesCacheTTL == 0 {
+		watcher.AutoCreateTenantDirectoriesCacheTTL = defaultAutoCreateTenantDirectoriesCacheTTL
+	}
+	if watcher.FileStabilityCheckDelay == 0 {
+		watcher.FileStabilityCheckDelay = defaultFileStabilityCheckDelay
+	}
+	if watcher.SkipStabilityCheckAfterAge == 0 {
+		watcher.SkipStabilityCheckAfterAge = defaultSkipStabilityCheckAfterAge
+	}
+	if watcher.ImportedFilesPruneInterval == 0 {
+		watcher.ImportedFilesPruneInterval = defaultImportedFilesPruneInterval
+	}
+	if watcher.ImportedFilesHistoryFlushInterval == 0 {
+		watcher.ImportedFilesHistoryFlushInterval = defaultImportedFilesHistoryFlushInterval
+	}
+}
+
+// applyFileWatcherRootAdvancedDefaults fills the zero-valued advanced settings of
+// a root template, using the same defaults as a single watcher.
+func applyFileWatcherRootAdvancedDefaults(root *FileWatcherRootConfig) {
+	if root.AutoCreateTenantDirectoriesCacheTTL == 0 {
+		root.AutoCreateTenantDirectoriesCacheTTL = defaultAutoCreateTenantDirectoriesCacheTTL
+	}
+	if root.FileStabilityCheckDelay == 0 {
+		root.FileStabilityCheckDelay = defaultFileStabilityCheckDelay
+	}
+	if root.SkipStabilityCheckAfterAge == 0 {
+		root.SkipStabilityCheckAfterAge = defaultSkipStabilityCheckAfterAge
+	}
+	if root.ImportedFilesPruneInterval == 0 {
+		root.ImportedFilesPruneInterval = defaultImportedFilesPruneInterval
+	}
+	if root.ImportedFilesHistoryFlushInterval == 0 {
+		root.ImportedFilesHistoryFlushInterval = defaultImportedFilesHistoryFlushInterval
 	}
 }
 
@@ -296,6 +852,34 @@ func (c *Config) Validate() error {
 	if c.DefaultTenantQuota < 0 {
 		return fmt.Errorf("DefaultTenantQuota cannot be negative")
 	}
+	if err := validateRetryPolicy(&c.RetryPolicy); err != nil {
+		return err
+	}
+	if err := validateBadgerDB(&c.BadgerDB); err != nil {
+		return err
+	}
+	if err := validateCaches(&c.TenantManager, &c.Metadata); err != nil {
+		return err
+	}
+	if err := validateCleanup(&c.Cleanup); err != nil {
+		return err
+	}
+	if err := validateOrphanRecovery(&c.OrphanRecovery); err != nil {
+		return err
+	}
+	if err := validateDatabaseHealthCheck(&c.DatabaseHealthCheck); err != nil {
+		return err
+	}
+	if err := validateFileWatcherService(&c.FileWatcherService); err != nil {
+		return err
+	}
+	if err := validateFileWatcherRoots(c.FileWatcherRoots); err != nil {
+		return err
+	}
+	if err := validateStatistics(&c.Statistics); err != nil {
+		return err
+	}
+
 	volumeIDs := make(map[string]bool)
 	for i, volume := range c.Volumes {
 		if volume.VolumeID == "" {
@@ -311,11 +895,23 @@ func (c *Config) Validate() error {
 		if volume.ShardingDepth < 0 || volume.ShardingDepth > 3 {
 			return fmt.Errorf("volume[%d]: ShardingDepth must be between 0 and 3", i)
 		}
+		if volume.InitialDelay < 0 {
+			return fmt.Errorf("volume[%d]: InitialDelay cannot be negative", i)
+		}
+		if volume.HealthCheckDelay < 0 {
+			return fmt.Errorf("volume[%d]: HealthCheckDelay cannot be negative", i)
+		}
 	}
+
 	tenantIDs := make(map[string]bool)
 	for i, tenant := range c.Tenants {
 		if tenant.TenantID == "" {
 			return fmt.Errorf("tenant[%d]: TenantID is required", i)
+		}
+		// Tenant IDs become path segments for tenant metadata and physical
+		// storage, so they must be validated before runtime construction.
+		if err := core.ValidateTenantID(tenant.TenantID); err != nil {
+			return fmt.Errorf("tenant[%d]: %w", i, err)
 		}
 		if tenantIDs[tenant.TenantID] {
 			return fmt.Errorf("tenant[%d]: duplicate TenantID: %s", i, tenant.TenantID)
@@ -325,6 +921,7 @@ func (c *Config) Validate() error {
 		}
 		tenantIDs[tenant.TenantID] = true
 	}
+
 	watcherIDs := make(map[string]bool)
 	for i, watcher := range c.FileWatchers {
 		if watcher.WatcherID == "" {
@@ -340,11 +937,331 @@ func (c *Config) Validate() error {
 		if !watcher.MultiTenantMode && watcher.TenantID == "" {
 			return fmt.Errorf("fileWatcher[%d]: TenantID is required when MultiTenantMode is false", i)
 		}
+		if watcher.MultiTenantMode && watcher.TenantID != "" {
+			return fmt.Errorf("fileWatcher[%d]: TenantID must be empty when MultiTenantMode is true", i)
+		}
+		if !watcher.MultiTenantMode {
+			if err := core.ValidateTenantID(watcher.TenantID); err != nil {
+				return fmt.Errorf("fileWatcher[%d]: %w", i, err)
+			}
+		}
 		if watcher.PostImportAction != "Delete" && watcher.PostImportAction != "Move" && watcher.PostImportAction != "Keep" {
 			return fmt.Errorf("fileWatcher[%d]: PostImportAction must be 'Delete', 'Move', or 'Keep'", i)
 		}
 		if watcher.PostImportAction == "Move" && watcher.MoveToDirectory == "" {
 			return fmt.Errorf("fileWatcher[%d]: MoveToDirectory is required when PostImportAction is 'Move'", i)
+		}
+		if watcher.MaxConcurrentImports < 0 {
+			return fmt.Errorf("fileWatcher[%d]: MaxConcurrentImports cannot be negative", i)
+		}
+		if watcher.MinFileAge < 0 {
+			return fmt.Errorf("fileWatcher[%d]: MinFileAge cannot be negative", i)
+		}
+		if watcher.MaxFileSizeBytes < 0 {
+			return fmt.Errorf("fileWatcher[%d]: MaxFileSizeBytes cannot be negative", i)
+		}
+		if watcher.PollingInterval < 0 {
+			return fmt.Errorf("fileWatcher[%d]: PollingInterval cannot be negative", i)
+		}
+		if err := validateWatcherAdvancedSettings(
+			"fileWatcher["+fmt.Sprint(i)+"]",
+			watcher.AutoCreateTenantDirectoriesCacheTTL,
+			watcher.ImportedFilesPruneInterval,
+			watcher.ImportedFilesHistoryFlushInterval,
+		); err != nil {
+			return err
+		}
+		for patternIndex, pattern := range watcher.FilePatterns {
+			if pattern == "" || pattern != strings.TrimSpace(pattern) {
+				return fmt.Errorf("fileWatcher[%d]: FilePatterns[%d] must be a non-blank pattern", i, patternIndex)
+			}
+			if _, err := filepath.Match(pattern, "probe"); err != nil {
+				return fmt.Errorf("fileWatcher[%d]: FilePatterns[%d] is not a valid pattern: %w", i, patternIndex, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRetryPolicy(policy *RetryPolicyConfig) error {
+	if policy.MaxRetryCount < 0 {
+		return fmt.Errorf("RetryPolicy.MaxRetryCount cannot be negative")
+	}
+	if policy.InitialRetryDelay < 0 {
+		return fmt.Errorf("RetryPolicy.InitialRetryDelay cannot be negative")
+	}
+	if policy.MaxRetryDelay < 0 {
+		return fmt.Errorf("RetryPolicy.MaxRetryDelay cannot be negative")
+	}
+	return nil
+}
+
+func validateBadgerDB(badger *BadgerDBConfig) error {
+	if badger.GCInterval < 0 {
+		return fmt.Errorf("BadgerDB.GCInterval cannot be negative")
+	}
+	if badger.GCDiscardRatio < 0 || badger.GCDiscardRatio >= 1 {
+		return fmt.Errorf("BadgerDB.GCDiscardRatio must be greater than or equal to 0 and less than 1")
+	}
+	if badger.MemTableSize < 0 {
+		return fmt.Errorf("BadgerDB.MemTableSize cannot be negative")
+	}
+	if badger.ValueLogFileSize < 0 {
+		return fmt.Errorf("BadgerDB.ValueLogFileSize cannot be negative")
+	}
+	if badger.BlockCacheSize < 0 {
+		return fmt.Errorf("BadgerDB.BlockCacheSize cannot be negative")
+	}
+	if badger.CorruptedDatabaseRetention < 0 {
+		return fmt.Errorf("BadgerDB.CorruptedDatabaseRetention cannot be negative")
+	}
+	if badger.BackupInterval < 0 {
+		return fmt.Errorf("BadgerDB.BackupInterval cannot be negative")
+	}
+	if badger.BackupRetention < 0 {
+		return fmt.Errorf("BadgerDB.BackupRetention cannot be negative")
+	}
+	if badger.AutoRestoreFromBackup && badger.BackupDirectory == "" {
+		return fmt.Errorf("BadgerDB.AutoRestoreFromBackup requires BadgerDB.BackupDirectory")
+	}
+	return nil
+}
+
+// validateStatistics mirrors the in-memory recorder's own limits so an invalid
+// configuration fails at construction rather than at first record.
+func validateStatistics(statistics *StatisticsConfig) error {
+	if statistics.WindowSize < 0 {
+		return fmt.Errorf("Statistics.WindowSize cannot be negative")
+	}
+	if statistics.Retention < 0 {
+		return fmt.Errorf("Statistics.Retention cannot be negative")
+	}
+	if statistics.WindowSize > 0 && statistics.Retention > 0 && statistics.Retention < statistics.WindowSize {
+		return fmt.Errorf("Statistics.Retention must be greater than or equal to Statistics.WindowSize")
+	}
+	if statistics.MaxSeries < 0 {
+		return fmt.Errorf("Statistics.MaxSeries cannot be negative")
+	}
+	// A zero value means "use the default", which ApplyDefaults fills in.
+	if statistics.MaxSeries > 0 && (statistics.MaxSeries < minStatisticsMaxSeries || statistics.MaxSeries > maxStatisticsMaxSeries) {
+		return fmt.Errorf(
+			"Statistics.MaxSeries must be between %d and %d",
+			minStatisticsMaxSeries,
+			maxStatisticsMaxSeries,
+		)
+	}
+	if statistics.Output.Sink != "" && !strings.EqualFold(statistics.Output.Sink, "Logging") {
+		return fmt.Errorf("Statistics.Output.Sink must be 'Logging'")
+	}
+	if statistics.Output.Interval < 0 {
+		return fmt.Errorf("Statistics.Output.Interval cannot be negative")
+	}
+	if statistics.Output.QueryWindow < 0 {
+		return fmt.Errorf("Statistics.Output.QueryWindow cannot be negative")
+	}
+	if statistics.Output.Enabled && !statistics.Enabled {
+		return fmt.Errorf("Statistics.Output.Enabled requires Statistics.Enabled")
+	}
+	return nil
+}
+
+func validateCaches(tenantManager *TenantManagerConfig, metadata *MetadataConfig) error {
+	if tenantManager.CacheTTL < 0 {
+		return fmt.Errorf("TenantManager.CacheTTL cannot be negative")
+	}
+	if metadata.CacheTTL < 0 {
+		return fmt.Errorf("Metadata.CacheTTL cannot be negative")
+	}
+	if metadata.MaxCacheEntries < 0 {
+		return fmt.Errorf("Metadata.MaxCacheEntries cannot be negative")
+	}
+	return nil
+}
+
+func validateCleanup(cleanup *CleanupConfig) error {
+	if cleanup.CleanupInterval < 0 {
+		return fmt.Errorf("Cleanup.CleanupInterval cannot be negative")
+	}
+	if cleanup.InitialDelay < 0 {
+		return fmt.Errorf("Cleanup.InitialDelay cannot be negative")
+	}
+	if cleanup.ProcessingTimeout < 0 {
+		return fmt.Errorf("Cleanup.ProcessingTimeout cannot be negative")
+	}
+	if cleanup.TimedOutReclaimCooldown < 0 {
+		return fmt.Errorf("Cleanup.TimedOutReclaimCooldown cannot be negative")
+	}
+	if cleanup.FailedFileRetentionPeriod < 0 {
+		return fmt.Errorf("Cleanup.FailedFileRetentionPeriod cannot be negative")
+	}
+	if cleanup.CompletedRecordRetentionPeriod < 0 {
+		return fmt.Errorf("Cleanup.CompletedRecordRetentionPeriod cannot be negative")
+	}
+	if cleanup.DatabaseOptimizationInterval < 0 {
+		return fmt.Errorf("Cleanup.DatabaseOptimizationInterval cannot be negative")
+	}
+	if cleanup.JunkFileCleanupInterval < 0 {
+		return fmt.Errorf("Cleanup.JunkFileCleanupInterval cannot be negative")
+	}
+	if _, err := core.ParsePermanentlyFailedDisposition(cleanup.PermanentlyFailedDisposition); err != nil {
+		return fmt.Errorf("Cleanup.PermanentlyFailedDisposition: %w", err)
+	}
+	if err := validateRetiredVolumes(cleanup.RetiredVolumes); err != nil {
+		return err
+	}
+	return validateDeadLetter(&cleanup.DeadLetter)
+}
+
+// validateDeadLetter ensures the dead-letter area stays inside a volume root and
+// describes a usable layout.
+func validateDeadLetter(deadLetter *DeadLetterConfig) error {
+	if deadLetter.RootPath == "" {
+		return fmt.Errorf("Cleanup.DeadLetter.RootPath is required")
+	}
+	if filepath.IsAbs(deadLetter.RootPath) || filepath.VolumeName(deadLetter.RootPath) != "" {
+		return fmt.Errorf("Cleanup.DeadLetter.RootPath must be relative to the volume mount path")
+	}
+	for _, segment := range strings.FieldsFunc(filepath.ToSlash(deadLetter.RootPath), func(r rune) bool { return r == '/' }) {
+		if segment == ".." {
+			return fmt.Errorf("Cleanup.DeadLetter.RootPath must not contain %q segments", "..")
+		}
+	}
+	if deadLetter.ShardingDepth < 0 || deadLetter.ShardingDepth > 3 {
+		return fmt.Errorf("Cleanup.DeadLetter.ShardingDepth must be between 0 and 3")
+	}
+	return nil
+}
+
+func validateRetiredVolumes(volumes []RetiredVolumeConfig) error {
+	seen := make(map[string]bool, len(volumes))
+	for i, volume := range volumes {
+		if volume.VolumeID == "" {
+			return fmt.Errorf("retiredVolumes[%d]: VolumeID is required", i)
+		}
+		if seen[volume.VolumeID] {
+			return fmt.Errorf("retiredVolumes[%d]: duplicate VolumeID: %s", i, volume.VolumeID)
+		}
+		seen[volume.VolumeID] = true
+		if _, err := core.ParseRetiredVolumeDisposition(volume.Disposition); err != nil {
+			return fmt.Errorf("retiredVolumes[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func validateOrphanRecovery(recovery *OrphanRecoveryConfig) error {
+	if recovery.RecoveryInterval < 0 {
+		return fmt.Errorf("OrphanRecovery.RecoveryInterval cannot be negative")
+	}
+	if recovery.InitialDelay < 0 {
+		return fmt.Errorf("OrphanRecovery.InitialDelay cannot be negative")
+	}
+	return nil
+}
+
+func validateDatabaseHealthCheck(check *DatabaseHealthCheckConfig) error {
+	if check.InitialDelay < 0 {
+		return fmt.Errorf("DatabaseHealthCheck.InitialDelay cannot be negative")
+	}
+	if check.MaxRetries < 0 {
+		return fmt.Errorf("DatabaseHealthCheck.MaxRetries cannot be negative")
+	}
+	if check.RetryDelay < 0 {
+		return fmt.Errorf("DatabaseHealthCheck.RetryDelay cannot be negative")
+	}
+	if check.PeriodicCheckInterval < 0 {
+		return fmt.Errorf("DatabaseHealthCheck.PeriodicCheckInterval cannot be negative")
+	}
+	return nil
+}
+
+// validateWatcherAdvancedSettings rejects negative values for the advanced
+// watcher settings whose zero value means "use the default". The two stability
+// delays are excluded: a negative value there means "disable the extra probe".
+func validateWatcherAdvancedSettings(label string, cacheTTL, pruneInterval, flushInterval time.Duration) error {
+	if cacheTTL < 0 {
+		return fmt.Errorf("%s: AutoCreateTenantDirectoriesCacheTTL cannot be negative", label)
+	}
+	if pruneInterval < 0 {
+		return fmt.Errorf("%s: ImportedFilesPruneInterval cannot be negative", label)
+	}
+	if flushInterval < 0 {
+		return fmt.Errorf("%s: ImportedFilesHistoryFlushInterval cannot be negative", label)
+	}
+	return nil
+}
+
+func validateFileWatcherService(service *FileWatcherServiceConfig) error {
+	if service.DefaultPollingInterval < 0 {
+		return fmt.Errorf("FileWatcherService.DefaultPollingInterval cannot be negative")
+	}
+	if service.MinimumPollingInterval < 0 {
+		return fmt.Errorf("FileWatcherService.MinimumPollingInterval cannot be negative")
+	}
+	if service.MaximumPollingInterval < 0 {
+		return fmt.Errorf("FileWatcherService.MaximumPollingInterval cannot be negative")
+	}
+	if service.MinimumPollingInterval > 0 && service.MaximumPollingInterval > 0 &&
+		service.MinimumPollingInterval > service.MaximumPollingInterval {
+		return fmt.Errorf("FileWatcherService.MinimumPollingInterval must not exceed MaximumPollingInterval")
+	}
+	if service.DisabledCheckInterval < 0 {
+		return fmt.Errorf("FileWatcherService.DisabledCheckInterval cannot be negative")
+	}
+	if service.MaxParallelWatcherScans < 0 {
+		return fmt.Errorf("FileWatcherService.MaxParallelWatcherScans cannot be negative")
+	}
+	return nil
+}
+
+func validateFileWatcherRoots(roots []FileWatcherRootConfig) error {
+	seen := make(map[string]bool, len(roots))
+	for i, root := range roots {
+		if root.RootPath == "" {
+			return fmt.Errorf("watcherRoots[%d]: RootPath is required", i)
+		}
+		if seen[root.RootPath] {
+			return fmt.Errorf("watcherRoots[%d]: duplicate RootPath: %s", i, root.RootPath)
+		}
+		seen[root.RootPath] = true
+		if !root.MultiTenantMode {
+			// A single-tenant root has no tenant directory to infer a tenant
+			// from, so the runtime cannot generate a usable watcher.
+			return fmt.Errorf("watcherRoots[%d]: MultiTenantMode must be true for a derived watcher", i)
+		}
+		if root.PostImportAction != "Delete" && root.PostImportAction != "Move" && root.PostImportAction != "Keep" {
+			return fmt.Errorf("watcherRoots[%d]: PostImportAction must be 'Delete', 'Move', or 'Keep'", i)
+		}
+		if root.PostImportAction == "Move" && root.MoveToDirectory == "" {
+			return fmt.Errorf("watcherRoots[%d]: MoveToDirectory is required when PostImportAction is 'Move'", i)
+		}
+		if root.MaxConcurrentImports < 0 {
+			return fmt.Errorf("watcherRoots[%d]: MaxConcurrentImports cannot be negative", i)
+		}
+		if root.MinFileAge < 0 {
+			return fmt.Errorf("watcherRoots[%d]: MinFileAge cannot be negative", i)
+		}
+		if root.MaxFileSizeBytes < 0 {
+			return fmt.Errorf("watcherRoots[%d]: MaxFileSizeBytes cannot be negative", i)
+		}
+		if root.PollingInterval < 0 {
+			return fmt.Errorf("watcherRoots[%d]: PollingInterval cannot be negative", i)
+		}
+		if err := validateWatcherAdvancedSettings(
+			"watcherRoots["+fmt.Sprint(i)+"]",
+			root.AutoCreateTenantDirectoriesCacheTTL,
+			root.ImportedFilesPruneInterval,
+			root.ImportedFilesHistoryFlushInterval,
+		); err != nil {
+			return err
+		}
+		for patternIndex, pattern := range root.FilePatterns {
+			if pattern == "" || pattern != strings.TrimSpace(pattern) {
+				return fmt.Errorf("watcherRoots[%d]: FilePatterns[%d] must be a non-blank pattern", i, patternIndex)
+			}
+			if _, err := filepath.Match(pattern, "probe"); err != nil {
+				return fmt.Errorf("watcherRoots[%d]: FilePatterns[%d] is not a valid pattern: %w", i, patternIndex, err)
+			}
 		}
 	}
 	return nil
@@ -369,6 +1286,11 @@ func (c *Config) Clone() *Config {
 	for i, watcher := range c.FileWatchers {
 		clone.FileWatchers[i] = watcher
 		clone.FileWatchers[i].FilePatterns = append([]string(nil), watcher.FilePatterns...)
+	}
+	clone.FileWatcherRoots = make([]FileWatcherRootConfig, len(c.FileWatcherRoots))
+	for i, root := range c.FileWatcherRoots {
+		clone.FileWatcherRoots[i] = root
+		clone.FileWatcherRoots[i].FilePatterns = append([]string(nil), root.FilePatterns...)
 	}
 	if c.Logging != nil {
 		loggingConfig := *c.Logging

@@ -31,3 +31,10 @@ func (v *LocalFileSystemVolume) AvailableSpace(ctx context.Context) (int64, erro
 	available := int64(stat.Bavail) * int64(stat.Bsize)
 	return available, nil
 }
+
+// isNotSameDeviceErrno reports a platform-specific cross-device status. Unix
+// reports syscall.EXDEV, which the shared cross-device check already recognises,
+// so no extra errno applies here.
+func isNotSameDeviceErrno(error) bool {
+	return false
+}

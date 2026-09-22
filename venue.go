@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"reflect"
 	"sync"
 
 	"github.com/cocosip/venue/config"
@@ -15,7 +17,9 @@ import (
 	"github.com/cocosip/venue/pkg/metadata"
 	"github.com/cocosip/venue/pkg/pool"
 	"github.com/cocosip/venue/pkg/quota"
+	"github.com/cocosip/venue/pkg/recovery"
 	"github.com/cocosip/venue/pkg/scheduler"
+	"github.com/cocosip/venue/pkg/statistics"
 	"github.com/cocosip/venue/pkg/tenant"
 	"github.com/cocosip/venue/pkg/volume"
 	"github.com/cocosip/venue/pkg/watcher"
@@ -30,25 +34,41 @@ type Venue struct {
 	cancel  context.CancelFunc
 	mu      sync.RWMutex
 	running bool
+	closed  bool
 
 	// Core components
-	tenantManager         core.TenantManager
-	metadataRepo          core.MetadataRepository
-	dirQuotaRepo          core.DirectoryQuotaRepository
-	tenantQuotaManager    core.TenantQuotaManager
-	dirQuotaManager       core.DirectoryQuotaManager
-	volumes               map[string]core.StorageVolume
-	fileScheduler         core.FileScheduler
-	storagePool           core.StoragePool
-	cleanupServiceCore    core.CleanupService
-	fileWatcherCore       core.FileWatcher
-	databaseHealthChecker core.DatabaseHealthChecker
+	tenantManager          core.TenantManager
+	metadataRepo           core.MetadataRepository
+	dirQuotaRepo           core.DirectoryQuotaRepository
+	tenantQuotaManager     core.TenantQuotaManager
+	dirQuotaManager        core.DirectoryQuotaManager
+	volumes                map[string]core.StorageVolume
+	fileScheduler          core.FileScheduler
+	storagePool            core.StoragePool
+	cleanupServiceCore     core.CleanupService
+	fileWatcherCore        core.FileWatcher
+	fileWatcherAutoManager core.FileWatcherAutoManager
+	databaseHealthChecker  core.DatabaseHealthChecker
+	orphanRecoveryCore     core.OrphanRecoveryService
 
 	// Background services
 	cleanupService     *cleanup.BackgroundCleanupService
 	fileWatcherService *watcher.BackgroundFileWatcherService
 	healthCheckService *health.DatabaseHealthCheckService
+	orphanRecovery     *recovery.OrphanRecoveryService
+	metadataBackupCore *metadata.BackupService
+
+	// statisticsRecorder is the runtime's recorder: statistics.Noop when
+	// statistics are disabled, so every instrumented call site can forward
+	// unconditionally.
+	statisticsRecorder core.StatisticsRecorder
+	statisticsOutput   *statistics.OutputService
 }
+
+// sharedMetadataTenantID is the logical tenant segment of the shared metadata
+// database directory. Metadata records are keyed by their real tenant, so this
+// segment only names the database, not the data.
+const sharedMetadataTenantID = "shared"
 
 // NewVenue creates a new Venue instance with the given configuration.
 // This is the main entry point for initializing the entire system.
@@ -79,6 +99,9 @@ func NewVenue(cfg *config.Config) (*Venue, error) {
 
 	// Initialize all components
 	if err := v.initialize(); err != nil {
+		// NewVenue owns every resource it opened before the failure; release
+		// them so a failed construction cannot strand a database lock.
+		v.closeRepositories()
 		return nil, fmt.Errorf("failed to initialize venue: %w", err)
 	}
 
@@ -87,9 +110,66 @@ func NewVenue(cfg *config.Config) (*Venue, error) {
 	return v, nil
 }
 
+// initializeStatistics builds the runtime statistics recorder and the optional
+// periodic output service from configuration.
+//
+// Statistics are disabled by default: a disabled configuration installs the noop
+// recorder, so every instrumented call site forwards unconditionally and pays
+// nothing.
+func (v *Venue) initializeStatistics() error {
+	options := statisticsOptions(v.config.Statistics)
+	if !options.Enabled {
+		v.statisticsRecorder = statistics.Noop
+		return nil
+	}
+
+	recorder, err := statistics.NewRecorder(options)
+	if err != nil {
+		return fmt.Errorf("invalid statistics configuration: %w", err)
+	}
+	v.statisticsRecorder = recorder
+
+	if options.Output.Enabled {
+		v.statisticsOutput = statistics.NewOutputService(recorder, options, v.logger)
+	}
+
+	return nil
+}
+
+// statisticsOptions maps the public statistics configuration onto the
+// statistics package options.
+func statisticsOptions(cfg config.StatisticsConfig) statistics.Options {
+	return statistics.Options{
+		Enabled:    cfg.Enabled,
+		WindowSize: cfg.WindowSize,
+		Retention:  cfg.Retention,
+		MaxSeries:  cfg.MaxSeries,
+		Dimensions: statistics.DimensionOptions{
+			TenantID:  cfg.Dimensions.TenantID,
+			VolumeID:  cfg.Dimensions.VolumeID,
+			WatcherID: cfg.Dimensions.WatcherID,
+			Operation: cfg.Dimensions.Operation,
+		},
+		Output: statistics.OutputOptions{
+			Enabled:               cfg.Output.Enabled,
+			Sink:                  cfg.Output.Sink,
+			Interval:              cfg.Output.Interval,
+			QueryWindow:           cfg.Output.QueryWindow,
+			IncludeEmptySnapshots: cfg.Output.IncludeEmptySnapshots,
+		},
+	}
+}
+
 // initialize initializes all components in the correct order using configuration.
 func (v *Venue) initialize() error {
 	ctx := context.Background()
+
+	// 0. Initialize statistics. The recorder exists before every instrumented
+	// component so no operation is recorded into a missing recorder.
+	v.emit(ctx, slog.LevelInfo, "statistics_initializing", "Initializing runtime statistics")
+	if err := v.initializeStatistics(); err != nil {
+		return err
+	}
 
 	// 1. Initialize tenant manager
 	v.emit(ctx, slog.LevelInfo, "tenant_manager_initializing", "Initializing tenant manager")
@@ -98,6 +178,7 @@ func (v *Venue) initialize() error {
 		MetadataPath:     v.config.TenantManager.MetadataPath,
 		CacheTTL:         v.config.TenantManager.CacheTTL,
 		EnableAutoCreate: v.config.AutoCreateTenants,
+		Logging:          v.logger,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create tenant manager: %w", err)
@@ -129,27 +210,37 @@ func (v *Venue) initialize() error {
 
 	// 2. Initialize metadata repository
 	v.emit(ctx, slog.LevelInfo, "metadata_repository_initializing", "Initializing metadata repository")
-	metaRepo, err := metadata.NewBadgerMetadataRepository(&metadata.BadgerRepositoryOptions{
-		TenantID:         "shared", // Multi-tenant repository
-		DataPath:         v.config.MetadataDirectory,
-		CacheTTL:         v.config.Metadata.CacheTTL,
-		MaxCacheEntries:  v.config.Metadata.MaxCacheEntries,
-		GCInterval:       v.config.BadgerDB.GCInterval,
-		GCDiscardRatio:   v.config.BadgerDB.GCDiscardRatio,
-		MemTableSize:     int64(v.config.BadgerDB.MemTableSize) << 20,
-		ValueLogFileSize: int64(v.config.BadgerDB.ValueLogFileSize) << 20,
-		BlockCacheSize:   int64(v.config.BadgerDB.BlockCacheSize) << 20,
-		SyncWrites:       v.config.BadgerDB.SyncWrites,
-	})
+	metadataOptions := badgerRepositoryOptions(v.config)
+	metadataOptions.OnCorruptedDatabase = v.quarantineReporter()
+	metadataOptions.Logging = v.logger
+	metadataOptions.StatisticsRecorder = v.statisticsRecorder
+	metaRepo, err := metadata.NewBadgerMetadataRepository(metadataOptions)
 	if err != nil {
 		return fmt.Errorf("failed to create metadata repository: %w", err)
 	}
 	v.metadataRepo = metaRepo
 
+	// 2b. Initialize the periodic metadata backup runner (disabled unless a
+	// backup directory and a positive interval are configured).
+	if v.config.BadgerDB.BackupDirectory != "" && v.config.BadgerDB.BackupInterval > 0 {
+		backupService, err := metadata.NewBackupService(&metadata.BackupServiceOptions{
+			Repository: metaRepo,
+			Directory:  v.config.BadgerDB.BackupDirectory,
+			Interval:   v.config.BadgerDB.BackupInterval,
+			Retention:  v.config.BadgerDB.BackupRetention,
+			Logging:    v.logger,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create metadata backup service: %w", err)
+		}
+		v.metadataBackupCore = backupService
+		v.emit(ctx, slog.LevelInfo, "metadata_backup_configured", "Periodic metadata backups configured",
+			slog.Duration("interval", v.config.BadgerDB.BackupInterval))
+	}
+
 	// 3. Initialize quota managers
 	v.emit(ctx, slog.LevelInfo, "quota_managers_initializing", "Initializing quota managers")
 	v.tenantQuotaManager = quota.NewTenantQuotaManager(int(v.config.DefaultTenantQuota))
-
 	// Set tenant quotas from configuration
 	for _, tenantCfg := range v.config.Tenants {
 		if tenantCfg.Quota != nil {
@@ -162,10 +253,10 @@ func (v *Venue) initialize() error {
 				v.emit(ctx, slog.LevelInfo, "tenant_quota_unlimited", "Tenant quota unlimited", slog.String("tenant_id", tenantCfg.TenantID))
 			}
 		} else if v.config.DefaultTenantQuota > 0 {
-			if err := v.tenantQuotaManager.SetQuota(ctx, tenantCfg.TenantID, int(v.config.DefaultTenantQuota)); err != nil {
-				return fmt.Errorf("failed to set default quota for tenant %s: %w", tenantCfg.TenantID, err)
-			}
-			v.emit(ctx, slog.LevelInfo, "tenant_quota_defaulted", "Tenant quota set to default", slog.String("tenant_id", tenantCfg.TenantID), slog.Int64("quota", v.config.DefaultTenantQuota))
+			// No per-tenant override: the manager's global limit already applies
+			// to this tenant, so materializing an override here would freeze the
+			// tenant against a later SetGlobalLimit.
+			v.emit(ctx, slog.LevelInfo, "tenant_quota_default_applies", "Tenant uses the global quota limit", slog.String("tenant_id", tenantCfg.TenantID), slog.Int64("quota", v.config.DefaultTenantQuota))
 		}
 	}
 	if err := v.reconcileTenantQuotaCounts(ctx); err != nil {
@@ -173,13 +264,16 @@ func (v *Venue) initialize() error {
 	}
 
 	dirQuotaRepo, err := quota.NewBadgerDirectoryQuotaRepository(&quota.BadgerDirectoryQuotaRepositoryOptions{
-		DataPath:         v.config.QuotaDirectory,
-		GCInterval:       v.config.BadgerDB.GCInterval,
-		GCDiscardRatio:   v.config.BadgerDB.GCDiscardRatio,
-		MemTableSize:     int64(v.config.BadgerDB.MemTableSize/2) << 20, // Half size for quota
-		ValueLogFileSize: int64(v.config.BadgerDB.ValueLogFileSize/2) << 20,
-		BlockCacheSize:   int64(v.config.BadgerDB.BlockCacheSize/2) << 20,
-		SyncWrites:       v.config.BadgerDB.SyncWrites,
+		DataPath:                   v.config.QuotaDirectory,
+		GCInterval:                 v.config.BadgerDB.GCInterval,
+		GCDiscardRatio:             v.config.BadgerDB.GCDiscardRatio,
+		MemTableSize:               int64(v.config.BadgerDB.MemTableSize/2) << 20, // Half size for quota
+		ValueLogFileSize:           int64(v.config.BadgerDB.ValueLogFileSize/2) << 20,
+		BlockCacheSize:             int64(v.config.BadgerDB.BlockCacheSize/2) << 20,
+		SyncWrites:                 v.config.BadgerDB.SyncWrites,
+		RecoverCorruptedDatabase:   v.config.BadgerDB.RecoverCorruptedDatabase,
+		CorruptedDatabaseRetention: v.config.BadgerDB.CorruptedDatabaseRetention,
+		OnCorruptedDatabase:        v.quarantineReporter(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create directory quota repository: %w", err)
@@ -207,11 +301,12 @@ func (v *Venue) initialize() error {
 		case "LocalFileSystem", "":
 			// Default to LocalFileSystem if not specified
 			vol, err = volume.NewLocalFileSystemVolume(&volume.LocalFileSystemVolumeOptions{
-				VolumeID:    volConfig.VolumeID,
-				VolumeType:  volConfig.VolumeType,
-				MountPath:   volConfig.MountPath,
-				ShardDepth:  volConfig.ShardingDepth,
-				EnableFsync: volConfig.EnableFsync,
+				VolumeID:            volConfig.VolumeID,
+				VolumeType:          volConfig.VolumeType,
+				MountPath:           volConfig.MountPath,
+				ShardDepth:          volConfig.ShardingDepth,
+				EnableFsync:         volConfig.EnableFsync,
+				HealthCheckCacheTTL: volConfig.HealthCheckCacheTTL,
 			})
 		default:
 			return fmt.Errorf("unsupported volume type %s for volume %s", volConfig.VolumeType, volConfig.VolumeID)
@@ -237,7 +332,12 @@ func (v *Venue) initialize() error {
 			UseExponentialBackoff: v.config.RetryPolicy.UseExponentialBackoff,
 			MaxRetryDelay:         v.config.RetryPolicy.MaxRetryDelay,
 		},
-		ProcessingTimeout: v.config.Cleanup.ProcessingTimeout,
+		ProcessingTimeout:           v.config.Cleanup.ProcessingTimeout,
+		RecoverTimedOutOnEmptyQueue: v.config.Cleanup.RecoverTimedOutOnEmptyQueue,
+		TimedOutReclaimCooldown:     v.config.Cleanup.TimedOutReclaimCooldown,
+		// The batch size has no configuration field; a zero value would silently
+		// disable immediate reclaim, so the package default is used explicitly.
+		EmptyQueueReclaimBatchSize: scheduler.DefaultEmptyQueueReclaimBatchSize,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create file scheduler: %w", err)
@@ -253,6 +353,7 @@ func (v *Venue) initialize() error {
 		Volumes:               v.volumes,
 		TenantQuotaManager:    v.tenantQuotaManager,
 		DirectoryQuotaManager: v.dirQuotaManager,
+		StatisticsRecorder:    v.statisticsRecorder,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create storage pool: %w", err)
@@ -261,15 +362,39 @@ func (v *Venue) initialize() error {
 
 	// 7. Initialize cleanup service (core)
 	v.emit(ctx, slog.LevelInfo, "cleanup_service_initializing", "Initializing cleanup service")
+	disposition, err := core.ParsePermanentlyFailedDisposition(v.config.Cleanup.PermanentlyFailedDisposition)
+	if err != nil {
+		return fmt.Errorf("invalid permanently failed disposition: %w", err)
+	}
+	retiredVolumes := make(map[string]core.RetiredVolumeDisposition, len(v.config.Cleanup.RetiredVolumes))
+	for _, retired := range v.config.Cleanup.RetiredVolumes {
+		retiredDisposition, err := core.ParseRetiredVolumeDisposition(retired.Disposition)
+		if err != nil {
+			return fmt.Errorf("invalid retired volume disposition for %s: %w", retired.VolumeID, err)
+		}
+		retiredVolumes[retired.VolumeID] = retiredDisposition
+	}
 	cleanupServiceCore, err := cleanup.NewCleanupService(&cleanup.CleanupServiceOptions{
-		TenantManager:            v.tenantManager,
-		MetadataRepository:       metaRepo,
-		FileScheduler:            fileScheduler,
-		Volumes:                  v.volumes,
-		TenantQuotaManager:       v.tenantQuotaManager,
-		DirectoryQuotaManager:    v.dirQuotaManager,
-		DirectoryQuotaRepository: dirQuotaRepo,
-		DefaultProcessingTimeout: v.config.Cleanup.ProcessingTimeout,
+		TenantManager:                v.tenantManager,
+		MetadataRepository:           metaRepo,
+		FileScheduler:                fileScheduler,
+		Volumes:                      v.volumes,
+		TenantQuotaManager:           v.tenantQuotaManager,
+		DirectoryQuotaManager:        v.dirQuotaManager,
+		DirectoryQuotaRepository:     dirQuotaRepo,
+		DefaultProcessingTimeout:     v.config.Cleanup.ProcessingTimeout,
+		Logging:                      v.logger,
+		PermanentlyFailedDisposition: disposition,
+		DeadLetter: cleanup.DeadLetterOptions{
+			RootPath:             v.config.Cleanup.DeadLetter.RootPath,
+			IncludeTenantInPath:  v.config.Cleanup.DeadLetter.IncludeTenantInPath,
+			IncludeDatePartition: v.config.Cleanup.DeadLetter.IncludeDatePartition,
+			ShardingDepth:        v.config.Cleanup.DeadLetter.ShardingDepth,
+		},
+		RetiredVolumes:             retiredVolumes,
+		MetadataDirectory:          v.config.MetadataDirectory,
+		QuotaDirectory:             v.config.QuotaDirectory,
+		CorruptedDatabaseRetention: v.config.BadgerDB.CorruptedDatabaseRetention,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create cleanup service: %w", err)
@@ -288,8 +413,13 @@ func (v *Venue) initialize() error {
 			CleanupTimedOutFiles:           v.config.Cleanup.CleanupTimedOutFiles,
 			ProcessingTimeout:              v.config.Cleanup.ProcessingTimeout,
 			CleanupPermanentlyFailedFiles:  v.config.Cleanup.CleanupPermanentlyFailedFiles,
+			FailedFileRetentionPeriod:      v.config.Cleanup.FailedFileRetentionPeriod,
 			CleanupCompletedRecords:        v.config.Cleanup.CleanupCompletedRecords,
 			CompletedRecordRetentionPeriod: v.config.Cleanup.CompletedRecordRetentionPeriod,
+			CleanupOrphanedMetadata:        v.config.Cleanup.CleanupOrphanedMetadata,
+			CleanupJunkFiles:               v.config.Cleanup.CleanupJunkFiles,
+			JunkFileCleanupInterval:        v.config.Cleanup.JunkFileCleanupInterval,
+			CleanupInvalidDatabaseBackups:  v.config.Cleanup.CleanupInvalidDatabaseBackups,
 			OptimizeDatabases:              v.config.Cleanup.OptimizeDatabases,
 			DatabaseOptimizationInterval:   v.config.Cleanup.DatabaseOptimizationInterval,
 		})
@@ -299,14 +429,16 @@ func (v *Venue) initialize() error {
 		v.cleanupService = bgCleanupService
 	}
 
-	// 9. Initialize file watcher (if there are watchers configured)
-	if len(v.config.FileWatchers) > 0 {
-		v.emit(ctx, slog.LevelInfo, "file_watcher_initializing", "Initializing file watcher service", slog.Int("watchers", len(v.config.FileWatchers)))
+	// 9. Initialize file watcher (if there are watchers or roots configured)
+	if len(v.config.FileWatchers) > 0 || len(v.config.FileWatcherRoots) > 0 {
+		v.emit(ctx, slog.LevelInfo, "file_watcher_initializing", "Initializing file watcher service",
+			slog.Int("watchers", len(v.config.FileWatchers)), slog.Int("roots", len(v.config.FileWatcherRoots)))
 		fileWatcherCore, err := watcher.NewFileWatcher(&watcher.FileWatcherOptions{
 			TenantManager:        v.tenantManager,
 			StoragePool:          v.storagePool,
 			ConfigurationRootDir: v.config.FileWatcherConfigurationDirectory,
 			Logging:              v.logger,
+			StatisticsRecorder:   v.statisticsRecorder,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create file watcher: %w", err)
@@ -345,17 +477,84 @@ func (v *Venue) initialize() error {
 
 		// Create background service
 		bgFileWatcherService, err := watcher.NewBackgroundFileWatcherService(&watcher.BackgroundFileWatcherServiceOptions{
-			FileWatcher:  fileWatcherCore,
-			Logging:      v.logger,
-			InitialDelay: v.config.Cleanup.InitialDelay,
+			FileWatcher:          fileWatcherCore,
+			Logging:              v.logger,
+			Enabled:              v.config.FileWatcherService.Enabled,
+			ConfigurationRootDir: v.config.FileWatcherConfigurationDirectory,
+			ServiceOptions: core.FileWatcherServiceOptions{
+				Enabled:                 v.config.FileWatcherService.Enabled,
+				DefaultPollingInterval:  v.config.FileWatcherService.DefaultPollingInterval,
+				MinimumPollingInterval:  v.config.FileWatcherService.MinimumPollingInterval,
+				MaximumPollingInterval:  v.config.FileWatcherService.MaximumPollingInterval,
+				DisabledCheckInterval:   v.config.FileWatcherService.DisabledCheckInterval,
+				MaxParallelWatcherScans: v.config.FileWatcherService.MaxParallelWatcherScans,
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create background file watcher service: %w", err)
 		}
 		v.fileWatcherService = bgFileWatcherService
+
+		// Derive per-tenant watchers from the configured roots.
+		if len(v.config.FileWatcherRoots) > 0 {
+			roots := make([]core.FileWatcherRootConfiguration, 0, len(v.config.FileWatcherRoots))
+			for _, rootCfg := range v.config.FileWatcherRoots {
+				roots = append(roots, core.FileWatcherRootConfiguration{
+					RootPath:              rootCfg.RootPath,
+					MultiTenantMode:       rootCfg.MultiTenantMode,
+					Enabled:               rootCfg.Enabled,
+					IncludeSubdirectories: rootCfg.IncludeSubdirectories,
+					FilePatterns:          append([]string(nil), rootCfg.FilePatterns...),
+					PostImportAction:      core.ParsePostImportAction(rootCfg.PostImportAction),
+					MoveToDirectory:       rootCfg.MoveToDirectory,
+					PollingInterval:       rootCfg.PollingInterval,
+					MaxFileSizeBytes:      rootCfg.MaxFileSizeBytes,
+					MinFileAge:            rootCfg.MinFileAge,
+					MaxConcurrentImports:  rootCfg.MaxConcurrentImports,
+				})
+			}
+
+			autoManager, err := watcher.NewFileWatcherAutoManager(&watcher.FileWatcherAutoManagerOptions{
+				FileWatcher:          fileWatcherCore,
+				Logging:              v.logger,
+				ConfigurationRootDir: v.config.FileWatcherConfigurationDirectory,
+				Roots:                roots,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create file watcher auto manager: %w", err)
+			}
+			v.fileWatcherAutoManager = autoManager
+
+			created, err := autoManager.DiscoverAndCreateWatchers(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to derive file watchers from configured roots: %w", err)
+			}
+			v.emit(ctx, slog.LevelInfo, "file_watcher_roots_applied", "Derived file watchers from configured roots",
+				slog.Int("watcher_roots", len(roots)), slog.Int("watchers", created))
+		}
 	}
 
-	// 10. Initialize health check service (if enabled)
+	// 10. Initialize orphan recovery (if enabled)
+	if v.config.OrphanRecovery.Enabled {
+		v.emit(ctx, slog.LevelInfo, "orphan_recovery_initializing", "Initializing orphan recovery service")
+		orphanRecoveryService, err := recovery.NewOrphanRecoveryService(&recovery.OrphanRecoveryServiceOptions{
+			MetadataRepository:    metaRepo,
+			Volumes:               v.volumes,
+			TenantQuotaManager:    v.tenantQuotaManager,
+			DirectoryQuotaManager: v.dirQuotaManager,
+			Logging:               v.logger,
+			RecoveryInterval:      v.config.OrphanRecovery.RecoveryInterval,
+			InitialDelay:          v.config.OrphanRecovery.InitialDelay,
+			RunOnStartup:          v.config.OrphanRecovery.RunOnStartup,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create orphan recovery service: %w", err)
+		}
+		v.orphanRecoveryCore = orphanRecoveryService
+		v.orphanRecovery = orphanRecoveryService
+	}
+
+	// 11. Initialize health check service (if enabled)
 	if v.config.EnableDatabaseHealthCheck {
 		v.emit(ctx, slog.LevelInfo, "database_health_initializing", "Initializing database health check service")
 		volumePaths := make([]string, 0, len(v.volumes))
@@ -364,10 +563,12 @@ func (v *Venue) initialize() error {
 		}
 
 		healthChecker, err := health.NewDatabaseHealthChecker(&health.DatabaseHealthCheckerOptions{
-			MetadataDataPath:       v.config.MetadataDirectory,
-			DirectoryQuotaDataPath: v.config.QuotaDirectory,
-			VolumePaths:            volumePaths,
-			Logging:                v.logger,
+			MetadataDataPath:           v.config.MetadataDirectory,
+			DirectoryQuotaDataPath:     v.config.QuotaDirectory,
+			MetadataDatabasePath:       filepath.Join(v.config.MetadataDirectory, sharedMetadataTenantID, "metadata"),
+			DirectoryQuotaDatabasePath: filepath.Join(v.config.QuotaDirectory, "quota"),
+			VolumePaths:                volumePaths,
+			Logging:                    v.logger,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create database health checker: %w", err)
@@ -392,6 +593,67 @@ func (v *Venue) initialize() error {
 	return nil
 }
 
+// quotaReconcilePageSize bounds how many metadata records a quota recount keeps
+// in memory at once.
+const quotaReconcilePageSize = 500
+
+// ReconcileQuotaCounts rebuilds the tenant and directory file counts from
+// persisted metadata.
+//
+// NewVenue runs the same reconciliation at startup. Expose this method for
+// operator repair: if a count drifted because a process died mid-transition, or
+// because files were removed out-of-band, calling it restores both counters
+// without a restart. It is safe to call while the runtime is running.
+func (v *Venue) ReconcileQuotaCounts(ctx context.Context) error {
+	if err := v.reconcileTenantQuotaCounts(ctx); err != nil {
+		return fmt.Errorf("failed to reconcile tenant quotas: %w", err)
+	}
+	if err := v.reconcileDirectoryQuotaCounts(ctx); err != nil {
+		return fmt.Errorf("failed to reconcile directory quotas: %w", err)
+	}
+	return nil
+}
+
+// forEachCountedRecord visits every metadata record that consumes quota for one
+// tenant, in bounded pages when the repository supports paging.
+func (v *Venue) forEachCountedRecord(ctx context.Context, tenantID string, visit func(*core.FileMetadata) error) error {
+	for _, status := range quotaCountedStatuses {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if reader, ok := v.metadataRepo.(core.StatusPageReader); ok {
+			cursor := ""
+			for {
+				page, err := reader.GetByStatusPage(ctx, tenantID, status, cursor, quotaReconcilePageSize)
+				if err != nil {
+					return fmt.Errorf("failed to page status %s for tenant %s: %w", status, tenantID, err)
+				}
+				for _, record := range page.Records {
+					if err := visit(record); err != nil {
+						return err
+					}
+				}
+				if page.NextCursor == "" {
+					break
+				}
+				cursor = page.NextCursor
+			}
+			continue
+		}
+
+		files, err := v.metadataRepo.GetByStatus(ctx, tenantID, status, 0)
+		if err != nil {
+			return fmt.Errorf("failed to list status %s for tenant %s: %w", status, tenantID, err)
+		}
+		for _, record := range files {
+			if err := visit(record); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (v *Venue) reconcileTenantQuotaCounts(ctx context.Context) error {
 	tenants, err := v.tenantManager.GetAllTenants(ctx)
 	if err != nil {
@@ -399,12 +661,11 @@ func (v *Venue) reconcileTenantQuotaCounts(ctx context.Context) error {
 	}
 	for _, tenantContext := range tenants {
 		count := 0
-		for _, status := range quotaCountedStatuses {
-			files, err := v.metadataRepo.GetByStatus(ctx, tenantContext.ID, status, 0)
-			if err != nil {
-				return fmt.Errorf("failed to count status %s for tenant %s: %w", status, tenantContext.ID, err)
-			}
-			count += len(files)
+		if err := v.forEachCountedRecord(ctx, tenantContext.ID, func(*core.FileMetadata) error {
+			count++
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to count files for tenant %s: %w", tenantContext.ID, err)
 		}
 		if err := v.tenantQuotaManager.SetFileCount(ctx, tenantContext.ID, count); err != nil {
 			return fmt.Errorf("failed to set count for tenant %s: %w", tenantContext.ID, err)
@@ -424,17 +685,16 @@ func (v *Venue) reconcileDirectoryQuotaCounts(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to list quotas for tenant %s: %w", tenantContext.ID, err)
 		}
+		// Seed from the configured directory rows so an explicit limit survives
+		// even when its directory currently holds no file.
 		for _, quota := range existing {
 			counts[directorypath.Normalize(quota.DirectoryPath)] = 0
 		}
-		for _, status := range quotaCountedStatuses {
-			files, err := v.metadataRepo.GetByStatus(ctx, tenantContext.ID, status, 0)
-			if err != nil {
-				return fmt.Errorf("failed to list status %s for tenant %s: %w", status, tenantContext.ID, err)
-			}
-			for _, file := range files {
-				counts[directorypath.Normalize(file.DirectoryPath)]++
-			}
+		if err := v.forEachCountedRecord(ctx, tenantContext.ID, func(record *core.FileMetadata) error {
+			counts[directorypath.Normalize(record.DirectoryPath)]++
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to count directory usage for tenant %s: %w", tenantContext.ID, err)
 		}
 		for directoryPath, count := range counts {
 			if err := v.dirQuotaManager.SetFileCount(ctx, tenantContext.ID, directoryPath, count); err != nil {
@@ -454,11 +714,47 @@ var quotaCountedStatuses = [...]core.FileProcessingStatus{
 	core.FileStatusDeleteRequested,
 }
 
-// Start starts all background services.
+// backgroundService is the lifecycle surface shared by Venue's background
+// services, used for start rollback and reverse-order shutdown.
+type backgroundService interface {
+	Start() error
+	Stop() error
+}
+
+// voidBackgroundService adapts a background service whose lifecycle cannot fail
+// to the backgroundService surface, so it joins the same start rollback and
+// reverse-order shutdown as the services that can.
+type voidBackgroundService struct {
+	start func()
+	stop  func()
+}
+
+func (s voidBackgroundService) Start() error {
+	if s.start != nil {
+		s.start()
+	}
+	return nil
+}
+
+func (s voidBackgroundService) Stop() error {
+	if s.stop != nil {
+		s.stop()
+	}
+	return nil
+}
+
+// Start starts all enabled background services.
+//
+// Start must be called before the background services do work. It is not
+// required before using StoragePool, TenantManager, or the other synchronous
+// components.
 func (v *Venue) Start() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	if v.closed {
+		return fmt.Errorf("venue is stopped; create a new instance with NewVenue")
+	}
 	if v.running {
 		return fmt.Errorf("venue is already running")
 	}
@@ -468,91 +764,164 @@ func (v *Venue) Start() error {
 
 	v.emit(v.ctx, slog.LevelInfo, "services_starting", "Starting Venue services")
 
-	// Start health check service first (if enabled)
-	if v.healthCheckService != nil {
-		if err := v.healthCheckService.Start(); err != nil {
-			v.running = false
-			return fmt.Errorf("failed to start health check service: %w", err)
-		}
+	// Start in dependency order; roll back everything already started when a
+	// later service cannot start.
+	services := []struct {
+		name    string
+		started string
+		service backgroundService
+	}{
+		{"health check", "health_check_started", v.healthCheckService},
+		{"cleanup", "cleanup_started", v.cleanupService},
+		{"orphan recovery", "orphan_recovery_started", v.orphanRecovery},
+		{"file watcher", "file_watcher_started", v.fileWatcherService},
+		{"metadata backup", "metadata_backup_started", v.metadataBackupService()},
+		{"statistics output", "statistics_output_started", v.statisticsOutputService()},
 	}
 
-	// Start cleanup service (if enabled)
-	if v.cleanupService != nil {
-		if err := v.cleanupService.Start(); err != nil {
-			if v.healthCheckService != nil {
-				_ = v.healthCheckService.Stop()
+	started := make([]backgroundService, 0, len(services))
+	for _, entry := range services {
+		if isNilService(entry.service) {
+			continue
+		}
+		if err := entry.service.Start(); err != nil {
+			for i := len(started) - 1; i >= 0; i-- {
+				_ = started[i].Stop()
 			}
 			v.running = false
-			return fmt.Errorf("failed to start cleanup service: %w", err)
+			return fmt.Errorf("failed to start %s service: %w", entry.name, err)
 		}
-	}
-
-	// Start file watcher service (if enabled)
-	if v.fileWatcherService != nil {
-		if err := v.fileWatcherService.Start(); err != nil {
-			if v.cleanupService != nil {
-				_ = v.cleanupService.Stop()
-			}
-			if v.healthCheckService != nil {
-				_ = v.healthCheckService.Stop()
-			}
-			v.running = false
-			return fmt.Errorf("failed to start file watcher service: %w", err)
-		}
+		started = append(started, entry.service)
+		v.emit(v.ctx, slog.LevelInfo, entry.started, "Background service started")
 	}
 
 	v.emit(v.ctx, slog.LevelInfo, "services_started", "Venue services started successfully")
 	return nil
 }
 
-// Stop stops all background services and releases resources.
+// Stop stops the background services, closes the repositories opened by
+// NewVenue, and releases their database locks.
+//
+// Stop is idempotent and safe in a deferred shutdown path: calling it without
+// Start still releases the repositories, and calling it again returns nil.
+// After Stop the synchronous accessors must not be used.
 func (v *Venue) Stop() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if !v.running {
-		return fmt.Errorf("venue is not running")
+	if v.closed {
+		return nil
 	}
 
-	v.emit(v.ctx, slog.LevelInfo, "services_stopping", "Stopping Venue services")
+	if v.running {
+		v.emit(v.ctx, slog.LevelInfo, "services_stopping", "Stopping Venue services")
 
-	// Stop services in reverse order
-	if v.fileWatcherService != nil {
-		if err := v.fileWatcherService.Stop(); err != nil {
-			v.emit(v.ctx, slog.LevelError, "file_watcher_stop_failed", "Failed to stop file watcher service", errorTypeAttr(err))
+		// Stop services in reverse start order.
+		toStop := []struct {
+			name    string
+			failed  string
+			service backgroundService
+		}{
+			{"statistics output", "statistics_output_stop_failed", v.statisticsOutputService()},
+			{"metadata backup", "metadata_backup_stop_failed", v.metadataBackupService()},
+			{"file watcher", "file_watcher_stop_failed", v.fileWatcherService},
+			{"orphan recovery", "orphan_recovery_stop_failed", v.orphanRecovery},
+			{"cleanup", "cleanup_stop_failed", v.cleanupService},
+			{"health check", "health_check_stop_failed", v.healthCheckService},
 		}
-	}
-
-	if v.cleanupService != nil {
-		if err := v.cleanupService.Stop(); err != nil {
-			v.emit(v.ctx, slog.LevelError, "cleanup_stop_failed", "Failed to stop cleanup service", errorTypeAttr(err))
+		for _, entry := range toStop {
+			if isNilService(entry.service) {
+				continue
+			}
+			if err := entry.service.Stop(); err != nil {
+				v.emit(v.ctx, slog.LevelError, entry.failed, "Failed to stop background service", errorTypeAttr(err))
+			}
 		}
+
+		v.running = false
 	}
 
-	if v.healthCheckService != nil {
-		if err := v.healthCheckService.Stop(); err != nil {
-			v.emit(v.ctx, slog.LevelError, "health_check_stop_failed", "Failed to stop health check service", errorTypeAttr(err))
+	v.closeRepositories()
+
+	if v.cancel != nil {
+		v.cancel()
+		v.cancel = nil
+	}
+	v.closed = true
+
+	v.emit(v.ctx, slog.LevelInfo, "services_stopped", "Venue services stopped and resources released")
+	return nil
+}
+
+// metadataBackupService adapts the optional periodic backup runner to the
+// background service surface. It returns nil when backups are not configured, so
+// Start and Stop skip it exactly like every other disabled service.
+func (v *Venue) metadataBackupService() backgroundService {
+	if v.metadataBackupCore == nil {
+		return nil
+	}
+	return voidBackgroundService{start: v.metadataBackupCore.Start, stop: v.metadataBackupCore.Stop}
+}
+
+// statisticsOutputService adapts the optional statistics output loop to the
+// background service surface. It returns nil when periodic output is not
+// configured.
+func (v *Venue) statisticsOutputService() backgroundService {
+	if v.statisticsOutput == nil {
+		return nil
+	}
+	return voidBackgroundService{start: v.statisticsOutput.Start, stop: v.statisticsOutput.Stop}
+}
+
+// closeRepositories releases every repository opened by NewVenue. It is
+// idempotent so it can run on both the construction-failure and the Stop path.
+func (v *Venue) closeRepositories() {
+	if v.fileWatcherCore != nil {
+		// The watcher owns its persisted import history; closing it flushes any
+		// pending write. The capability is optional so core.FileWatcher stays a
+		// minimal queue-import contract.
+		if closer, ok := v.fileWatcherCore.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				v.emit(v.ctx, slog.LevelError, "file_watcher_close_failed", "Failed to close file watcher", errorTypeAttr(err))
+			}
 		}
+		v.fileWatcherCore = nil
 	}
 
-	// Close repositories
 	if v.metadataRepo != nil {
 		if err := v.metadataRepo.Close(); err != nil {
 			v.emit(v.ctx, slog.LevelError, "metadata_close_failed", "Failed to close metadata repository", errorTypeAttr(err))
 		}
+		v.metadataRepo = nil
 	}
 
 	if v.dirQuotaRepo != nil {
 		if err := v.dirQuotaRepo.Close(); err != nil {
 			v.emit(v.ctx, slog.LevelError, "quota_close_failed", "Failed to close directory quota repository", errorTypeAttr(err))
 		}
+		v.dirQuotaRepo = nil
 	}
+}
 
-	v.cancel()
-	v.running = false
+// quarantineReporter returns the callback that reports a database directory the
+// repositories had to quarantine. Only the directory name is logged: a full
+// physical path must never reach the log.
+func (v *Venue) quarantineReporter() func(string) {
+	return func(quarantinedPath string) {
+		v.emit(context.Background(), slog.LevelError, "database_quarantined",
+			"Unopenable database was quarantined and recreated",
+			slog.String("quarantine_directory", filepath.Base(quarantinedPath)))
+	}
+}
 
-	v.emit(v.ctx, slog.LevelInfo, "services_stopped", "Venue services stopped successfully")
-	return nil
+// isNilService reports whether a background service is absent, including a
+// typed nil pointer stored in an interface.
+func isNilService(service backgroundService) bool {
+	if service == nil {
+		return true
+	}
+	value := reflect.ValueOf(service)
+	return value.Kind() == reflect.Pointer && value.IsNil()
 }
 
 // IsRunning returns whether the venue is currently running.
@@ -589,6 +958,41 @@ func (v *Venue) TenantQuotaManager() core.TenantQuotaManager {
 	return v.tenantQuotaManager
 }
 
+// TenantQuotaAdministrator returns the tenant quota manager's limit
+// administration capability.
+//
+// The capability is optional so a minimal TenantQuotaManager implementation
+// stays valid; the runtime's own manager always provides it, so the second result
+// is false only for a caller-supplied manager.
+func (v *Venue) TenantQuotaAdministrator() (core.TenantQuotaAdministrator, bool) {
+	administrator, ok := v.tenantQuotaManager.(core.TenantQuotaAdministrator)
+	return administrator, ok
+}
+
+// Statistics returns the runtime statistics reader.
+//
+// It is never nil: when Statistics.Enabled is false the returned reader answers
+// every query with an empty snapshot. The returned value is owned by the Venue
+// instance and stays usable until Stop.
+func (v *Venue) Statistics() core.StatisticsReader {
+	if reader, ok := v.statisticsRecorder.(core.StatisticsReader); ok {
+		return reader
+	}
+	return statistics.Noop
+}
+
+// StatisticsRecorder returns the runtime statistics recorder, so an application
+// can add its own measurements to the same bounded window set.
+//
+// It is never nil: when statistics are disabled the returned recorder drops
+// every record.
+func (v *Venue) StatisticsRecorder() core.StatisticsRecorder {
+	if v.statisticsRecorder == nil {
+		return statistics.Noop
+	}
+	return v.statisticsRecorder
+}
+
 // DirectoryQuotaManager returns the directory quota manager instance.
 func (v *Venue) DirectoryQuotaManager() core.DirectoryQuotaManager {
 	return v.dirQuotaManager
@@ -599,9 +1003,27 @@ func (v *Venue) CleanupService() core.CleanupService {
 	return v.cleanupServiceCore
 }
 
+// OrphanRecovery returns the orphan recovery service instance (nil when
+// OrphanRecovery.Enabled is false).
+func (v *Venue) OrphanRecovery() core.OrphanRecoveryService {
+	return v.orphanRecoveryCore
+}
+
 // FileWatcher returns the file watcher instance (may be nil if not enabled).
 func (v *Venue) FileWatcher() core.FileWatcher {
 	return v.fileWatcherCore
+}
+
+// FileWatcherAutoManager returns the root-configuration watcher manager (nil
+// when no watcher roots are configured).
+func (v *Venue) FileWatcherAutoManager() core.FileWatcherAutoManager {
+	return v.fileWatcherAutoManager
+}
+
+// FileWatcherService returns the background watcher service (nil when no
+// watchers or roots are configured).
+func (v *Venue) FileWatcherService() *watcher.BackgroundFileWatcherService {
+	return v.fileWatcherService
 }
 
 // DatabaseHealthChecker returns the database health checker instance (may be nil if not enabled).

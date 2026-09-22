@@ -10,8 +10,11 @@ import (
 
 // Config configures a Venue logging runtime. The caller owns the handler and
 // any writer or resource used by it.
+//
+// Handler is runtime-only: it is never bound from JSON, YAML, or Viper, so all
+// binding tags are "-".
 type Config struct {
-	Handler slog.Handler
+	Handler slog.Handler `json:"-" yaml:"-" mapstructure:"-"`
 }
 
 // Record is one structured Venue log event.

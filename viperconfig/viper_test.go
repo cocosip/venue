@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -91,5 +92,40 @@ venue:
 func TestLoadRejectsNilSource(t *testing.T) {
 	if _, err := Load(nil); err == nil {
 		t.Fatal("Load(nil) error = nil")
+	}
+}
+
+// TestShippedExampleConfigurationLoads guards the documented example file from
+// drifting away from the code: it must bind and pass validation.
+func TestShippedExampleConfigurationLoads(t *testing.T) {
+	path := filepath.Join("..", "venue-config-example.yaml")
+
+	cfg, err := LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("LoadFromFile(%s) error = %v", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("example configuration failed validation: %v", err)
+	}
+	if len(cfg.Volumes) != 2 || len(cfg.Tenants) != 3 || len(cfg.FileWatchers) != 2 {
+		t.Fatalf("example configuration shape = %d volumes, %d tenants, %d watchers",
+			len(cfg.Volumes), len(cfg.Tenants), len(cfg.FileWatchers))
+	}
+	if cfg.OrphanRecovery.Enabled {
+		t.Error("example enables orphan recovery; the shipped default is opt-in")
+	}
+	if cfg.OrphanRecovery.RecoveryInterval != 6*time.Hour {
+		t.Errorf("OrphanRecovery.RecoveryInterval = %v, want 6h", cfg.OrphanRecovery.RecoveryInterval)
+	}
+	if cfg.Cleanup.FailedFileRetentionPeriod != 72*time.Hour {
+		t.Errorf("Cleanup.FailedFileRetentionPeriod = %v, want 72h", cfg.Cleanup.FailedFileRetentionPeriod)
+	}
+	for i, watcher := range cfg.FileWatchers {
+		if !watcher.Enabled {
+			t.Errorf("fileWatchers[%d].Enabled = false; boolean keys must be explicit in the example", i)
+		}
+		if watcher.MinFileAge <= 0 {
+			t.Errorf("fileWatchers[%d].MinFileAge = %v", i, watcher.MinFileAge)
+		}
 	}
 }

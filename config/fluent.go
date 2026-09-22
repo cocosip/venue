@@ -117,6 +117,187 @@ func (c *Config) WithFileWatchers(values ...*FileWatcherConfig) *Config {
 	return c
 }
 
+// WithFileWatcherRoots replaces the root watcher templates with copies.
+func (c *Config) WithFileWatcherRoots(values ...*FileWatcherRootConfig) *Config {
+	c.FileWatcherRoots = c.FileWatcherRoots[:0]
+	for _, value := range values {
+		if value != nil {
+			c.FileWatcherRoots = append(c.FileWatcherRoots, cloneFileWatcherRootConfig(*value))
+		}
+	}
+	return c
+}
+
+// AddFileWatcherRoot appends one root watcher template.
+func (c *Config) AddFileWatcherRoot(value *FileWatcherRootConfig) *Config {
+	if value != nil {
+		c.FileWatcherRoots = append(c.FileWatcherRoots, cloneFileWatcherRootConfig(*value))
+	}
+	return c
+}
+
+// WithFileWatcherService sets the global background watcher service options.
+func (c *Config) WithFileWatcherService(value *FileWatcherServiceConfig) *Config {
+	if value != nil {
+		c.FileWatcherService = *value
+	}
+	return c
+}
+
+// NewFileWatcherServiceConfig returns the default global watcher options.
+func NewFileWatcherServiceConfig() *FileWatcherServiceConfig {
+	value := DefaultConfig().FileWatcherService
+	return &value
+}
+
+// WithEnabled enables or disables the background watcher service globally.
+func (c *FileWatcherServiceConfig) WithEnabled(enabled bool) *FileWatcherServiceConfig {
+	c.Enabled = enabled
+	return c
+}
+
+// WithDefaultPollingInterval sets the interval used when a watcher omits one.
+func (c *FileWatcherServiceConfig) WithDefaultPollingInterval(value time.Duration) *FileWatcherServiceConfig {
+	c.DefaultPollingInterval = value
+	return c
+}
+
+// WithPollingIntervalBounds sets the clamp applied to per-watcher intervals.
+func (c *FileWatcherServiceConfig) WithPollingIntervalBounds(minimum, maximum time.Duration) *FileWatcherServiceConfig {
+	c.MinimumPollingInterval = minimum
+	c.MaximumPollingInterval = maximum
+	return c
+}
+
+// WithDisabledCheckInterval sets how often a disabled service rechecks itself.
+func (c *FileWatcherServiceConfig) WithDisabledCheckInterval(value time.Duration) *FileWatcherServiceConfig {
+	c.DisabledCheckInterval = value
+	return c
+}
+
+// WithMaxParallelScans bounds how many watchers one cycle scans in parallel.
+func (c *FileWatcherServiceConfig) WithMaxParallelScans(value int) *FileWatcherServiceConfig {
+	c.MaxParallelWatcherScans = value
+	return c
+}
+
+// NewFileWatcherRootConfig returns a multi-tenant root watcher template.
+func NewFileWatcherRootConfig(rootPath string) *FileWatcherRootConfig {
+	return &FileWatcherRootConfig{
+		RootPath:              rootPath,
+		MultiTenantMode:       true,
+		Enabled:               true,
+		IncludeSubdirectories: true,
+		FilePatterns:          []string{"*.*"},
+		PostImportAction:      "Delete",
+		PollingInterval:       30 * time.Second,
+		MinFileAge:            5 * time.Second,
+		MaxConcurrentImports:  4,
+
+		AutoCreateTenantDirectoriesCacheTTL: defaultAutoCreateTenantDirectoriesCacheTTL,
+		FileStabilityCheckDelay:             defaultFileStabilityCheckDelay,
+		SkipStabilityCheckAfterAge:          defaultSkipStabilityCheckAfterAge,
+		ImportedFilesPruneInterval:          defaultImportedFilesPruneInterval,
+		ImportedFilesHistoryFlushInterval:   defaultImportedFilesHistoryFlushInterval,
+	}
+}
+
+// WithRootPath sets the directory whose subdirectories are tenants.
+func (c *FileWatcherRootConfig) WithRootPath(value string) *FileWatcherRootConfig {
+	c.RootPath = value
+	return c
+}
+
+// WithMultiTenantMode enables or disables per-tenant derivation.
+func (c *FileWatcherRootConfig) WithMultiTenantMode(enabled bool) *FileWatcherRootConfig {
+	c.MultiTenantMode = enabled
+	return c
+}
+
+// WithEnabled enables or disables every derived watcher.
+func (c *FileWatcherRootConfig) WithEnabled(enabled bool) *FileWatcherRootConfig {
+	c.Enabled = enabled
+	return c
+}
+
+// WithSubdirectories enables or disables recursive scanning for derived watchers.
+func (c *FileWatcherRootConfig) WithSubdirectories(enabled bool) *FileWatcherRootConfig {
+	c.IncludeSubdirectories = enabled
+	return c
+}
+
+// WithFilePatterns replaces the derived watcher file patterns.
+func (c *FileWatcherRootConfig) WithFilePatterns(values ...string) *FileWatcherRootConfig {
+	c.FilePatterns = append([]string(nil), values...)
+	return c
+}
+
+// WithPostImportAction sets the derived watcher post-import action.
+func (c *FileWatcherRootConfig) WithPostImportAction(value string) *FileWatcherRootConfig {
+	c.PostImportAction = value
+	return c
+}
+
+// WithMoveToDirectory sets the derived watcher move destination.
+func (c *FileWatcherRootConfig) WithMoveToDirectory(value string) *FileWatcherRootConfig {
+	c.MoveToDirectory = value
+	return c
+}
+
+// WithPollingInterval sets the derived watcher polling interval.
+func (c *FileWatcherRootConfig) WithPollingInterval(value time.Duration) *FileWatcherRootConfig {
+	c.PollingInterval = value
+	return c
+}
+
+// WithMaxFileSizeBytes sets the derived watcher file-size limit.
+func (c *FileWatcherRootConfig) WithMaxFileSizeBytes(value int64) *FileWatcherRootConfig {
+	c.MaxFileSizeBytes = value
+	return c
+}
+
+// WithMinFileAge sets the derived watcher minimum file age.
+func (c *FileWatcherRootConfig) WithMinFileAge(value time.Duration) *FileWatcherRootConfig {
+	c.MinFileAge = value
+	return c
+}
+
+// WithMaxConcurrentImports sets the derived watcher concurrency limit.
+func (c *FileWatcherRootConfig) WithMaxConcurrentImports(value int) *FileWatcherRootConfig {
+	c.MaxConcurrentImports = value
+	return c
+}
+
+// WithAutoCreateTenantDirectoryCacheTTL sets how long the tenant list used by
+// automatic tenant-directory creation is cached for every derived watcher.
+func (c *FileWatcherRootConfig) WithAutoCreateTenantDirectoryCacheTTL(value time.Duration) *FileWatcherRootConfig {
+	c.AutoCreateTenantDirectoriesCacheTTL = value
+	return c
+}
+
+// WithStabilityChecks configures the delayed second stability probe of every
+// derived watcher.
+func (c *FileWatcherRootConfig) WithStabilityChecks(delay, skipAfterAge time.Duration) *FileWatcherRootConfig {
+	c.FileStabilityCheckDelay = delay
+	c.SkipStabilityCheckAfterAge = skipAfterAge
+	return c
+}
+
+// WithImportedFilesHistoryPersistence configures import-history housekeeping for
+// every derived watcher.
+func (c *FileWatcherRootConfig) WithImportedFilesHistoryPersistence(
+	pruneThrottle bool,
+	pruneInterval time.Duration,
+	flushDebounce bool,
+	flushInterval time.Duration,
+) *FileWatcherRootConfig {
+	c.DisableImportedFilesPruneThrottle = !pruneThrottle
+	c.ImportedFilesPruneInterval = pruneInterval
+	c.DisableImportedFilesHistoryFlushDebounce = !flushDebounce
+	c.ImportedFilesHistoryFlushInterval = flushInterval
+	return c
+}
+
 // AddFileWatcher appends one file watcher configuration.
 func (c *Config) AddFileWatcher(value *FileWatcherConfig) *Config {
 	if value != nil {
@@ -147,8 +328,148 @@ func (c *Config) WithDatabaseHealthCheck(value *DatabaseHealthCheckConfig) *Conf
 	return c
 }
 
+// WithOrphanRecovery sets orphan-file recovery configuration.
+func (c *Config) WithOrphanRecovery(value *OrphanRecoveryConfig) *Config {
+	if value != nil {
+		c.OrphanRecovery = *value
+	}
+	return c
+}
+
 // WithLogging sets instance logging configuration.
 func (c *Config) WithLogging(value *logging.Config) *Config { c.Logging = value; return c }
+
+// WithFailFastOnStartupRecoveryFailure makes startup fail when a database had to
+// be quarantined and could not be restored from a backup.
+func (c *Config) WithFailFastOnStartupRecoveryFailure(enabled bool) *Config {
+	c.FailFastOnStartupRecoveryFailure = enabled
+	return c
+}
+
+// WithStatistics sets in-process statistics configuration.
+func (c *Config) WithStatistics(value *StatisticsConfig) *Config {
+	if value != nil {
+		c.Statistics = *value
+	}
+	return c
+}
+
+// NewStatisticsConfig returns statistics configuration with Venue defaults.
+func NewStatisticsConfig() *StatisticsConfig {
+	return &StatisticsConfig{
+		WindowSize: 5 * time.Minute,
+		Retention:  time.Hour,
+		MaxSeries:  defaultStatisticsMaxSeries,
+		Dimensions: StatisticsDimensionConfig{VolumeID: true, WatcherID: true, Operation: true},
+		Output: StatisticsOutputConfig{
+			Sink:        "Logging",
+			Interval:    time.Minute,
+			QueryWindow: 15 * time.Minute,
+		},
+	}
+}
+
+// WithEnabled turns statistics collection on or off.
+func (c *StatisticsConfig) WithEnabled(enabled bool) *StatisticsConfig {
+	c.Enabled = enabled
+	return c
+}
+
+// WithWindowSize sets the aggregation bucket size.
+func (c *StatisticsConfig) WithWindowSize(value time.Duration) *StatisticsConfig {
+	c.WindowSize = value
+	return c
+}
+
+// WithRetention sets how long in-memory buckets are kept.
+func (c *StatisticsConfig) WithRetention(value time.Duration) *StatisticsConfig {
+	c.Retention = value
+	return c
+}
+
+// WithMaxSeries bounds the number of retained statistics series.
+func (c *StatisticsConfig) WithMaxSeries(value int) *StatisticsConfig {
+	c.MaxSeries = value
+	return c
+}
+
+// WithDimensions sets which statistics dimensions are retained.
+func (c *StatisticsConfig) WithDimensions(value *StatisticsDimensionConfig) *StatisticsConfig {
+	if value != nil {
+		c.Dimensions = *value
+	}
+	return c
+}
+
+// WithOutput sets periodic statistics output configuration.
+func (c *StatisticsConfig) WithOutput(value *StatisticsOutputConfig) *StatisticsConfig {
+	if value != nil {
+		c.Output = *value
+	}
+	return c
+}
+
+// NewStatisticsDimensionConfig returns the default dimension selection.
+func NewStatisticsDimensionConfig() *StatisticsDimensionConfig {
+	return &StatisticsDimensionConfig{VolumeID: true, WatcherID: true, Operation: true}
+}
+
+// WithTenantIDDimension retains or drops the tenant_id dimension.
+func (c *StatisticsDimensionConfig) WithTenantIDDimension(enabled bool) *StatisticsDimensionConfig {
+	c.TenantID = enabled
+	return c
+}
+
+// WithVolumeIDDimension retains or drops the volume_id dimension.
+func (c *StatisticsDimensionConfig) WithVolumeIDDimension(enabled bool) *StatisticsDimensionConfig {
+	c.VolumeID = enabled
+	return c
+}
+
+// WithWatcherIDDimension retains or drops the watcher_id dimension.
+func (c *StatisticsDimensionConfig) WithWatcherIDDimension(enabled bool) *StatisticsDimensionConfig {
+	c.WatcherID = enabled
+	return c
+}
+
+// WithOperationDimension retains or drops the operation dimension.
+func (c *StatisticsDimensionConfig) WithOperationDimension(enabled bool) *StatisticsDimensionConfig {
+	c.Operation = enabled
+	return c
+}
+
+// NewStatisticsOutputConfig returns the default statistics output configuration.
+func NewStatisticsOutputConfig() *StatisticsOutputConfig {
+	return &StatisticsOutputConfig{
+		Sink:        "Logging",
+		Interval:    time.Minute,
+		QueryWindow: 15 * time.Minute,
+	}
+}
+
+// WithOutputEnabled turns periodic statistics output on or off.
+func (c *StatisticsOutputConfig) WithOutputEnabled(enabled bool) *StatisticsOutputConfig {
+	c.Enabled = enabled
+	return c
+}
+
+// WithOutputInterval sets the delay between summaries.
+func (c *StatisticsOutputConfig) WithOutputInterval(value time.Duration) *StatisticsOutputConfig {
+	c.Interval = value
+	return c
+}
+
+// WithOutputQueryWindow sets the time range included in each summary.
+func (c *StatisticsOutputConfig) WithOutputQueryWindow(value time.Duration) *StatisticsOutputConfig {
+	c.QueryWindow = value
+	return c
+}
+
+// WithIncludeEmptySnapshots logs summaries even when every counter is zero.
+func (c *StatisticsOutputConfig) WithIncludeEmptySnapshots(enabled bool) *StatisticsOutputConfig {
+	c.IncludeEmptySnapshots = enabled
+	return c
+}
 
 // NewRetryPolicyConfig returns the default retry policy configuration.
 func NewRetryPolicyConfig() *RetryPolicyConfig {
@@ -258,6 +579,66 @@ func (c *BadgerDBConfig) WithSyncWrites(enabled bool) *BadgerDBConfig {
 	return c
 }
 
+// WithCorruptedDatabaseRecovery enables or disables quarantining a database
+// that cannot be opened and recreating it.
+func (c *BadgerDBConfig) WithCorruptedDatabaseRecovery(enabled bool) *BadgerDBConfig {
+	c.RecoverCorruptedDatabase = enabled
+	return c
+}
+
+// WithCorruptedDatabaseRetention sets how long a quarantined database
+// directory is kept before startup removes it.
+func (c *BadgerDBConfig) WithCorruptedDatabaseRetention(value time.Duration) *BadgerDBConfig {
+	c.CorruptedDatabaseRetention = value
+	return c
+}
+
+// WithBackup configures periodic consistent metadata backups. An empty
+// directory disables them.
+func (c *BadgerDBConfig) WithBackup(directory string, interval time.Duration, retention time.Duration) *BadgerDBConfig {
+	c.BackupDirectory = directory
+	c.BackupInterval = interval
+	c.BackupRetention = retention
+	return c
+}
+
+// WithAutoRestoreFromBackup enables or disables restoring the newest backup
+// into a database that had to be quarantined.
+func (c *BadgerDBConfig) WithAutoRestoreFromBackup(enabled bool) *BadgerDBConfig {
+	c.AutoRestoreFromBackup = enabled
+	return c
+}
+
+// WithStartupHealthChecks sets how long startup waits before the first
+// health-check retry for this volume and the delay between attempts.
+func (c *VolumeConfig) WithStartupHealthChecks(initialDelay, healthCheckDelay time.Duration) *VolumeConfig {
+	c.InitialDelay = initialDelay
+	c.HealthCheckDelay = healthCheckDelay
+	return c
+}
+
+// WithWarmupOnStartup enables or disables the throwaway warmup write performed
+// after the volume passed its startup health checks.
+func (c *VolumeConfig) WithWarmupOnStartup(enabled bool) *VolumeConfig {
+	c.WarmupOnStartup = enabled
+	return c
+}
+
+// WithTimedOutReclaimBatchSizes sets the immediate and background timed-out
+// reclaim batch sizes.
+func (c *CleanupConfig) WithTimedOutReclaimBatchSizes(emptyQueueBatchSize, backgroundBatchSize int) *CleanupConfig {
+	c.EmptyQueueReclaimBatchSize = emptyQueueBatchSize
+	c.BackgroundTimedOutReclaimBatchSize = backgroundBatchSize
+	return c
+}
+
+// WithBackgroundTimedOutReclaim enables or disables the opportunistic
+// background reclaim of timed-out files.
+func (c *CleanupConfig) WithBackgroundTimedOutReclaim(enabled bool) *CleanupConfig {
+	c.EnableBackgroundTimedOutReclaim = enabled
+	return c
+}
+
 // NewVolumeConfig returns an empty local filesystem volume configuration.
 func NewVolumeConfig() *VolumeConfig {
 	return &VolumeConfig{VolumeType: "LocalFileSystem", ShardingDepth: 2, EnableFsync: true}
@@ -278,6 +659,13 @@ func (c *VolumeConfig) WithShardingDepth(value int) *VolumeConfig { c.ShardingDe
 // WithFsync enables or disables fsync after volume writes.
 func (c *VolumeConfig) WithFsync(enabled bool) *VolumeConfig { c.EnableFsync = enabled; return c }
 
+// WithHealthCheckCacheTTL sets how long the volume health probe is cached.
+// Zero selects the runtime default; a negative value disables caching.
+func (c *VolumeConfig) WithHealthCheckCacheTTL(value time.Duration) *VolumeConfig {
+	c.HealthCheckCacheTTL = value
+	return c
+}
+
 // NewTenantConfig returns a tenant configuration with the supplied identifier.
 func NewTenantConfig(tenantID string) *TenantConfig {
 	return &TenantConfig{TenantID: tenantID, Enabled: true}
@@ -296,14 +684,59 @@ func (c *TenantConfig) WithQuota(value int64) *TenantConfig { c.Quota = &value; 
 func (c *TenantConfig) WithoutQuota() *TenantConfig { c.Quota = nil; return c }
 
 // NewFileWatcherConfig returns default file watcher configuration.
+//
+// The Go defaults mirror the Locus defaults: a watcher is enabled, scans
+// subdirectories, requires a 5 second minimum file age, and uses 4 concurrent
+// imports. File-bound configuration must set these explicitly, because a boolean
+// key that is absent from the source cannot be distinguished from an explicit
+// false value.
 func NewFileWatcherConfig() *FileWatcherConfig {
 	return &FileWatcherConfig{
-		FilePatterns:         []string{"*.*"},
-		PostImportAction:     "Delete",
-		PollingInterval:      30 * time.Second,
-		MinFileAge:           3 * time.Second,
-		MaxConcurrentImports: 4,
+		Enabled:               true,
+		IncludeSubdirectories: true,
+		FilePatterns:          []string{"*.*"},
+		PostImportAction:      "Delete",
+		PollingInterval:       30 * time.Second,
+		MinFileAge:            5 * time.Second,
+		MaxConcurrentImports:  4,
+
+		AutoCreateTenantDirectoriesCacheTTL: defaultAutoCreateTenantDirectoriesCacheTTL,
+		FileStabilityCheckDelay:             defaultFileStabilityCheckDelay,
+		SkipStabilityCheckAfterAge:          defaultSkipStabilityCheckAfterAge,
+		ImportedFilesPruneInterval:          defaultImportedFilesPruneInterval,
+		ImportedFilesHistoryFlushInterval:   defaultImportedFilesHistoryFlushInterval,
 	}
+}
+
+// WithAutoCreateTenantDirectoryCacheTTL sets how long the tenant list used by
+// automatic tenant-directory creation is cached.
+func (c *FileWatcherConfig) WithAutoCreateTenantDirectoryCacheTTL(value time.Duration) *FileWatcherConfig {
+	c.AutoCreateTenantDirectoriesCacheTTL = value
+	return c
+}
+
+// WithStabilityChecks configures the delayed second stability probe. A negative
+// delay disables the probe; a negative skip age always probes.
+func (c *FileWatcherConfig) WithStabilityChecks(delay, skipAfterAge time.Duration) *FileWatcherConfig {
+	c.FileStabilityCheckDelay = delay
+	c.SkipStabilityCheckAfterAge = skipAfterAge
+	return c
+}
+
+// WithImportedFilesHistoryPersistence configures import-history housekeeping:
+// whether stale pruning is throttled, the minimum prune interval, whether
+// history writes are debounced, and the minimum debounce flush interval.
+func (c *FileWatcherConfig) WithImportedFilesHistoryPersistence(
+	pruneThrottle bool,
+	pruneInterval time.Duration,
+	flushDebounce bool,
+	flushInterval time.Duration,
+) *FileWatcherConfig {
+	c.DisableImportedFilesPruneThrottle = !pruneThrottle
+	c.ImportedFilesPruneInterval = pruneInterval
+	c.DisableImportedFilesHistoryFlushDebounce = !flushDebounce
+	c.ImportedFilesHistoryFlushInterval = flushInterval
+	return c
 }
 
 // WithWatcherID sets the watcher identifier.
@@ -450,6 +883,121 @@ func (c *CleanupConfig) WithCompletedRecordRetention(value time.Duration) *Clean
 	return c
 }
 
+// WithOrphanedMetadataCleanup enables or disables orphaned-metadata cleanup.
+func (c *CleanupConfig) WithOrphanedMetadataCleanup(enabled bool) *CleanupConfig {
+	c.CleanupOrphanedMetadata = enabled
+	return c
+}
+
+// WithTimedOutReclaimOnEmptyQueue controls immediate timed-out reclaim when a
+// worker finds no claimable file.
+func (c *CleanupConfig) WithTimedOutReclaimOnEmptyQueue(enabled bool) *CleanupConfig {
+	c.RecoverTimedOutOnEmptyQueue = enabled
+	return c
+}
+
+// WithTimedOutReclaimCooldown sets the per-tenant cooldown between immediate
+// timed-out reclaim attempts.
+func (c *CleanupConfig) WithTimedOutReclaimCooldown(value time.Duration) *CleanupConfig {
+	c.TimedOutReclaimCooldown = value
+	return c
+}
+
+// WithPermanentlyFailedDisposition sets how permanently failed payloads are
+// handled after their retention elapses: "Keep", "MoveToDeadLetter", or "Delete".
+func (c *CleanupConfig) WithPermanentlyFailedDisposition(value string) *CleanupConfig {
+	c.PermanentlyFailedDisposition = value
+	return c
+}
+
+// WithDeadLetter sets the dead-letter layout.
+func (c *CleanupConfig) WithDeadLetter(value *DeadLetterConfig) *CleanupConfig {
+	if value != nil {
+		c.DeadLetter = *value
+	}
+	return c
+}
+
+// WithJunkFileCleanup enables or disables OS junk-file cleanup.
+func (c *CleanupConfig) WithJunkFileCleanup(enabled bool) *CleanupConfig {
+	c.CleanupJunkFiles = enabled
+	return c
+}
+
+// WithJunkFileCleanupInterval sets the minimum interval between junk-file sweeps.
+func (c *CleanupConfig) WithJunkFileCleanupInterval(value time.Duration) *CleanupConfig {
+	c.JunkFileCleanupInterval = value
+	return c
+}
+
+// WithInvalidDatabaseBackupCleanup enables or disables quarantined database
+// backup removal.
+func (c *CleanupConfig) WithInvalidDatabaseBackupCleanup(enabled bool) *CleanupConfig {
+	c.CleanupInvalidDatabaseBackups = enabled
+	return c
+}
+
+// WithRetiredVolumes replaces the retired volume declarations with copies.
+func (c *CleanupConfig) WithRetiredVolumes(values ...*RetiredVolumeConfig) *CleanupConfig {
+	c.RetiredVolumes = c.RetiredVolumes[:0]
+	for _, value := range values {
+		if value != nil {
+			c.RetiredVolumes = append(c.RetiredVolumes, *value)
+		}
+	}
+	return c
+}
+
+// AddRetiredVolume appends one retired volume declaration.
+func (c *CleanupConfig) AddRetiredVolume(value *RetiredVolumeConfig) *CleanupConfig {
+	if value != nil {
+		c.RetiredVolumes = append(c.RetiredVolumes, *value)
+	}
+	return c
+}
+
+// NewDeadLetterConfig returns the default dead-letter layout.
+func NewDeadLetterConfig() *DeadLetterConfig {
+	value := DefaultConfig().Cleanup.DeadLetter
+	return &value
+}
+
+// WithRootPath sets the dead-letter root, relative to the volume mount path.
+func (c *DeadLetterConfig) WithRootPath(value string) *DeadLetterConfig {
+	c.RootPath = value
+	return c
+}
+
+// WithTenantInPath controls whether the tenant ID appears in the path.
+func (c *DeadLetterConfig) WithTenantInPath(enabled bool) *DeadLetterConfig {
+	c.IncludeTenantInPath = enabled
+	return c
+}
+
+// WithDatePartition controls whether a yyyyMMdd partition appears in the path.
+func (c *DeadLetterConfig) WithDatePartition(enabled bool) *DeadLetterConfig {
+	c.IncludeDatePartition = enabled
+	return c
+}
+
+// WithShardingDepth sets the shard depth under the dead-letter root.
+func (c *DeadLetterConfig) WithShardingDepth(value int) *DeadLetterConfig {
+	c.ShardingDepth = value
+	return c
+}
+
+// NewRetiredVolumeConfig returns a retired volume declaration that keeps metadata.
+func NewRetiredVolumeConfig(volumeID string) *RetiredVolumeConfig {
+	return &RetiredVolumeConfig{VolumeID: volumeID, Disposition: "Keep"}
+}
+
+// WithDisposition sets the retired volume disposition ("Keep" or
+// "PurgeMetadataOnly").
+func (c *RetiredVolumeConfig) WithDisposition(value string) *RetiredVolumeConfig {
+	c.Disposition = value
+	return c
+}
+
 // WithDatabaseOptimization controls periodic database optimization.
 func (c *CleanupConfig) WithDatabaseOptimization(enabled bool) *CleanupConfig {
 	c.OptimizeDatabases = enabled
@@ -466,6 +1014,36 @@ func (c *CleanupConfig) WithDatabaseOptimizationInterval(value time.Duration) *C
 func NewDatabaseHealthCheckConfig() *DatabaseHealthCheckConfig {
 	value := DefaultConfig().DatabaseHealthCheck
 	return &value
+}
+
+// NewOrphanRecoveryConfig returns default orphan-file recovery configuration.
+func NewOrphanRecoveryConfig() *OrphanRecoveryConfig {
+	value := DefaultConfig().OrphanRecovery
+	return &value
+}
+
+// WithEnabled enables or disables orphan-file recovery.
+func (c *OrphanRecoveryConfig) WithEnabled(enabled bool) *OrphanRecoveryConfig {
+	c.Enabled = enabled
+	return c
+}
+
+// WithRunOnStartup controls whether one recovery scan runs during startup.
+func (c *OrphanRecoveryConfig) WithRunOnStartup(enabled bool) *OrphanRecoveryConfig {
+	c.RunOnStartup = enabled
+	return c
+}
+
+// WithRecoveryInterval sets the delay between periodic recovery scans.
+func (c *OrphanRecoveryConfig) WithRecoveryInterval(value time.Duration) *OrphanRecoveryConfig {
+	c.RecoveryInterval = value
+	return c
+}
+
+// WithInitialDelay sets the delay before the first recovery scan.
+func (c *OrphanRecoveryConfig) WithInitialDelay(value time.Duration) *OrphanRecoveryConfig {
+	c.InitialDelay = value
+	return c
 }
 
 // WithInitialDelay sets the initial health-check delay.
@@ -507,6 +1085,11 @@ func cloneTenantConfig(value TenantConfig) TenantConfig {
 }
 
 func cloneFileWatcherConfig(value FileWatcherConfig) FileWatcherConfig {
+	value.FilePatterns = append([]string(nil), value.FilePatterns...)
+	return value
+}
+
+func cloneFileWatcherRootConfig(value FileWatcherRootConfig) FileWatcherRootConfig {
 	value.FilePatterns = append([]string(nil), value.FilePatterns...)
 	return value
 }

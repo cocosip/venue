@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/metadata"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/options"
 )
@@ -44,6 +44,28 @@ type BadgerDirectoryQuotaRepositoryOptions struct {
 	// SyncWrites enables synchronous writes. Disable for better performance.
 	// Default: false
 	SyncWrites bool
+
+	// RecoverCorruptedDatabase quarantines a database directory that cannot be
+	// opened and recreates an empty one instead of failing startup.
+	//
+	// The directory is renamed to a sibling named
+	// "<dbPath>.corrupted.<UTC timestamp>", so the unusable data is preserved
+	// rather than deleted, and the stored quota counters are lost until an
+	// operator restores them. A lock or ownership failure (another process using
+	// the database) is never treated as corruption: that directory may hold a
+	// healthy database, so it is reported as a startup failure even when this
+	// flag is true.
+	RecoverCorruptedDatabase bool
+
+	// CorruptedDatabaseRetention is how long a quarantined directory is kept.
+	// Quarantined siblings older than this are pruned best-effort during the
+	// next open. Zero selects 72 hours; a negative value disables pruning.
+	CorruptedDatabaseRetention time.Duration
+
+	// OnCorruptedDatabase, when set, is called synchronously with the quarantine
+	// directory path after a database was quarantined. It runs on the opening
+	// goroutine and must not block; a panic from it propagates to the caller.
+	OnCorruptedDatabase func(quarantinedPath string)
 }
 
 // badgerDirectoryQuotaRepository implements DirectoryQuotaRepository using BadgerDB.
@@ -55,6 +77,9 @@ type badgerDirectoryQuotaRepository struct {
 	gcWg           sync.WaitGroup
 	mu             sync.RWMutex
 	closed         bool
+	closeOnce      sync.Once
+	closedCh       chan struct{}
+	closeErr       error
 }
 
 // NewBadgerDirectoryQuotaRepository creates a new BadgerDB quota repository.
@@ -95,9 +120,6 @@ func NewBadgerDirectoryQuotaRepository(opts *BadgerDirectoryQuotaRepositoryOptio
 
 	// Create database path
 	dbPath := filepath.Join(opts.DataPath, "quota")
-	if err := os.MkdirAll(dbPath, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create database path: %w", err)
-	}
 
 	// Open BadgerDB with optimized settings for production workloads
 	badgerOpts := badger.DefaultOptions(dbPath).
@@ -113,7 +135,16 @@ func NewBadgerDirectoryQuotaRepository(opts *BadgerDirectoryQuotaRepositoryOptio
 		WithCompactL0OnClose(true). // Compact on close
 		WithSyncWrites(opts.SyncWrites)
 
-	db, err := badger.Open(badgerOpts)
+	// The quota database gets the same recovery path as the metadata database,
+	// through the shared helper: an unopenable directory is quarantined instead
+	// of blocking startup, and a held lock is never quarantined.
+	db, err := metadata.OpenBadgerWithRecovery(dbPath, metadata.CorruptedDatabaseRecoveryOptions{
+		RecoverCorruptedDatabase:   opts.RecoverCorruptedDatabase,
+		CorruptedDatabaseRetention: opts.CorruptedDatabaseRetention,
+		OnCorruptedDatabase:        opts.OnCorruptedDatabase,
+	}, func() (*badger.DB, error) {
+		return badger.Open(badgerOpts)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
@@ -123,6 +154,7 @@ func NewBadgerDirectoryQuotaRepository(opts *BadgerDirectoryQuotaRepositoryOptio
 		gcInterval:     gcInterval,
 		gcDiscardRatio: gcDiscardRatio,
 		gcStopCh:       make(chan struct{}),
+		closedCh:       make(chan struct{}),
 	}
 
 	// Start background GC
@@ -421,6 +453,14 @@ func (r *badgerDirectoryQuotaRepository) Optimize(ctx context.Context) error {
 		default:
 		}
 
+		// Stop as soon as Close signals shutdown so the database handle is never
+		// closed underneath an in-flight value-log GC.
+		select {
+		case <-r.gcStopCh:
+			return nil
+		default:
+		}
+
 		err := r.db.RunValueLogGC(r.gcDiscardRatio)
 		if err == nil {
 			continue
@@ -432,27 +472,44 @@ func (r *badgerDirectoryQuotaRepository) Optimize(ctx context.Context) error {
 	}
 }
 
-// Close closes the repository and releases resources.
+// Close closes the repository and releases resources. It is idempotent and safe
+// to call concurrently with in-flight Optimize or GC runs.
+//
+// Close never holds mu while it waits for the GC goroutine: the GC goroutine's
+// Optimize takes mu.RLock(), so holding the write lock across gcWg.Wait() would
+// deadlock whenever a GC tick lands inside that window. The close work itself is
+// serialized by closeOnce, and mu is only taken to publish the closed flag and to
+// guard the close error.
 func (r *badgerDirectoryQuotaRepository) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.closed = true
+		r.mu.Unlock()
 
-	if r.closed {
-		return nil
-	}
+		// Stop the GC goroutine, then wait for the final run without holding mu.
+		close(r.gcStopCh)
+		r.gcWg.Wait()
 
-	r.closed = true
+		// Close BadgerDB
+		err := r.db.Close()
+		if err != nil {
+			err = fmt.Errorf("failed to close BadgerDB: %w", err)
+		}
 
-	// Stop GC
-	close(r.gcStopCh)
-	r.gcWg.Wait()
+		r.mu.Lock()
+		r.closeErr = err
+		r.mu.Unlock()
 
-	// Close BadgerDB
-	if err := r.db.Close(); err != nil {
-		return fmt.Errorf("failed to close BadgerDB: %w", err)
-	}
+		close(r.closedCh)
+	})
 
-	return nil
+	// Every caller observes the first close outcome; concurrent callers wait for
+	// the handle to be released instead of returning early.
+	<-r.closedCh
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.closeErr
 }
 
 // buildKey builds a BadgerDB key for a directory path.

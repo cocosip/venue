@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 )
+
+// defaultCacheTTL is used when TenantManagerOptions.CacheTTL is zero.
+const defaultCacheTTL = 5 * time.Minute
 
 // cacheEntry holds cached tenant context with expiration.
 type cacheEntry struct {
@@ -38,6 +43,10 @@ type TenantManagerOptions struct {
 	// EnableAutoCreate enables automatic tenant creation.
 	// Default: false
 	EnableAutoCreate bool
+
+	// Logging is the instance-scoped logging runtime. Nil disables logging.
+	// The manager owns no handler or writer.
+	Logging *logging.Runtime
 }
 
 // DefaultTenantManagerOptions returns default options.
@@ -52,8 +61,9 @@ func DefaultTenantManagerOptions(rootPath string) *TenantManagerOptions {
 
 // TenantManager manages tenant lifecycle and multi-tenant isolation.
 type TenantManager struct {
-	opts  *TenantManagerOptions
-	store *MetadataStore
+	opts   *TenantManagerOptions
+	store  *MetadataStore
+	logger *logging.Runtime
 
 	// Cache for tenant contexts
 	cache   map[string]*cacheEntry
@@ -81,28 +91,55 @@ func NewTenantManager(opts *TenantManagerOptions) (core.TenantManager, error) {
 		metadataPath = filepath.Join(opts.RootPath, ".locus", "tenants")
 	}
 
+	if opts.CacheTTL == 0 {
+		opts.CacheTTL = defaultCacheTTL
+	}
+
 	// Create metadata store
 	store, err := NewMetadataStore(metadataPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create metadata store: %w", err)
 	}
 
+	logger := opts.Logging
+	if logger == nil {
+		logger = logging.Disabled()
+	}
+
 	return &TenantManager{
-		opts:  opts,
-		store: store,
-		cache: make(map[string]*cacheEntry),
-		locks: make(map[string]*sync.Mutex),
+		opts:   opts,
+		store:  store,
+		logger: logger,
+		cache:  make(map[string]*cacheEntry),
+		locks:  make(map[string]*sync.Mutex),
 	}, nil
 }
 
 // GetTenant retrieves a tenant context by ID.
 // If auto-create is enabled and tenant doesn't exist, creates it automatically.
+//
+// The tenant ID is validated before it is used to derive any path, so an
+// identifier that could resolve outside the tenant metadata directory is
+// rejected with core.ErrInvalidArgument (and core.ErrPathTraversalAttempt).
 func (m *TenantManager) GetTenant(ctx context.Context, tenantID string) (core.TenantContext, error) {
-	if tenantID == "" {
-		return core.TenantContext{}, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return core.TenantContext{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return core.TenantContext{}, err
 	}
 
 	// Check cache first
+	if cached, ok := m.getCached(tenantID); ok {
+		return cached, nil
+	}
+
+	// Hold the per-tenant lock while loading and publishing to the cache so a
+	// concurrent status change cannot be overwritten by a pre-change snapshot.
+	lock := m.getTenantLock(tenantID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if cached, ok := m.getCached(tenantID); ok {
 		return cached, nil
 	}
@@ -113,11 +150,11 @@ func (m *TenantManager) GetTenant(ctx context.Context, tenantID string) (core.Te
 		if errors.Is(err, core.ErrTenantNotFound) {
 			// Auto-create if enabled
 			if m.opts.EnableAutoCreate {
-				return m.createTenantInternal(tenantID)
+				return m.createTenantInternalLocked(tenantID)
 			}
-			return core.TenantContext{}, core.ErrTenantNotFound
+			return core.TenantContext{}, fmt.Errorf("tenant %q: %w", tenantID, core.ErrTenantNotFound)
 		}
-		return core.TenantContext{}, fmt.Errorf("failed to load tenant: %w", err)
+		return core.TenantContext{}, fmt.Errorf("failed to load tenant %q: %w", tenantID, err)
 	}
 
 	// Convert to context and cache
@@ -127,23 +164,78 @@ func (m *TenantManager) GetTenant(ctx context.Context, tenantID string) (core.Te
 	return tenantCtx, nil
 }
 
-// IsTenantEnabled checks if a tenant is enabled.
-func (m *TenantManager) IsTenantEnabled(ctx context.Context, tenantID string) (bool, error) {
-	tenant, err := m.GetTenant(ctx, tenantID)
+// TryGetTenant retrieves a tenant context by ID without creating it.
+//
+// It reports ok=false when no tenant with that ID exists. Unlike GetTenant it
+// never writes tenant state: a missing tenant is not created even when
+// auto-create is enabled, and no tenant directory is materialized as a side
+// effect. A malformed identifier is still rejected, because it could not have
+// been created in the first place.
+func (m *TenantManager) TryGetTenant(ctx context.Context, tenantID string) (core.TenantContext, bool, error) {
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return core.TenantContext{}, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return core.TenantContext{}, false, err
+	}
+
+	if cached, ok := m.getCached(tenantID); ok {
+		return cached, true, nil
+	}
+
+	// The per-tenant lock keeps a read consistent with a concurrent status
+	// change; nothing is published to disk while it is held.
+	lock := m.getTenantLock(tenantID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if cached, ok := m.getCached(tenantID); ok {
+		return cached, true, nil
+	}
+
+	metadata, err := m.store.Load(tenantID)
 	if err != nil {
 		if errors.Is(err, core.ErrTenantNotFound) {
-			return false, nil
+			return core.TenantContext{}, false, nil
 		}
+		return core.TenantContext{}, false, fmt.Errorf("failed to load tenant %q: %w", tenantID, err)
+	}
+
+	tenantCtx := metadata.ToTenantContext()
+	m.putCache(tenantID, tenantCtx)
+
+	return tenantCtx, true, nil
+}
+
+// IsTenantEnabled checks if a tenant is enabled.
+// Returns false if tenant doesn't exist.
+//
+// It is a read-only probe: a tenant that does not exist is reported as disabled
+// rather than being materialized, so a health check or watcher scan cannot
+// create tenant state.
+func (m *TenantManager) IsTenantEnabled(ctx context.Context, tenantID string) (bool, error) {
+	tenant, ok, err := m.TryGetTenant(ctx, tenantID)
+	if err != nil {
 		return false, err
+	}
+	if !ok {
+		return false, nil
 	}
 
 	return tenant.Status == core.TenantStatusEnabled, nil
 }
 
 // CreateTenant creates a new tenant.
+//
+// Errors:
+// - ErrInvalidArgument if the tenant ID is empty or unsafe as a path segment
+// - ErrTenantAlreadyExists if tenant already exists
 func (m *TenantManager) CreateTenant(ctx context.Context, tenantID string) error {
-	if tenantID == "" {
-		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Acquire tenant lock
@@ -195,9 +287,15 @@ func (m *TenantManager) GetAllTenants(ctx context.Context) ([]core.TenantContext
 
 	var tenants []core.TenantContext
 	for _, tenantID := range tenantIDs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		tenant, err := m.GetTenant(ctx, tenantID)
 		if err != nil {
-			// Skip tenants that failed to load
+			// A single unreadable tenant file must not hide the remaining
+			// tenants, but it must be visible to operators.
+			m.emit(ctx, tenantID, err)
 			continue
 		}
 		tenants = append(tenants, tenant)
@@ -206,13 +304,9 @@ func (m *TenantManager) GetAllTenants(ctx context.Context) ([]core.TenantContext
 	return tenants, nil
 }
 
-// createTenantInternal creates a tenant with proper locking.
-func (m *TenantManager) createTenantInternal(tenantID string) (core.TenantContext, error) {
-	// Acquire tenant lock
-	lock := m.getTenantLock(tenantID)
-	lock.Lock()
-	defer lock.Unlock()
-
+// createTenantInternalLocked creates a tenant. The caller must already hold the
+// per-tenant lock and must have validated the tenant ID.
+func (m *TenantManager) createTenantInternalLocked(tenantID string) (core.TenantContext, error) {
 	// Double-check existence
 	exists, err := m.store.Exists(tenantID)
 	if err != nil {
@@ -247,8 +341,8 @@ func (m *TenantManager) createTenantInternal(tenantID string) (core.TenantContex
 
 // updateTenantStatus updates a tenant's status.
 func (m *TenantManager) updateTenantStatus(tenantID string, status core.TenantStatus) error {
-	if tenantID == "" {
-		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return err
 	}
 
 	// Acquire tenant lock
@@ -259,6 +353,9 @@ func (m *TenantManager) updateTenantStatus(tenantID string, status core.TenantSt
 	// Load metadata
 	metadata, err := m.store.Load(tenantID)
 	if err != nil {
+		if errors.Is(err, core.ErrTenantNotFound) {
+			return fmt.Errorf("tenant %q: %w", tenantID, core.ErrTenantNotFound)
+		}
 		return err
 	}
 
@@ -275,6 +372,21 @@ func (m *TenantManager) updateTenantStatus(tenantID string, status core.TenantSt
 	m.invalidateCache(tenantID)
 
 	return nil
+}
+
+// emit records a tenant-level diagnostic without exposing file contents or
+// physical paths.
+func (m *TenantManager) emit(ctx context.Context, tenantID string, cause error) {
+	m.logger.Emit(ctx, logging.Record{
+		Level:     slog.LevelWarn,
+		Component: "tenant.manager",
+		Event:     "tenant_load_failed",
+		Message:   "Tenant metadata could not be loaded and was skipped",
+		Attrs: []slog.Attr{
+			slog.String("tenant_id", tenantID),
+			slog.String("error_type", fmt.Sprintf("%T", cause)),
+		},
+	})
 }
 
 // getCached retrieves a tenant from cache if not expired.

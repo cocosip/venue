@@ -4,11 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
 )
+
+// benchTenantID is the tenant the shared createTestMetadata helper writes under.
+// Benchmarks must read the same tenant or every lookup misses.
+const benchTenantID = "test-tenant"
 
 // BenchmarkAddOrUpdate measures write performance.
 func BenchmarkAddOrUpdate(b *testing.B) {
@@ -44,7 +49,7 @@ func BenchmarkGet(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fileKey := fmt.Sprintf("file-%d", i%numFiles)
-		_, err := repo.Get(ctx, "bench-tenant", fileKey)
+		_, err := repo.Get(ctx, benchTenantID, fileKey)
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}
@@ -61,11 +66,11 @@ func BenchmarkGetCached(b *testing.B) {
 	// Add a single file and ensure it's cached
 	metadata := createTestMetadata("cached-file", core.FileStatusPending)
 	_ = repo.AddOrUpdate(ctx, metadata)
-	_, _ = repo.Get(ctx, "bench-tenant", "cached-file") // Warm up cache
+	_, _ = repo.Get(ctx, benchTenantID, "cached-file") // Warm up cache
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := repo.Get(ctx, "bench-tenant", "cached-file")
+		_, err := repo.Get(ctx, benchTenantID, "cached-file")
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}
@@ -89,7 +94,7 @@ func BenchmarkGetUncached(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fileKey := fmt.Sprintf("file-%d", i%numFiles)
-		_, err := repo.Get(ctx, "bench-tenant", fileKey)
+		_, err := repo.Get(ctx, benchTenantID, fileKey)
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}
@@ -117,7 +122,7 @@ func BenchmarkUpdateStatus(b *testing.B) {
 		if i%2 == 0 {
 			status = core.FileStatusCompleted
 		}
-		err := repo.UpdateStatus(ctx, "bench-tenant", fileKey, status)
+		err := repo.UpdateStatus(ctx, benchTenantID, fileKey, status)
 		if err != nil {
 			b.Fatalf("UpdateStatus failed: %v", err)
 		}
@@ -193,7 +198,7 @@ func BenchmarkDelete(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fileKey := fmt.Sprintf("file-%d", i)
-		err := repo.Delete(ctx, "bench-tenant", fileKey)
+		err := repo.Delete(ctx, benchTenantID, fileKey)
 		if err != nil {
 			b.Fatalf("Delete failed: %v", err)
 		}
@@ -208,15 +213,18 @@ func BenchmarkConcurrentWrites(b *testing.B) {
 	defer func() { _ = repo.(*BadgerMetadataRepository).Close() }()
 
 	b.ResetTimer()
+	// Every iteration writes a distinct file key. Reusing one key across
+	// goroutines would make the benchmark measure badger conflict handling
+	// instead of concurrent write throughput.
+	var sequence atomic.Int64
 	b.RunParallel(func(pb *testing.PB) {
-		i := 0
 		for pb.Next() {
-			metadata := createTestMetadata(fmt.Sprintf("file-%d", i), core.FileStatusPending)
+			index := sequence.Add(1)
+			metadata := createTestMetadata(fmt.Sprintf("file-%d", index), core.FileStatusPending)
 			err := repo.AddOrUpdate(ctx, metadata)
 			if err != nil {
 				b.Fatalf("AddOrUpdate failed: %v", err)
 			}
-			i++
 		}
 	})
 }
@@ -240,7 +248,7 @@ func BenchmarkConcurrentReads(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			fileKey := fmt.Sprintf("file-%d", i%numFiles)
-			_, err := repo.Get(ctx, "bench-tenant", fileKey)
+			_, err := repo.Get(ctx, benchTenantID, fileKey)
 			if err != nil {
 				b.Fatalf("Get failed: %v", err)
 			}
@@ -271,12 +279,12 @@ func BenchmarkMixedOperations(b *testing.B) {
 
 			switch operation {
 			case 0: // Read
-				_, _ = repo.Get(ctx, "bench-tenant", fileKey)
+				_, _ = repo.Get(ctx, benchTenantID, fileKey)
 			case 1: // Write
 				metadata := createTestMetadata(fileKey, core.FileStatusPending)
 				_ = repo.AddOrUpdate(ctx, metadata)
 			case 2: // Update status
-				_ = repo.UpdateStatus(ctx, "bench-tenant", fileKey, core.FileStatusProcessing)
+				_ = repo.UpdateStatus(ctx, benchTenantID, fileKey, core.FileStatusProcessing)
 			case 3: // Query
 				_, _ = repo.GetByStatus(ctx, "test-tenant", core.FileStatusPending, 10)
 			}
@@ -293,7 +301,7 @@ func createBenchRepository(b *testing.B) (core.MetadataRepository, string) {
 	}
 
 	opts := &BadgerRepositoryOptions{
-		TenantID:       "bench-tenant",
+		TenantID:       benchTenantID,
 		DataPath:       tmpDir,
 		CacheTTL:       5 * time.Minute,
 		GCInterval:     10 * time.Minute,

@@ -418,6 +418,14 @@ func (m *mockTenantManager) GetTenant(ctx context.Context, tenantID string) (cor
 	}, nil
 }
 
+func (m *mockTenantManager) TryGetTenant(ctx context.Context, tenantID string) (core.TenantContext, bool, error) {
+	return core.TenantContext{
+		ID:        tenantID,
+		Status:    core.TenantStatusEnabled,
+		CreatedAt: time.Now(),
+	}, true, nil
+}
+
 func (m *mockTenantManager) IsTenantEnabled(ctx context.Context, tenantID string) (bool, error) {
 	return true, nil
 }

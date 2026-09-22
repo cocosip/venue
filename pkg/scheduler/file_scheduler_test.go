@@ -115,9 +115,12 @@ func TestGetNextFileForProcessing(t *testing.T) {
 	})
 
 	t.Run("No files available", func(t *testing.T) {
-		_, err := scheduler.GetNextFileForProcessing(ctx, tenant)
-		if err != core.ErrNoFilesAvailable {
-			t.Errorf("Expected ErrNoFilesAvailable, got %v", err)
+		location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
+		if err != nil {
+			t.Errorf("Expected no error for an empty queue, got %v", err)
+		}
+		if location != nil {
+			t.Errorf("Expected nil location for an empty queue, got %v", location)
 		}
 	})
 
@@ -141,9 +144,12 @@ func TestGetNextFileForProcessing(t *testing.T) {
 		_ = repo.AddOrUpdate(ctx, file)
 
 		// Should not get this file
-		_, err := scheduler.GetNextFileForProcessing(ctx, tenant)
-		if err != core.ErrNoFilesAvailable {
-			t.Errorf("Expected ErrNoFilesAvailable for future file, got %v", err)
+		location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
+		if err != nil {
+			t.Errorf("Expected no error for a not-yet-available file, got %v", err)
+		}
+		if location != nil {
+			t.Errorf("Expected nil location for a not-yet-available file, got %v", location)
 		}
 	})
 }

@@ -4,10 +4,19 @@ package volume
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"golang.org/x/sys/windows"
 )
+
+// isNotSameDeviceErrno reports whether err is the Windows
+// ERROR_NOT_SAME_DEVICE status that a rename across drives returns. Go does not
+// map that status onto syscall.EXDEV, so it has to be recognised by value; the
+// localized message text cannot be relied on.
+func isNotSameDeviceErrno(err error) bool {
+	return errors.Is(err, windows.ERROR_NOT_SAME_DEVICE)
+}
 
 // TotalCapacity returns the total capacity in bytes (Windows implementation).
 func (v *LocalFileSystemVolume) TotalCapacity(ctx context.Context) (int64, error) {

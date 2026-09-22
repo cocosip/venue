@@ -2,6 +2,7 @@ package cleanup
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ type mockCleanupService struct {
 	completedRetentionNanos       atomic.Int64
 	cleanupOrphanedMetadataCalled atomic.Int32
 	optimizeDatabasesCalled       atomic.Int32
+	cleanupJunkFilesCalled        atomic.Int32
+	invalidBackupsCalled          atomic.Int32
 }
 
 func (m *mockCleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.CleanupStatistics, error) {
@@ -54,6 +57,20 @@ func (m *mockCleanupService) OptimizeDatabases(ctx context.Context) (*core.Clean
 		MetadataDatabasesOptimized: 1,
 		QuotaDatabasesOptimized:    1,
 	}, nil
+}
+
+func (m *mockCleanupService) CleanupJunkFiles(ctx context.Context) (*core.CleanupStatistics, error) {
+	m.cleanupJunkFilesCalled.Add(1)
+	return &core.CleanupStatistics{JunkFilesRemoved: 7}, nil
+}
+
+func (m *mockCleanupService) CleanupInvalidDatabaseBackups(ctx context.Context) (*core.CleanupStatistics, error) {
+	m.invalidBackupsCalled.Add(1)
+	return &core.CleanupStatistics{InvalidDatabaseBackupsRemoved: 1}, nil
+}
+
+func (m *mockCleanupService) CumulativeStatistics() *core.CleanupStatistics {
+	return &core.CleanupStatistics{}
 }
 
 func TestNewBackgroundCleanupService(t *testing.T) {
@@ -306,6 +323,330 @@ func TestBackgroundCleanupService_GracefulShutdown(t *testing.T) {
 
 	if bgSvc.IsRunning() {
 		t.Error("Service should not be running after stop")
+	}
+}
+
+// blockingCleanupService blocks inside the first cleanup step until the test
+// releases it, which pins the run goroutine inside an in-flight cycle.
+type blockingCleanupService struct {
+	entered        chan struct{}
+	release        chan struct{}
+	enteredOnce    sync.Once
+	emptyDirsCalls atomic.Int32
+}
+
+func newBlockingCleanupService() *blockingCleanupService {
+	return &blockingCleanupService{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (m *blockingCleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.CleanupStatistics, error) {
+	m.emptyDirsCalls.Add(1)
+	m.enteredOnce.Do(func() { close(m.entered) })
+	select {
+	case <-m.release:
+	case <-ctx.Done():
+	}
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) CleanupTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) CleanupCompletedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) OptimizeDatabases(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) CleanupJunkFiles(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) CleanupInvalidDatabaseBackups(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *blockingCleanupService) CumulativeStatistics() *core.CleanupStatistics {
+	return &core.CleanupStatistics{}
+}
+
+// TestBackgroundCleanupService_StopDuringInFlightCycle is the regression test for
+// the Stop()/run() lock-order deadlock: Stop() must not hold s.mu while it waits
+// for the run goroutine, because the goroutine takes s.mu.RLock() through
+// shouldOptimizeDatabases().
+func TestBackgroundCleanupService_StopDuringInFlightCycle(t *testing.T) {
+	blocking := newBlockingCleanupService()
+
+	svc, err := NewBackgroundCleanupService(&BackgroundCleanupServiceOptions{
+		CleanupService:          blocking,
+		InitialDelay:            time.Microsecond,
+		CleanupInterval:         time.Hour,
+		CleanupEmptyDirectories: true,
+		OptimizeDatabases:       true,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundCleanupService() error = %v", err)
+	}
+
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// Wait until the run goroutine is parked inside the cleanup cycle.
+	select {
+	case <-blocking.entered:
+	case <-time.After(5 * time.Second):
+		close(blocking.release)
+		t.Fatal("cleanup cycle never started")
+	}
+
+	// Release the cycle only after Stop() has been called, which is exactly the
+	// window where a lock held across wg.Wait() deadlocks against the cycle's
+	// s.mu.RLock() in shouldOptimizeDatabases().
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(blocking.release)
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- svc.Stop() }()
+
+	var stopErr error
+	select {
+	case stopErr = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return within 5s while a cleanup cycle was in flight: deadlock")
+	}
+
+	if stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if svc.IsRunning() {
+		t.Error("service should not report running after Stop()")
+	}
+}
+
+// TestNewBackgroundCleanupService_RespectsExplicitFalseFlags verifies that a
+// caller can disable every cleanup category; the constructor must not rewrite an
+// explicit all-false configuration into all-true.
+func TestNewBackgroundCleanupService_RespectsExplicitFalseFlags(t *testing.T) {
+	svc, err := NewBackgroundCleanupService(&BackgroundCleanupServiceOptions{
+		CleanupService:                &mockCleanupService{},
+		CleanupEmptyDirectories:       false,
+		CleanupTimedOutFiles:          false,
+		CleanupPermanentlyFailedFiles: false,
+		CleanupCompletedRecords:       false,
+		OptimizeDatabases:             false,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundCleanupService() error = %v", err)
+	}
+
+	if svc.cleanupEmptyDirectories {
+		t.Error("cleanupEmptyDirectories = true, want explicit false")
+	}
+	if svc.cleanupTimedOutFiles {
+		t.Error("cleanupTimedOutFiles = true, want explicit false")
+	}
+	if svc.cleanupPermanentlyFailedFiles {
+		t.Error("cleanupPermanentlyFailedFiles = true, want explicit false")
+	}
+	if svc.cleanupCompletedRecords {
+		t.Error("cleanupCompletedRecords = true, want explicit false")
+	}
+	if svc.optimizeDatabases {
+		t.Error("optimizeDatabases = true, want explicit false")
+	}
+}
+
+// TestBackgroundCleanupService_AllFlagsFalseSkipsEveryStep verifies that an
+// all-false configuration performs no cleanup work at all.
+func TestBackgroundCleanupService_AllFlagsFalseSkipsEveryStep(t *testing.T) {
+	mockSvc := &mockCleanupService{}
+
+	svc, err := NewBackgroundCleanupService(&BackgroundCleanupServiceOptions{
+		CleanupService:                mockSvc,
+		InitialDelay:                  10 * time.Millisecond,
+		CleanupInterval:               50 * time.Millisecond,
+		CleanupEmptyDirectories:       false,
+		CleanupTimedOutFiles:          false,
+		CleanupPermanentlyFailedFiles: false,
+		CleanupCompletedRecords:       false,
+		OptimizeDatabases:             false,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundCleanupService() error = %v", err)
+	}
+
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	if got := mockSvc.cleanupEmptyDirsCalled.Load(); got != 0 {
+		t.Errorf("CleanupEmptyDirectories calls = %d, want 0", got)
+	}
+	if got := mockSvc.cleanupTimedOutFilesCalled.Load(); got != 0 {
+		t.Errorf("CleanupTimedOutProcessingFiles calls = %d, want 0", got)
+	}
+	if got := mockSvc.cleanupFailedFilesCalled.Load(); got != 0 {
+		t.Errorf("CleanupPermanentlyFailedFiles calls = %d, want 0", got)
+	}
+	if got := mockSvc.cleanupCompletedFilesCalled.Load(); got != 0 {
+		t.Errorf("CleanupCompletedFiles calls = %d, want 0", got)
+	}
+	if got := mockSvc.optimizeDatabasesCalled.Load(); got != 0 {
+		t.Errorf("OptimizeDatabases calls = %d, want 0", got)
+	}
+	if got := mockSvc.cleanupOrphanedMetadataCalled.Load(); got != 0 {
+		t.Errorf("CleanupOrphanedMetadata calls = %d, want 0", got)
+	}
+}
+
+// TestBackgroundCleanupService_OrphanedMetadataCleanupIsOptIn verifies the
+// orphaned-metadata step runs on the cycle only when it is enabled.
+func TestBackgroundCleanupService_OrphanedMetadataCleanupIsOptIn(t *testing.T) {
+	tests := []struct {
+		name    string
+		enabled bool
+		want    int32
+	}{
+		{name: "enabled", enabled: true, want: 1},
+		{name: "disabled", enabled: false, want: 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mockSvc := &mockCleanupService{}
+			svc, err := NewBackgroundCleanupService(&BackgroundCleanupServiceOptions{
+				CleanupService:          mockSvc,
+				InitialDelay:            10 * time.Millisecond,
+				CleanupInterval:         time.Hour, // exactly one cycle after the delay
+				CleanupOrphanedMetadata: test.enabled,
+			})
+			if err != nil {
+				t.Fatalf("NewBackgroundCleanupService() error = %v", err)
+			}
+
+			if err := svc.Start(); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			time.Sleep(150 * time.Millisecond)
+			if err := svc.Stop(); err != nil {
+				t.Fatalf("Stop() error = %v", err)
+			}
+
+			if got := mockSvc.cleanupOrphanedMetadataCalled.Load(); got != test.want {
+				t.Errorf("CleanupOrphanedMetadata calls = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+// panicCleanupService panics on the first cleanup step and then succeeds.
+type panicCleanupService struct {
+	panicOnce      sync.Once
+	panicked       atomic.Bool
+	emptyDirsCalls atomic.Int32
+}
+
+func (m *panicCleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.CleanupStatistics, error) {
+	m.emptyDirsCalls.Add(1)
+	shouldPanic := false
+	m.panicOnce.Do(func() {
+		shouldPanic = true
+		m.panicked.Store(true)
+	})
+	if shouldPanic {
+		panic("simulated cleanup failure")
+	}
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) CleanupTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) CleanupCompletedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) OptimizeDatabases(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) CleanupJunkFiles(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) CleanupInvalidDatabaseBackups(ctx context.Context) (*core.CleanupStatistics, error) {
+	return &core.CleanupStatistics{}, nil
+}
+
+func (m *panicCleanupService) CumulativeStatistics() *core.CleanupStatistics {
+	return &core.CleanupStatistics{}
+}
+
+// TestBackgroundCleanupService_PanicIsContained verifies that a panic inside one
+// cleanup pass is logged and contained instead of killing the process, and that
+// later cycles still run.
+func TestBackgroundCleanupService_PanicIsContained(t *testing.T) {
+	panicking := &panicCleanupService{}
+
+	svc, err := NewBackgroundCleanupService(&BackgroundCleanupServiceOptions{
+		CleanupService:          panicking,
+		InitialDelay:            time.Microsecond,
+		CleanupInterval:         20 * time.Millisecond,
+		CleanupEmptyDirectories: true,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundCleanupService() error = %v", err)
+	}
+
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// The loop must survive the panic and keep scheduling later cycles.
+	deadline := time.Now().Add(3 * time.Second)
+	for panicking.emptyDirsCalls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	if !panicking.panicked.Load() {
+		t.Fatal("the panicking cleanup pass never ran")
+	}
+	if got := panicking.emptyDirsCalls.Load(); got < 2 {
+		t.Errorf("cleanup cycles after the panic = %d, want at least 2 (the loop must keep running)", got)
 	}
 }
 

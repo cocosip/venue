@@ -3,14 +3,22 @@ package cleanup
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 )
+
+// cleanupPageSize bounds how many metadata records a single status page holds,
+// so a large store is scanned in bounded chunks instead of being materialised at
+// once.
+const cleanupPageSize = 500
 
 // CleanupServiceOptions configures the cleanup service.
 type CleanupServiceOptions struct {
@@ -38,9 +46,48 @@ type CleanupServiceOptions struct {
 	// Optional: used for database optimization.
 	DirectoryQuotaRepository core.DirectoryQuotaRepository
 
+	// Logging is the instance-scoped logging runtime. Nil disables logging.
+	Logging *logging.Runtime
+
 	// DefaultProcessingTimeout is the default timeout for processing files.
 	// Default: 30 minutes
 	DefaultProcessingTimeout time.Duration
+
+	// PermanentlyFailedDisposition selects what happens to a permanently failed
+	// file once its retention period elapses: keep it, move it to the dead-letter
+	// area, or delete it.
+	//
+	// The Go zero value is core.PermanentlyFailedKeep. The Locus default
+	// (core.PermanentlyFailedMoveToDeadLetter) is supplied by the configuration
+	// model and by core.ParsePermanentlyFailedDisposition(""), so every
+	// disposition stays reachable through this option.
+	PermanentlyFailedDisposition core.PermanentlyFailedDisposition
+
+	// DeadLetter configures the dead-letter layout used by
+	// core.PermanentlyFailedMoveToDeadLetter. The zero value selects the Locus
+	// defaults; see DeadLetterOptions.
+	DeadLetter DeadLetterOptions
+
+	// RetiredVolumes maps a retired volume identifier to how metadata that still
+	// references it is handled.
+	//
+	// A volume that is neither registered in Volumes nor listed here keeps the
+	// safe default (core.RetiredVolumeKeep): the record is retained.
+	RetiredVolumes map[string]core.RetiredVolumeDisposition
+
+	// MetadataDirectory is the root of the metadata database tree. The expired
+	// quarantined-database sweep scans it for "<dbDir>.corrupted.<stamp>"
+	// entries. Empty disables that half of the sweep.
+	MetadataDirectory string
+
+	// QuotaDirectory is the root of the quota database tree, scanned the same way
+	// as MetadataDirectory. Empty disables that half of the sweep.
+	QuotaDirectory string
+
+	// CorruptedDatabaseRetention is how long a quarantined database directory is
+	// kept before the sweep removes it. Zero selects the default of 72 hours; a
+	// negative value disables the sweep.
+	CorruptedDatabaseRetention time.Duration
 }
 
 // cleanupService implements the CleanupService interface.
@@ -52,8 +99,33 @@ type cleanupService struct {
 	tenantQuotaMgr           core.TenantQuotaManager
 	dirQuotaMgr              core.DirectoryQuotaManager
 	dirQuotaRepo             core.DirectoryQuotaRepository
+	logger                   *logging.Runtime
 	defaultProcessingTimeout time.Duration
-	mu                       sync.RWMutex
+
+	// permanentlyFailedDisposition is the configured disposition for retention-
+	// elapsed permanently failed files.
+	permanentlyFailedDisposition core.PermanentlyFailedDisposition
+
+	// deadLetter is the resolved dead-letter layout (defaults applied).
+	deadLetter DeadLetterOptions
+
+	// retiredVolumes maps a retired volume identifier to its disposition. The map
+	// is copied on construction, so the service never observes a caller mutation.
+	retiredVolumes map[string]core.RetiredVolumeDisposition
+
+	// metadataDirectory and quotaDirectory are the quarantine sweep roots.
+	metadataDirectory string
+	quotaDirectory    string
+
+	// corruptedDatabaseRetention is the configured quarantine retention; zero and
+	// negative are resolved by the sweep itself.
+	corruptedDatabaseRetention time.Duration
+
+	// cumulative holds the process-lifetime cleanup totals. The counters are
+	// monotonic and are only ever added to.
+	cumulative cumulativeCleanupCounters
+
+	mu sync.RWMutex
 }
 
 // NewCleanupService creates a new cleanup service.
@@ -82,24 +154,148 @@ func NewCleanupService(opts *CleanupServiceOptions) (core.CleanupService, error)
 		defaultTimeout = 30 * time.Minute
 	}
 
+	logger := opts.Logging
+	if logger == nil {
+		logger = logging.Disabled()
+	}
+
+	retiredVolumes := make(map[string]core.RetiredVolumeDisposition, len(opts.RetiredVolumes))
+	for volumeID, disposition := range opts.RetiredVolumes {
+		if volumeID == "" {
+			continue
+		}
+		retiredVolumes[volumeID] = disposition
+	}
+
 	return &cleanupService{
-		tenantManager:            opts.TenantManager,
-		metadataRepo:             opts.MetadataRepository,
-		scheduler:                opts.FileScheduler,
-		volumes:                  opts.Volumes,
-		tenantQuotaMgr:           opts.TenantQuotaManager,
-		dirQuotaMgr:              opts.DirectoryQuotaManager,
-		dirQuotaRepo:             opts.DirectoryQuotaRepository,
-		defaultProcessingTimeout: defaultTimeout,
+		tenantManager:                opts.TenantManager,
+		metadataRepo:                 opts.MetadataRepository,
+		scheduler:                    opts.FileScheduler,
+		volumes:                      opts.Volumes,
+		tenantQuotaMgr:               opts.TenantQuotaManager,
+		dirQuotaMgr:                  opts.DirectoryQuotaManager,
+		dirQuotaRepo:                 opts.DirectoryQuotaRepository,
+		logger:                       logger,
+		defaultProcessingTimeout:     defaultTimeout,
+		permanentlyFailedDisposition: opts.PermanentlyFailedDisposition,
+		deadLetter:                   opts.DeadLetter.withDefaults(),
+		retiredVolumes:               retiredVolumes,
+		metadataDirectory:            opts.MetadataDirectory,
+		quotaDirectory:               opts.QuotaDirectory,
+		corruptedDatabaseRetention:   opts.CorruptedDatabaseRetention,
 	}, nil
 }
 
+// volumeSnapshot returns a stable copy of the registered volumes, so a cleanup
+// sweep iterates a consistent set even if the service is reconfigured
+// concurrently.
+func (s *cleanupService) volumeSnapshot() map[string]core.StorageVolume {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	volumes := make(map[string]core.StorageVolume, len(s.volumes))
+	for id, volume := range s.volumes {
+		volumes[id] = volume
+	}
+	return volumes
+}
+
+// forEachStatusRecord visits every record with the given status in bounded
+// pages, so a large store is never materialised at once. It uses the optional
+// paging capability when the repository provides it and falls back to the
+// unbounded query otherwise.
+//
+// The scan is forward-only over the repository's key-ordered status index, so a
+// visitor that deletes the record it was given cannot make the scan skip a
+// later record or revisit an earlier one. Context cancellation is honoured
+// before the first page, between pages and between records. Repository and
+// visitor errors stop the scan and are returned unwrapped, so each caller can
+// add its own tenant/status context.
+func (s *cleanupService) forEachStatusRecord(
+	ctx context.Context,
+	tenantID string,
+	status core.FileProcessingStatus,
+	visit func(*core.FileMetadata) error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	reader, paged := s.metadataRepo.(core.StatusPageReader)
+	if !paged {
+		records, err := s.metadataRepo.GetByStatus(ctx, tenantID, status, 0)
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := visit(record); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	cursor := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		page, err := reader.GetByStatusPage(ctx, tenantID, status, cursor, cleanupPageSize)
+		if err != nil {
+			return err
+		}
+		if page == nil {
+			return nil
+		}
+
+		for _, record := range page.Records {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := visit(record); err != nil {
+				return err
+			}
+		}
+
+		// An empty cursor means the scan is complete. A cursor that does not
+		// move would repeat the same page forever (and visit its records
+		// twice), so the contract violation is reported instead.
+		if page.NextCursor == "" {
+			return nil
+		}
+		if page.NextCursor == cursor {
+			return fmt.Errorf("metadata repository returned a non-advancing status page cursor for tenant %s with status %s", tenantID, status)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// emit logs one structured cleanup event through the injected runtime.
+func (s *cleanupService) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {
+	s.logger.Emit(ctx, logging.Record{
+		Level: level, Component: "cleanup.service", Event: event, Message: message, Attrs: attrs,
+	})
+}
+
 // CleanupEmptyDirectories removes empty directories recursively.
+//
+// Directory removal is best-effort per directory, but the sweep itself is not:
+// walk failures and context cancellation are reported so a failed sweep is never
+// reported as success.
 func (s *cleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.CleanupStatistics, error) {
 	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	s.mu.RLock()
-	volumes := make(map[string]core.StorageVolume)
+	volumes := make(map[string]core.StorageVolume, len(s.volumes))
 	for k, v := range s.volumes {
 		volumes[k] = v
 	}
@@ -107,58 +303,118 @@ func (s *cleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.Cle
 
 	// For each volume, scan and remove empty directories
 	for _, volume := range volumes {
-		removed, err := s.cleanupEmptyDirsInVolume(ctx, volume)
-		if err != nil {
-			// Log error but continue with other volumes
-			continue
+		if err := ctx.Err(); err != nil {
+			return stats, err
 		}
+
+		removed, err := s.cleanupEmptyDirsInVolume(ctx, volume)
 		stats.EmptyDirectoriesRemoved += removed
+		if err != nil {
+			return stats, err
+		}
 	}
 
 	return stats, nil
 }
 
 // cleanupEmptyDirsInVolume removes empty directories in a specific volume.
+//
+// Removal repeats until no further directory can be removed, so a nested chain of
+// now-empty parents is reclaimed within a single cycle. Directories are re-checked
+// for emptiness at removal time because removing a child makes its parent empty.
 func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume core.StorageVolume) (int, error) {
 	mountPath := volume.MountPath()
 	removed := 0
 
-	// Walk the directory tree and remove only non-system empty directories.
-	// Parent directories may become removable on a later cleanup pass.
-	err := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
+	for {
+		candidates, err := s.emptyDirCandidates(ctx, mountPath)
 		if err != nil {
-			return nil // Skip errors
-		}
-
-		if !info.IsDir() {
-			return nil // Skip files
-		}
-
-		if isProtectedSystemDirectory(mountPath, path) {
-			return nil // Preserve mount path and system-managed directory structure
-		}
-
-		// Check if directory is empty
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			return nil // Skip on error
-		}
-
-		if len(entries) == 0 {
-			// Directory is empty, remove it
-			if err := os.Remove(path); err == nil {
-				removed++
+			if removed == 0 {
+				return 0, err
 			}
+			return removed, err
+		}
+		if len(candidates) == 0 {
+			return removed, nil
 		}
 
+		// Deepest paths first: removing a child can make its parent empty.
+		sort.Slice(candidates, func(i, j int) bool {
+			return pathDepth(candidates[i]) > pathDepth(candidates[j])
+		})
+
+		removedThisPass := 0
+		for _, path := range candidates {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return removed, ctxErr
+			}
+
+			entries, readErr := os.ReadDir(path)
+			if readErr != nil || len(entries) > 0 {
+				continue
+			}
+			if removeErr := os.Remove(path); removeErr == nil {
+				removed++
+				removedThisPass++
+			}
+			// Best-effort: a directory that is not removable right now is retried
+			// on a later pass.
+		}
+
+		if removedThisPass == 0 {
+			// The sweep cannot make further progress.
+			return removed, nil
+		}
+	}
+}
+
+// emptyDirCandidates walks one volume and returns every unprotected directory
+// that is empty right now.
+func (s *cleanupService) emptyDirCandidates(ctx context.Context, mountPath string) ([]string, error) {
+	candidates := make([]string, 0)
+
+	walkErr := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err != nil {
+			// The walk root itself is not optional: report it so callers can tell
+			// an unavailable volume apart from an empty one.
+			if path == mountPath {
+				return err
+			}
+			return nil
+		}
+		if info == nil || !info.IsDir() {
+			return nil
+		}
+		if isProtectedSystemDirectory(mountPath, path) {
+			return nil
+		}
+
+		entries, readErr := os.ReadDir(path)
+		if readErr != nil {
+			// Best-effort: an unreadable directory is not a cleanup failure.
+			return nil
+		}
+		if len(entries) == 0 {
+			candidates = append(candidates, path)
+		}
 		return nil
 	})
-
-	if err != nil {
-		return removed, err
+	if walkErr != nil {
+		return nil, walkErr
 	}
 
-	return removed, nil
+	return candidates, nil
+}
+
+func pathDepth(path string) int {
+	cleaned := filepath.Clean(path)
+	if cleaned == "." || cleaned == string(filepath.Separator) {
+		return 0
+	}
+	return strings.Count(cleaned, string(filepath.Separator))
 }
 
 func isProtectedSystemDirectory(mountPath string, path string) bool {
@@ -218,11 +474,15 @@ func isProtectedDateHierarchy(parts []string) bool {
 }
 
 func isProtectedShardHierarchy(parts []string) bool {
-	if len(parts) < 2 || len(parts) > 3 {
+	if len(parts) < 2 {
 		return false
 	}
 
-	for _, part := range parts {
+	// parts[0] is the tenant directory (see LocalFileSystemVolume.BuildPhysicalPath),
+	// so only the segments after it can be shard bytes. With the default
+	// ShardingDepth of 2 the real layout is {tenant}/{xx}/{yy}/{fileKey}; deleting
+	// an empty {xx} or {xx}/{yy} would race WriteFile's MkdirAll -> Create window.
+	for _, part := range parts[1:] {
 		if !isLowerHexByte(part) {
 			return false
 		}
@@ -275,6 +535,7 @@ func isLowerHexByte(value string) bool {
 // CleanupTimedOutProcessingFiles resets files that have been in Processing status too long.
 func (s *cleanupService) CleanupTimedOutProcessingFiles(ctx context.Context, timeout time.Duration) (*core.CleanupStatistics, error) {
 	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
 
 	// Use configured timeout if not specified
 	if timeout == 0 {
@@ -296,11 +557,47 @@ func (s *cleanupService) CleanupTimedOutProcessingFiles(ctx context.Context, tim
 	return stats, nil
 }
 
-// CleanupPermanentlyFailedFiles deletes permanently failed files older than retention.
+// CleanupPermanentlyFailedFiles applies the configured disposition to
+// permanently failed files whose retention period has elapsed.
+//
+//   - core.PermanentlyFailedKeep leaves the payload, the metadata and the quota
+//     counts untouched and performs no work at all (Locus skips the sweep, see
+//     StorageCleanupService.cs:286-290).
+//   - core.PermanentlyFailedDelete deletes the physical file first, then releases
+//     the directory and tenant counts, and finally deletes the metadata. Every
+//     failure compensates the steps that already succeeded so metadata and quota
+//     accounting never drift apart.
+//   - core.PermanentlyFailedMoveToDeadLetter moves the payload into the
+//     dead-letter area of the same volume, records the transition and then
+//     releases the quota counts.
+//
+// A record whose volume is not registered is handled by the retired-volume
+// policy; a record that is already DeadLettered is skipped so quota can never be
+// released twice.
 func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
 	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
+
 	if retention < 0 {
 		return stats, fmt.Errorf("permanently failed file retention cannot be negative: %w", core.ErrInvalidArgument)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	switch s.permanentlyFailedDisposition {
+	case core.PermanentlyFailedKeep:
+		s.emit(ctx, slog.LevelDebug, "permanently_failed_kept",
+			"Skipped permanently failed cleanup because the configured disposition is Keep")
+		return stats, nil
+	case core.PermanentlyFailedMoveToDeadLetter, core.PermanentlyFailedDelete:
+	default:
+		// An unrecognized disposition is never interpreted as "delete": the safe
+		// outcome is to leave the records for manual intervention.
+		s.emit(ctx, slog.LevelWarn, "permanently_failed_disposition_unknown",
+			"Skipped permanently failed cleanup because the configured disposition is not recognized",
+			slog.Int("disposition", int(s.permanentlyFailedDisposition)))
+		return stats, nil
 	}
 
 	tenants, err := s.tenantManager.GetAllTenants(ctx)
@@ -308,48 +605,117 @@ func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, rete
 		return stats, fmt.Errorf("failed to list tenants: %w", err)
 	}
 
+	cutoff := time.Now().Add(-retention)
 	for _, tenant := range tenants {
-		failedFiles, err := s.metadataRepo.GetByStatus(ctx, tenant.ID, core.FileStatusPermanentlyFailed, 0)
-		if err != nil {
-			return stats, fmt.Errorf("failed to get permanently failed files for tenant %s: %w", tenant.ID, err)
-		}
-		for _, file := range failedFiles {
-			if file.LastFailedAt != nil && file.LastFailedAt.After(time.Now().Add(-retention)) {
-				continue
+		if err := s.forEachStatusRecord(ctx, tenant.ID, core.FileStatusPermanentlyFailed, func(file *core.FileMetadata) error {
+			// A row that is already dead-lettered was never scanned by status, but
+			// guard anyway: its quota was released by the transition, so applying a
+			// disposition again would release it twice.
+			if file.Status == core.FileStatusDeadLettered {
+				return nil
 			}
-			// Delete physical file
+			// A row without a failure timestamp is not eligible yet: the retention
+			// period cannot be evaluated, and Locus blocks such rows too
+			// (StorageCleanupService.cs:1435-1439).
+			if file.LastFailedAt == nil || file.LastFailedAt.After(cutoff) {
+				return nil
+			}
+
 			volume, exists := s.volumes[file.VolumeID]
-			if exists {
-				if err := volume.DeleteFile(ctx, file.PhysicalPath); err == nil {
-					stats.SpaceFreed += file.FileSize
+			if !exists {
+				if s.purgeRecordForMissingVolume(ctx, file, "failed_file_volume_missing", slog.LevelWarn) {
+					stats.PermanentlyFailedFilesRemoved++
 				}
+				return nil
 			}
 
-			// Delete metadata
-			if err := s.metadataRepo.Delete(ctx, tenant.ID, file.FileKey); err != nil {
-				// Log error but continue
-				continue
+			if s.permanentlyFailedDisposition == core.PermanentlyFailedMoveToDeadLetter {
+				s.applyDeadLetterDisposition(ctx, volume, file, stats)
+				return nil
 			}
 
-			// Decrement quotas
-			if s.tenantQuotaMgr != nil {
-				_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
-			}
-			if s.dirQuotaMgr != nil {
-				directoryPath := file.DirectoryPath
-				_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
-			}
-
-			stats.PermanentlyFailedFilesRemoved++
+			s.deletePermanentlyFailedRecord(ctx, tenant.ID, volume, file, stats)
+			return nil
+		}); err != nil {
+			return stats, fmt.Errorf("failed to get permanently failed files for tenant %s: %w", tenant.ID, err)
 		}
 	}
 
 	return stats, nil
 }
 
+// deletePermanentlyFailedRecord physically deletes one permanently failed file,
+// releases its quota counts and removes its metadata, compensating every step
+// that already succeeded when a later step fails.
+func (s *cleanupService) deletePermanentlyFailedRecord(
+	ctx context.Context,
+	tenantID string,
+	volume core.StorageVolume,
+	file *core.FileMetadata,
+	stats *core.CleanupStatistics,
+) {
+	if err := volume.DeleteFile(ctx, file.PhysicalPath); err != nil {
+		s.emit(ctx, slog.LevelWarn, "failed_file_delete_failed",
+			"Failed to delete physical file for permanently failed file; metadata retained",
+			slog.String("tenant_id", tenantID), slog.String("volume_id", file.VolumeID))
+		return
+	}
+
+	directoryPath := file.DirectoryPath
+	directoryQuotaDecremented := false
+	if s.dirQuotaMgr != nil && directoryPath != "" {
+		if err := s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath); err != nil {
+			// The physical file is already gone; leave metadata in place so a
+			// later cycle retries the accounting.
+			s.emit(ctx, slog.LevelError, "failed_file_directory_quota_failed",
+				"Failed to decrement directory quota for permanently failed file",
+				slog.String("tenant_id", tenantID), errorTypeAttr(err))
+			return
+		}
+		directoryQuotaDecremented = true
+	}
+
+	tenantQuotaDecremented := false
+	if s.tenantQuotaMgr != nil {
+		if err := s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID); err != nil {
+			if directoryQuotaDecremented {
+				_ = s.dirQuotaMgr.IncrementFileCount(ctx, file.TenantID, directoryPath)
+			}
+			s.emit(ctx, slog.LevelError, "failed_file_tenant_quota_failed",
+				"Failed to decrement tenant quota for permanently failed file",
+				slog.String("tenant_id", tenantID), errorTypeAttr(err))
+			return
+		}
+		tenantQuotaDecremented = true
+	}
+
+	// Snapshot identity before deleting: the row must not be referenced after.
+	fileTenantID := file.TenantID
+	fileKey := file.FileKey
+	fileSize := file.FileSize
+
+	if err := s.metadataRepo.Delete(ctx, fileTenantID, fileKey); err != nil {
+		if tenantQuotaDecremented {
+			_ = s.tenantQuotaMgr.IncrementFileCount(ctx, fileTenantID)
+		}
+		if directoryQuotaDecremented {
+			_ = s.dirQuotaMgr.IncrementFileCount(ctx, fileTenantID, directoryPath)
+		}
+		s.emit(ctx, slog.LevelError, "failed_file_metadata_delete_failed",
+			"Failed to delete metadata for permanently failed file; quota counts restored",
+			slog.String("tenant_id", fileTenantID), errorTypeAttr(err))
+		return
+	}
+
+	stats.PermanentlyFailedFilesRemoved++
+	stats.SpaceFreed += fileSize
+}
+
 // CleanupCompletedFiles deletes completed physical files and finalizes their metadata.
 func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention time.Duration) (*core.CleanupStatistics, error) {
 	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
+
 	if retention < 0 {
 		return stats, fmt.Errorf("completed file retention cannot be negative: %w", core.ErrInvalidArgument)
 	}
@@ -360,27 +726,26 @@ func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention ti
 	}
 	cutoff := time.Now().Add(-retention)
 	for _, tenant := range tenants {
-		completedFiles, err := s.metadataRepo.GetByStatus(ctx, tenant.ID, core.FileStatusCompleted, 0)
-		if err != nil {
-			return stats, fmt.Errorf("failed to get completed files for tenant %s: %w", tenant.ID, err)
-		}
-		for _, file := range completedFiles {
+		if err := s.forEachStatusRecord(ctx, tenant.ID, core.FileStatusCompleted, func(file *core.FileMetadata) error {
 			if file.CompletedAt == nil || file.CompletedAt.After(cutoff) {
-				continue
+				return nil
 			}
 			volume, exists := s.volumes[file.VolumeID]
 			if !exists {
-				continue
+				if s.purgeRecordForMissingVolume(ctx, file, "completed_file_volume_missing", slog.LevelDebug) {
+					stats.CompletedRecordsRemoved++
+				}
+				return nil
 			}
 			if err := volume.DeleteFile(ctx, file.PhysicalPath); err != nil {
-				continue
+				return nil
 			}
 
 			directoryPath := file.DirectoryPath
 			directoryQuotaDecremented := false
 			if s.dirQuotaMgr != nil {
 				if err := s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath); err != nil {
-					continue
+					return nil
 				}
 				directoryQuotaDecremented = true
 			}
@@ -391,7 +756,7 @@ func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention ti
 					if directoryQuotaDecremented {
 						_ = s.dirQuotaMgr.IncrementFileCount(ctx, file.TenantID, directoryPath)
 					}
-					continue
+					return nil
 				}
 				tenantQuotaDecremented = true
 			}
@@ -403,11 +768,14 @@ func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention ti
 				if directoryQuotaDecremented {
 					_ = s.dirQuotaMgr.IncrementFileCount(ctx, file.TenantID, directoryPath)
 				}
-				continue
+				return nil
 			}
 
 			stats.CompletedRecordsRemoved++
 			stats.SpaceFreed += file.FileSize
+			return nil
+		}); err != nil {
+			return stats, fmt.Errorf("failed to get completed files for tenant %s: %w", tenant.ID, err)
 		}
 	}
 
@@ -417,9 +785,9 @@ func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention ti
 // CleanupOrphanedMetadata removes metadata for files that no longer exist physically.
 func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.CleanupStatistics, error) {
 	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
 
 	// Get all file metadata (we'll scan by status)
-	// This is not efficient for large systems - in production you'd want pagination
 	allStatuses := []core.FileProcessingStatus{
 		core.FileStatusPending,
 		core.FileStatusProcessing,
@@ -433,38 +801,71 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 	}
 	for _, tenant := range tenants {
 		for _, status := range allStatuses {
-			files, err := s.metadataRepo.GetByStatus(ctx, tenant.ID, status, 0)
-			if err != nil {
-				continue
-			}
+			if err := s.forEachStatusRecord(ctx, tenant.ID, status, func(file *core.FileMetadata) error {
+				// Only act on a confirmed absence. An unknown volume, an empty
+				// physical path and an inconclusive existence check all mean the
+				// metadata cannot be proven orphaned, so it is retained: deleting
+				// live metadata loses the only reference to a real file.
+				confirmedMissing := false
 
-			for _, file := range files {
-				// Check if physical file exists
-				volume, exists := s.volumes[file.VolumeID]
-				if !exists {
-					// Volume doesn't exist, metadata is orphaned
-					_ = s.metadataRepo.Delete(ctx, tenant.ID, file.FileKey)
-					stats.OrphanedMetadataRemoved++
-					continue
+				if volume, exists := s.volumes[file.VolumeID]; !exists {
+					// The volume is not registered with this service, so the physical
+					// file cannot be checked. The retired-volume policy decides
+					// whether the metadata is purged or retained; the accounting
+					// stays paired with a row that is really gone.
+					if s.purgeRecordForMissingVolume(ctx, file, "orphaned_metadata_volume_missing", slog.LevelWarn) {
+						stats.OrphanedMetadataRemoved++
+					}
+					return nil
+				} else if file.PhysicalPath == "" {
+					s.emit(ctx, slog.LevelWarn, "orphaned_metadata_empty_path",
+						"Skipped orphaned metadata check because PhysicalPath is empty",
+						slog.String("tenant_id", tenant.ID), slog.String("volume_id", file.VolumeID))
+				} else {
+					fileExists, existsErr := volume.FileExists(ctx, file.PhysicalPath)
+					if existsErr != nil {
+						s.emit(ctx, slog.LevelWarn, "orphaned_metadata_check_failed",
+							"Skipped orphaned metadata check after a failed existence check",
+							slog.String("tenant_id", tenant.ID), slog.String("volume_id", file.VolumeID),
+							errorTypeAttr(existsErr))
+					} else {
+						confirmedMissing = !fileExists
+					}
 				}
 
-				// Check if file exists on volume
-				fileExists, err := volume.FileExists(ctx, file.PhysicalPath)
-				if err != nil || !fileExists {
-					// File doesn't exist, metadata is orphaned
-					_ = s.metadataRepo.Delete(ctx, tenant.ID, file.FileKey)
-
-					// Decrement quotas
-					if s.tenantQuotaMgr != nil {
-						_ = s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID)
-					}
-					if s.dirQuotaMgr != nil {
-						directoryPath := file.DirectoryPath
-						_ = s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, directoryPath)
-					}
-
-					stats.OrphanedMetadataRemoved++
+				if !confirmedMissing {
+					return nil
 				}
+
+				// Metadata deletion and quota decrements stay paired: the delete is
+				// attempted first, and quota counts are only adjusted for a metadata
+				// row that is actually gone.
+				if err := s.metadataRepo.Delete(ctx, tenant.ID, file.FileKey); err != nil {
+					s.emit(ctx, slog.LevelError, "orphaned_metadata_delete_failed",
+						"Failed to delete orphaned metadata",
+						slog.String("tenant_id", tenant.ID), errorTypeAttr(err))
+					return nil
+				}
+
+				if s.dirQuotaMgr != nil && file.DirectoryPath != "" {
+					if err := s.dirQuotaMgr.DecrementFileCount(ctx, file.TenantID, file.DirectoryPath); err != nil {
+						s.emit(ctx, slog.LevelError, "orphaned_metadata_directory_quota_failed",
+							"Failed to decrement directory quota after deleting orphaned metadata",
+							slog.String("tenant_id", tenant.ID), errorTypeAttr(err))
+					}
+				}
+				if s.tenantQuotaMgr != nil {
+					if err := s.tenantQuotaMgr.DecrementFileCount(ctx, file.TenantID); err != nil {
+						s.emit(ctx, slog.LevelError, "orphaned_metadata_tenant_quota_failed",
+							"Failed to decrement tenant quota after deleting orphaned metadata",
+							slog.String("tenant_id", tenant.ID), errorTypeAttr(err))
+					}
+				}
+
+				stats.OrphanedMetadataRemoved++
+				return nil
+			}); err != nil {
+				return stats, fmt.Errorf("failed to get orphaned metadata for tenant %s with status %s: %w", tenant.ID, status, err)
 			}
 		}
 	}
@@ -475,6 +876,7 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 // OptimizeDatabases triggers repository-level garbage collection / compaction work.
 func (s *cleanupService) OptimizeDatabases(ctx context.Context) (*core.CleanupStatistics, error) {
 	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
 
 	if err := s.metadataRepo.Optimize(ctx); err != nil {
 		return stats, fmt.Errorf("failed to optimize metadata repository: %w", err)
