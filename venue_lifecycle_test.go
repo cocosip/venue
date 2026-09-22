@@ -512,9 +512,13 @@ func TestEmptyQueueReclaimWiredThroughVenue(t *testing.T) {
 					WithMountPath(filepath.Join(root, "storage")).
 					WithShardingDepth(2))
 			// A 1ms processing timeout makes a claimed file immediately eligible
-			// for timed-out recovery without waiting for the cleanup cycle.
+			// for timed-out recovery without waiting for the cleanup cycle. The
+			// opportunistic background pass is switched off so this test isolates
+			// the synchronous empty-queue path; the background path has its own
+			// test.
 			cfg.Cleanup.ProcessingTimeout = time.Millisecond
 			cfg.Cleanup.RecoverTimedOutOnEmptyQueue = test.enabled
+			cfg.Cleanup.EnableBackgroundTimedOutReclaim = false
 
 			runtime, err := venue.NewVenue(cfg)
 			if err != nil {

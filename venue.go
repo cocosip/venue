@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/cocosip/venue/config"
 	"github.com/cocosip/venue/internal/directorypath"
@@ -63,6 +64,12 @@ type Venue struct {
 	// unconditionally.
 	statisticsRecorder core.StatisticsRecorder
 	statisticsOutput   *statistics.OutputService
+
+	// recoveryMu guards incompleteRecoveries, which records metadata databases
+	// that were quarantined during startup and could not be restored from a
+	// backup. The callbacks that append run on the repository-opening goroutine.
+	recoveryMu           sync.Mutex
+	incompleteRecoveries []string
 }
 
 // sharedMetadataTenantID is the logical tenant segment of the shared metadata
@@ -160,6 +167,140 @@ func statisticsOptions(cfg config.StatisticsConfig) statistics.Options {
 	}
 }
 
+// maxVolumeHealthCheckAttempts bounds the startup health retries for one volume,
+// matching Locus (locus/src/Locus.Storage/StoragePool.cs:164-209).
+const maxVolumeHealthCheckAttempts = 10
+
+// prepareVolumes waits for every configured volume to become healthy and performs
+// the optional warm-up write.
+//
+// A volume that answers the first probe is never delayed: the configured
+// InitialDelay applies before the first *retry*, so an always-healthy local
+// volume costs one probe. A volume that does not answer is retried up to
+// maxVolumeHealthCheckAttempts times, separated by HealthCheckDelay, and must
+// answer two consecutive probes to count as healthy.
+func (v *Venue) prepareVolumes(ctx context.Context) error {
+	for _, volConfig := range v.config.Volumes {
+		volume, ok := v.volumes[volConfig.VolumeID]
+		if !ok {
+			continue
+		}
+
+		if !volumeProbe(ctx, volume) {
+			if err := v.waitForVolume(ctx, volume, volConfig); err != nil {
+				return err
+			}
+		}
+
+		v.warmVolume(ctx, volume, volConfig)
+	}
+
+	return nil
+}
+
+// volumeProbe probes a volume immediately, preferring the forced-probe
+// capability over a possibly cached IsHealthy answer.
+func volumeProbe(ctx context.Context, volume core.StorageVolume) bool {
+	if probe, ok := volume.(core.StorageVolumeHealthProbe); ok {
+		return probe.ProbeHealth(ctx)
+	}
+	return volume.IsHealthy(ctx)
+}
+
+// waitForVolume retries the health probe of one volume until it is healthy or the
+// attempt budget is exhausted.
+//
+// Errors:
+//   - ErrStorageVolumeUnavailable when the volume never answered two consecutive
+//     probes
+//   - the context error when startup was cancelled while waiting
+func (v *Venue) waitForVolume(ctx context.Context, volume core.StorageVolume, volConfig config.VolumeConfig) error {
+	v.emit(ctx, slog.LevelWarn, "volume_not_ready",
+		"Volume did not answer its first health probe; waiting before retrying",
+		slog.String("volume_id", volConfig.VolumeID))
+
+	if err := sleepContext(ctx, volConfig.InitialDelay); err != nil {
+		return err
+	}
+
+	healthy := 0
+	for attempt := 1; attempt <= maxVolumeHealthCheckAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if volumeProbe(ctx, volume) {
+			healthy++
+			if healthy >= 2 {
+				v.emit(ctx, slog.LevelInfo, "volume_ready", "Volume became healthy",
+					slog.String("volume_id", volConfig.VolumeID),
+					slog.Int("attempts", attempt))
+				return nil
+			}
+		} else {
+			healthy = 0
+		}
+
+		if attempt < maxVolumeHealthCheckAttempts {
+			if err := sleepContext(ctx, volConfig.HealthCheckDelay); err != nil {
+				return err
+			}
+		}
+	}
+
+	return fmt.Errorf(
+		"volume %s is not healthy after %d attempts: %w",
+		volConfig.VolumeID,
+		maxVolumeHealthCheckAttempts,
+		core.ErrStorageVolumeUnavailable,
+	)
+}
+
+// warmVolume performs the optional warm-up write for one volume. Warm-up is
+// advisory: a failure is reported and never unmounts or disables the volume.
+func (v *Venue) warmVolume(ctx context.Context, volume core.StorageVolume, volConfig config.VolumeConfig) {
+	if !volConfig.WarmupOnStartup {
+		return
+	}
+
+	warmup, ok := volume.(core.StorageVolumeWritePathWarmup)
+	if !ok {
+		return
+	}
+
+	if err := warmup.WarmWritePathCache(ctx); err != nil {
+		v.emit(ctx, slog.LevelWarn, "volume_warmup_failed",
+			"Volume write-path warm-up failed",
+			slog.String("volume_id", volConfig.VolumeID),
+			errorTypeAttr(err))
+		return
+	}
+
+	v.emit(ctx, slog.LevelInfo, "volume_warmed_up", "Volume write path warmed up",
+		slog.String("volume_id", volConfig.VolumeID))
+}
+
+// sleepContext waits for d or until ctx is done, whichever comes first. A
+// non-positive duration waits for nothing but still observes cancellation.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // initialize initializes all components in the correct order using configuration.
 func (v *Venue) initialize() error {
 	ctx := context.Background()
@@ -212,6 +353,7 @@ func (v *Venue) initialize() error {
 	v.emit(ctx, slog.LevelInfo, "metadata_repository_initializing", "Initializing metadata repository")
 	metadataOptions := badgerRepositoryOptions(v.config)
 	metadataOptions.OnCorruptedDatabase = v.quarantineReporter()
+	metadataOptions.OnRecoveryIncomplete = v.recoveryIncompleteReporter()
 	metadataOptions.Logging = v.logger
 	metadataOptions.StatisticsRecorder = v.statisticsRecorder
 	metaRepo, err := metadata.NewBadgerMetadataRepository(metadataOptions)
@@ -289,6 +431,14 @@ func (v *Venue) initialize() error {
 		return fmt.Errorf("failed to reconcile directory quotas: %w", err)
 	}
 
+	// The metadata database is the only store whose loss cannot be recomputed:
+	// directory quota counts are derived from metadata and are reconciled just
+	// above, so a quarantined quota database is a healthy degraded state rather
+	// than a startup failure.
+	if err := v.checkStartupRecovery(); err != nil {
+		return err
+	}
+
 	// 4. Initialize storage volumes
 	v.emit(ctx, slog.LevelInfo, "volumes_initializing", "Initializing storage volumes", slog.Int("count", len(v.config.Volumes)))
 	v.volumes = make(map[string]core.StorageVolume)
@@ -323,6 +473,12 @@ func (v *Venue) initialize() error {
 		return fmt.Errorf("no volumes configured")
 	}
 
+	// Wait for the volumes to become usable before any component can select one,
+	// and perform the optional warm-up write.
+	if err := v.prepareVolumes(ctx); err != nil {
+		return err
+	}
+
 	// 5. Initialize file scheduler
 	v.emit(ctx, slog.LevelInfo, "file_scheduler_initializing", "Initializing file scheduler")
 	fileScheduler, err := scheduler.NewFileScheduler(metaRepo, v.volumes, &scheduler.FileSchedulerOptions{
@@ -335,9 +491,15 @@ func (v *Venue) initialize() error {
 		ProcessingTimeout:           v.config.Cleanup.ProcessingTimeout,
 		RecoverTimedOutOnEmptyQueue: v.config.Cleanup.RecoverTimedOutOnEmptyQueue,
 		TimedOutReclaimCooldown:     v.config.Cleanup.TimedOutReclaimCooldown,
-		// The batch size has no configuration field; a zero value would silently
-		// disable immediate reclaim, so the package default is used explicitly.
-		EmptyQueueReclaimBatchSize: scheduler.DefaultEmptyQueueReclaimBatchSize,
+		// Reclaim batch sizes come from configuration so an operator can bound
+		// both the synchronous empty-queue pass and the opportunistic background
+		// pass, including disabling either one with a negative value.
+		EmptyQueueReclaimBatchSize:         v.config.Cleanup.EmptyQueueReclaimBatchSize,
+		BackgroundTimedOutReclaimEnabled:   v.config.Cleanup.EnableBackgroundTimedOutReclaim,
+		BackgroundTimedOutReclaimBatchSize: v.config.Cleanup.BackgroundTimedOutReclaimBatchSize,
+		// The background reclaim pass reports its contained failures through the
+		// instance runtime; without it those failures would be silent.
+		Logging: v.logger,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create file scheduler: %w", err)
@@ -467,6 +629,17 @@ func (v *Venue) initialize() error {
 				MinFileAge:                  watcherCfg.MinFileAge,
 				MaxConcurrentImports:        watcherCfg.MaxConcurrentImports,
 				Enabled:                     watcherCfg.Enabled,
+
+				// The configuration expresses the two housekeeping switches in
+				// negative form so their zero value means "enabled"; the runtime
+				// model keeps the positive form.
+				AutoCreateTenantDirectoriesCacheTTL:     watcherCfg.AutoCreateTenantDirectoriesCacheTTL,
+				FileStabilityCheckDelay:                 watcherCfg.FileStabilityCheckDelay,
+				SkipStabilityCheckAfterAge:              watcherCfg.SkipStabilityCheckAfterAge,
+				EnableImportedFilesPruneThrottle:        !watcherCfg.DisableImportedFilesPruneThrottle,
+				ImportedFilesPruneInterval:              watcherCfg.ImportedFilesPruneInterval,
+				EnableImportedFilesHistoryFlushDebounce: !watcherCfg.DisableImportedFilesHistoryFlushDebounce,
+				ImportedFilesHistoryFlushInterval:       watcherCfg.ImportedFilesHistoryFlushInterval,
 			}
 
 			if err := fileWatcherCore.RegisterWatcher(ctx, watcherConfig); err != nil {
@@ -475,12 +648,17 @@ func (v *Venue) initialize() error {
 			v.emit(ctx, slog.LevelInfo, "file_watcher_registered", "File watcher registered", slog.String("watcher_id", watcherCfg.WatcherID))
 		}
 
-		// Create background service
+		// Create background service. InitialEnabled carries the configured
+		// enabled state explicitly: the watcher service treats an unset flag as
+		// "scan by default", so a pointed value is how configuration disables it
+		// at construction.
+		watcherServiceEnabled := v.config.FileWatcherService.Enabled
 		bgFileWatcherService, err := watcher.NewBackgroundFileWatcherService(&watcher.BackgroundFileWatcherServiceOptions{
 			FileWatcher:          fileWatcherCore,
 			Logging:              v.logger,
 			Enabled:              v.config.FileWatcherService.Enabled,
 			ConfigurationRootDir: v.config.FileWatcherConfigurationDirectory,
+			InitialEnabled:       &watcherServiceEnabled,
 			ServiceOptions: core.FileWatcherServiceOptions{
 				Enabled:                 v.config.FileWatcherService.Enabled,
 				DefaultPollingInterval:  v.config.FileWatcherService.DefaultPollingInterval,
@@ -511,6 +689,14 @@ func (v *Venue) initialize() error {
 					MaxFileSizeBytes:      rootCfg.MaxFileSizeBytes,
 					MinFileAge:            rootCfg.MinFileAge,
 					MaxConcurrentImports:  rootCfg.MaxConcurrentImports,
+
+					AutoCreateTenantDirectoriesCacheTTL:     rootCfg.AutoCreateTenantDirectoriesCacheTTL,
+					FileStabilityCheckDelay:                 rootCfg.FileStabilityCheckDelay,
+					SkipStabilityCheckAfterAge:              rootCfg.SkipStabilityCheckAfterAge,
+					EnableImportedFilesPruneThrottle:        !rootCfg.DisableImportedFilesPruneThrottle,
+					ImportedFilesPruneInterval:              rootCfg.ImportedFilesPruneInterval,
+					EnableImportedFilesHistoryFlushDebounce: !rootCfg.DisableImportedFilesHistoryFlushDebounce,
+					ImportedFilesHistoryFlushInterval:       rootCfg.ImportedFilesHistoryFlushInterval,
 				})
 			}
 
@@ -540,6 +726,7 @@ func (v *Venue) initialize() error {
 		orphanRecoveryService, err := recovery.NewOrphanRecoveryService(&recovery.OrphanRecoveryServiceOptions{
 			MetadataRepository:    metaRepo,
 			Volumes:               v.volumes,
+			TenantManager:         v.tenantManager,
 			TenantQuotaManager:    v.tenantQuotaManager,
 			DirectoryQuotaManager: v.dirQuotaManager,
 			Logging:               v.logger,
@@ -876,6 +1063,15 @@ func (v *Venue) statisticsOutputService() backgroundService {
 // closeRepositories releases every repository opened by NewVenue. It is
 // idempotent so it can run on both the construction-failure and the Stop path.
 func (v *Venue) closeRepositories() {
+	// The scheduler owns background timed-out reclaim passes that write to the
+	// metadata repository, so it must stop before that repository is closed.
+	if v.fileScheduler != nil {
+		if err := scheduler.CloseFileScheduler(v.fileScheduler); err != nil {
+			v.emit(v.ctx, slog.LevelError, "file_scheduler_close_failed", "Failed to close file scheduler", errorTypeAttr(err))
+		}
+		v.fileScheduler = nil
+	}
+
 	if v.fileWatcherCore != nil {
 		// The watcher owns its persisted import history; closing it flushes any
 		// pending write. The capability is optional so core.FileWatcher stays a
@@ -912,6 +1108,52 @@ func (v *Venue) quarantineReporter() func(string) {
 			"Unopenable database was quarantined and recreated",
 			slog.String("quarantine_directory", filepath.Base(quarantinedPath)))
 	}
+}
+
+// recoveryIncompleteReporter returns the callback that records a quarantined
+// metadata database that no backup could replace, so the runtime is about to
+// serve an empty queue store.
+//
+// The event is always reported as a degraded state; FailFastOnStartupRecoveryFailure
+// only decides whether NewVenue then fails instead of continuing.
+func (v *Venue) recoveryIncompleteReporter() func(string) {
+	return func(quarantinedPath string) {
+		v.recoveryMu.Lock()
+		v.incompleteRecoveries = append(v.incompleteRecoveries, filepath.Base(quarantinedPath))
+		count := len(v.incompleteRecoveries)
+		v.recoveryMu.Unlock()
+
+		v.emit(context.Background(), slog.LevelWarn, "database_recovery_incomplete",
+			"Metadata database was recreated empty because no usable backup was available",
+			slog.String("quarantine_directory", filepath.Base(quarantinedPath)),
+			slog.Int("incomplete_recoveries", count))
+	}
+}
+
+// checkStartupRecovery reports the degraded state recorded during repository
+// construction and fails startup when the operator asked for fail-fast
+// behaviour.
+func (v *Venue) checkStartupRecovery() error {
+	v.recoveryMu.Lock()
+	incomplete := len(v.incompleteRecoveries)
+	v.recoveryMu.Unlock()
+
+	if incomplete == 0 {
+		return nil
+	}
+
+	if !v.config.FailFastOnStartupRecoveryFailure {
+		v.emit(context.Background(), slog.LevelWarn, "startup_degraded",
+			"Starting with an empty metadata database; queued file records were not recovered",
+			slog.Int("incomplete_recoveries", incomplete))
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%d metadata database(s) could not be recovered from a backup and startup fail-fast is enabled: %w",
+		incomplete,
+		core.ErrDatabaseError,
+	)
 }
 
 // isNilService reports whether a background service is absent, including a
