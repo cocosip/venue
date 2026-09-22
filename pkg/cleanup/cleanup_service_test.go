@@ -282,27 +282,12 @@ func TestCleanupOrphanedMetadata(t *testing.T) {
 func TestCleanupEmptyDirectories(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = repo.Close() }()
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	volumes := createTestVolumes(t)
-	defer cleanupVolumes(volumes)
-
-	sched, _ := scheduler.NewFileScheduler(repo, volumes, nil)
-
-	opts := &CleanupServiceOptions{
-		TenantManager:      &stubTenantManager{},
-		MetadataRepository: repo,
-		FileScheduler:      sched,
-		Volumes:            volumes,
-	}
-
-	service, _ := NewCleanupService(opts)
-
 	t.Run("Remove empty directories", func(t *testing.T) {
-		// Create some empty directories
-		vol := volumes["test-volume"]
+		// An unsharded volume protects only the tenant directory itself, so the
+		// empty directories below it are reclaimable.
+		service, volumes := newShardDepthCleanupService(t, 0, newMultiTenantManager("test-tenant"))
+		vol := volumes["vol-1"]
+
 		emptyDir1 := filepath.Join(vol.MountPath(), "tenant1", "empty1")
 		emptyDir2 := filepath.Join(vol.MountPath(), "tenant1", "empty2")
 
@@ -344,25 +329,31 @@ func TestCleanupEmptyDirectories(t *testing.T) {
 	})
 
 	t.Run("Preserve system managed directories", func(t *testing.T) {
-		vol := volumes["test-volume"]
+		// The asserted layout is a two-level shard chain below the tenant
+		// directory, so the volume reports depth 2 and the sweep must protect
+		// exactly those shard positions plus the date hierarchy.
+		service, volumes := newShardDepthCleanupService(t, 2, newMultiTenantManager("test-tenant"))
+		vol := volumes["vol-1"]
 
 		tenantRoot := filepath.Join(vol.MountPath(), "tenant-system")
 		dateDir := filepath.Join(tenantRoot, "2026", "04", "04")
 		hourDir := filepath.Join(dateDir, "15")
 		shardDir := filepath.Join(vol.MountPath(), "ab", "cd", "ef")
-		customEmptyDir := filepath.Join(tenantRoot, "custom-empty")
+		// A directory below the protected chain is not a shard position and must
+		// still be reclaimed.
+		deepEmptyDir := filepath.Join(hourDir, "unused")
 
 		_ = os.MkdirAll(hourDir, 0755)
 		_ = os.MkdirAll(shardDir, 0755)
-		_ = os.MkdirAll(customEmptyDir, 0755)
+		_ = os.MkdirAll(deepEmptyDir, 0755)
 
 		stats, err := service.CleanupEmptyDirectories(ctx)
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
 
-		if stats.EmptyDirectoriesRemoved == 0 {
-			t.Error("Expected at least one non-system empty directory to be removed")
+		if stats.EmptyDirectoriesRemoved != 1 {
+			t.Errorf("Expected exactly the below-chain empty directory to be removed, got %d", stats.EmptyDirectoriesRemoved)
 		}
 
 		if _, err := os.Stat(vol.MountPath()); err != nil {
@@ -385,8 +376,8 @@ func TestCleanupEmptyDirectories(t *testing.T) {
 			t.Fatalf("Expected shard directory to remain, got %v", err)
 		}
 
-		if _, err := os.Stat(customEmptyDir); !os.IsNotExist(err) {
-			t.Fatalf("Expected custom empty directory to be removed, got %v", err)
+		if _, err := os.Stat(deepEmptyDir); !os.IsNotExist(err) {
+			t.Fatalf("Expected below-chain empty directory to be removed, got %v", err)
 		}
 	})
 }

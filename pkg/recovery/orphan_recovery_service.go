@@ -23,6 +23,11 @@ import (
 // backlog is drained gradually instead of in one unbounded pass.
 const defaultBatchSize = 1000
 
+// Optional core capabilities implemented by this service. Callers type-assert
+// them, so an implementation drift must fail the build here rather than silently
+// degrade a caller to its fallback path.
+var _ core.TenantOrphanRecoveryService = (*OrphanRecoveryService)(nil)
+
 // OrphanRecoveryServiceOptions configures the orphan recovery service.
 type OrphanRecoveryServiceOptions struct {
 	// MetadataRepository stores the rebuilt metadata records.
@@ -30,6 +35,14 @@ type OrphanRecoveryServiceOptions struct {
 
 	// Volumes are the storage volumes scanned for orphaned files.
 	Volumes map[string]core.StorageVolume
+
+	// TenantManager verifies tenant existence for the tenant-scoped entry point
+	// (RecoverOrphanedFilesForTenant).
+	//
+	// It is optional: RecoverNow scans every tenant and works without it. When it
+	// is nil, the tenant-scoped entry point fails closed instead of scanning a
+	// tenant whose existence could not be verified.
+	TenantManager core.TenantManager
 
 	// TenantQuotaManager and DirectoryQuotaManager keep quotas consistent with
 	// recovered records. They may be nil, in which case quotas are not updated.
@@ -69,11 +82,12 @@ type OrphanRecoveryServiceOptions struct {
 // and when no metadata exists for that pair. Everything else is counted as
 // skipped, never guessed.
 type OrphanRecoveryService struct {
-	metadataRepo core.MetadataRepository
-	volumes      map[string]core.StorageVolume
-	tenantQuota  core.TenantQuotaManager
-	dirQuota     core.DirectoryQuotaManager
-	logger       *logging.Runtime
+	metadataRepo  core.MetadataRepository
+	volumes       map[string]core.StorageVolume
+	tenantManager core.TenantManager
+	tenantQuota   core.TenantQuotaManager
+	dirQuota      core.DirectoryQuotaManager
+	logger        *logging.Runtime
 
 	recoveryInterval time.Duration
 	initialDelay     time.Duration
@@ -127,6 +141,7 @@ func NewOrphanRecoveryService(opts *OrphanRecoveryServiceOptions) (*OrphanRecove
 	return &OrphanRecoveryService{
 		metadataRepo:     opts.MetadataRepository,
 		volumes:          opts.Volumes,
+		tenantManager:    opts.TenantManager,
 		tenantQuota:      opts.TenantQuotaManager,
 		dirQuota:         opts.DirectoryQuotaManager,
 		logger:           logger,
@@ -250,7 +265,7 @@ func (s *OrphanRecoveryService) RecoverNow(ctx context.Context) (*core.OrphanRec
 			return report, err
 		}
 		volume := s.volumes[volumeID]
-		if err := s.recoverVolume(ctx, volumeID, volume, report); err != nil {
+		if err := s.recoverVolume(ctx, volumeID, volume, "", report); err != nil {
 			report.AddError("volume %s: %v", volumeID, err)
 		}
 	}
@@ -258,10 +273,74 @@ func (s *OrphanRecoveryService) RecoverNow(ctx context.Context) (*core.OrphanRec
 	return report, nil
 }
 
+// RecoverOrphanedFilesForTenant scans every configured volume for physical files
+// that belong to tenantID and rebuilds their missing metadata as Pending.
+//
+// Only the named tenant's own storage directories are inspected and only files
+// whose stored layout resolves to that tenant are registered, so the scan can
+// never attribute another tenant's file. The rebuild reuses the same logic as
+// RecoverNow, including the size/mtime stability check and the tenant and
+// directory quota safeguards.
+//
+// Scans are serialized with RecoverNow through the same lock, so the periodic
+// loop and a tenant-scoped call cannot both register the same file (and charge
+// its quota twice). Recovery only ever adds a metadata record for a file that
+// has none; it never moves or rewrites a tenant's payload, so it is safe to run
+// while the runtime serves normal storage operations.
+//
+// Errors:
+//   - ErrInvalidArgument when tenantID is empty or unsafe as a path segment
+//   - ErrTenantNotFound when no tenant with that ID exists; the lookup is
+//     read-only and never creates a tenant
+//   - a configuration error when no TenantManager was configured, because an
+//     unverified tenant must never be scanned
+func (s *OrphanRecoveryService) RecoverOrphanedFilesForTenant(ctx context.Context, tenantID string) (*core.OrphanRecoveryReport, error) {
+	report := core.NewOrphanRecoveryReport()
+
+	// The tenant identifier becomes a path segment, so it is validated before it
+	// can be joined onto a volume root.
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return report, fmt.Errorf("invalid tenant identifier for orphan recovery: %w", err)
+	}
+
+	if s.tenantManager == nil {
+		return report, fmt.Errorf("cannot verify tenant %s because no tenant manager is configured", tenantID)
+	}
+
+	if _, ok, err := s.tenantManager.TryGetTenant(ctx, tenantID); err != nil {
+		return report, fmt.Errorf("failed to read tenant %s: %w", tenantID, err)
+	} else if !ok {
+		return report, fmt.Errorf("tenant %s does not exist: %w", tenantID, core.ErrTenantNotFound)
+	}
+
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+
+	for _, volumeID := range sortedVolumeIDs(s.volumes) {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		volume := s.volumes[volumeID]
+		if err := s.recoverVolume(ctx, volumeID, volume, tenantID, report); err != nil {
+			report.AddError("volume %s: %v", volumeID, err)
+		}
+	}
+
+	return report, nil
+}
+
+// recoverVolume scans one volume and rebuilds missing metadata.
+//
+// tenantScope restricts the walk to that tenant's directory below the volume
+// mount and requires every recovered file to resolve to that tenant; an empty
+// scope scans the whole volume. Paths are always interpreted relative to the
+// volume mount, so the tenant segment stays the first segment of the layout
+// ParsePhysicalPath expects.
 func (s *OrphanRecoveryService) recoverVolume(
 	ctx context.Context,
 	volumeID string,
 	volume core.StorageVolume,
+	tenantScope string,
 	report *core.OrphanRecoveryReport,
 ) error {
 	mountPath := volume.MountPath()
@@ -269,8 +348,27 @@ func (s *OrphanRecoveryService) recoverVolume(
 		return fmt.Errorf("volume %s has no mount path", volumeID)
 	}
 
+	walkRoot := mountPath
+	if tenantScope != "" {
+		walkRoot = filepath.Join(mountPath, tenantScope)
+
+		// A tenant that has not materialized a directory on this volume has no
+		// orphaned file here. Any other stat failure means the subtree could not
+		// be inspected, which is reported rather than reported as success.
+		info, statErr := os.Stat(walkRoot)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return nil
+			}
+			return fmt.Errorf("failed to inspect tenant %s: %w", tenantScope, statErr)
+		}
+		if !info.IsDir() {
+			return nil
+		}
+	}
+
 	limit := s.batchSize
-	return filepath.Walk(mountPath, func(path string, info os.FileInfo, walkErr error) error {
+	return filepath.Walk(walkRoot, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return nil // Skip unreadable entries; the next scan retries.
 		}
@@ -295,6 +393,12 @@ func (s *OrphanRecoveryService) recoverVolume(
 
 		tenantID, fileKey, ok := ParsePhysicalPath(relativePath)
 		if !ok {
+			report.FilesSkipped++
+			return nil
+		}
+		// Defense in depth: a tenant-scoped scan must never attribute another
+		// tenant's file, whatever the walked subtree contains.
+		if tenantScope != "" && tenantID != tenantScope {
 			report.FilesSkipped++
 			return nil
 		}

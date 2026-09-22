@@ -333,30 +333,35 @@ func TestCleanupEmptyDirectories_RemovesBottomUp(t *testing.T) {
 }
 
 // TestCleanupEmptyDirectories_ProtectsShardDirectories verifies that the shard
-// hierarchy is protected for realistic tenant identifiers, so a sweep cannot
-// race WriteFile's MkdirAll -> Create window.
+// hierarchy reported by the volume is protected for realistic tenant
+// identifiers, so a sweep cannot race WriteFile's MkdirAll -> Create window.
 func TestCleanupEmptyDirectories_ProtectsShardDirectories(t *testing.T) {
-	service, _, volumes := newRegressionCleanupService(t, []string{"test-tenant"}, nil)
+	// The fixture below is a two-level shard chain, so the volume reports the
+	// depth the sweep must honor exactly.
+	service, volumes := newShardDepthCleanupService(t, 2, newMultiTenantManager("test-tenant"))
 
-	mount := volumes["test-volume"].MountPath()
+	mount := volumes["vol-1"].MountPath()
 	protected := []string{
 		filepath.Join(mount, "tenant-001", "ab"),
 		filepath.Join(mount, "tenant-001", "ab", "cd"),
 		filepath.Join(mount, "tenant-001", "2026", "04", "04", "15"),
 	}
-	customEmpty := filepath.Join(mount, "tenant-001", "custom-empty")
+	// The date hierarchy above is protected as a system layout, but a directory
+	// below the protected chain is not a shard position and stays reclaimable.
+	removable := filepath.Join(mount, "tenant-001", "2026", "04", "04", "15", "unused")
 
-	for _, path := range protected {
+	for _, path := range append(append([]string{}, protected...), removable) {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			t.Fatalf("MkdirAll(%s) error = %v", path, err)
 		}
 	}
-	if err := os.MkdirAll(customEmpty, 0755); err != nil {
-		t.Fatalf("MkdirAll(%s) error = %v", customEmpty, err)
-	}
 
-	if _, err := service.CleanupEmptyDirectories(context.Background()); err != nil {
+	stats, err := service.CleanupEmptyDirectories(context.Background())
+	if err != nil {
 		t.Fatalf("CleanupEmptyDirectories() error = %v", err)
+	}
+	if stats.EmptyDirectoriesRemoved != 1 {
+		t.Errorf("EmptyDirectoriesRemoved = %d, want 1", stats.EmptyDirectoriesRemoved)
 	}
 
 	for _, path := range protected {
@@ -364,8 +369,8 @@ func TestCleanupEmptyDirectories_ProtectsShardDirectories(t *testing.T) {
 			t.Errorf("expected shard/date directory %s to be protected, stat error = %v", path, statErr)
 		}
 	}
-	if _, statErr := os.Stat(customEmpty); !os.IsNotExist(statErr) {
-		t.Errorf("expected non-system empty directory to be removed, stat error = %v", statErr)
+	if _, statErr := os.Stat(removable); !os.IsNotExist(statErr) {
+		t.Errorf("expected below-chain empty directory to be removed, stat error = %v", statErr)
 	}
 }
 

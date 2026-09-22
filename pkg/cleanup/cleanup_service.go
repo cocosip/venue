@@ -20,6 +20,14 @@ import (
 // once.
 const cleanupPageSize = 500
 
+// Optional core capabilities implemented by this service. Callers type-assert
+// them, so an implementation drift must fail the build here rather than silently
+// degrade a caller to its fallback path.
+var (
+	_ core.DatabaseOptimizationService = (*cleanupService)(nil)
+	_ core.TenantCleanupService        = (*cleanupService)(nil)
+)
+
 // CleanupServiceOptions configures the cleanup service.
 type CleanupServiceOptions struct {
 	// TenantManager provides the tenant scope for maintenance scans.
@@ -281,7 +289,8 @@ func (s *cleanupService) emit(ctx context.Context, level slog.Level, event, mess
 	})
 }
 
-// CleanupEmptyDirectories removes empty directories recursively.
+// CleanupEmptyDirectories removes empty directories recursively, for every
+// tenant on every configured volume.
 //
 // Directory removal is best-effort per directory, but the sweep itself is not:
 // walk failures and context cancellation are reported so a failed sweep is never
@@ -294,20 +303,66 @@ func (s *cleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.Cle
 		ctx = context.Background()
 	}
 
-	s.mu.RLock()
-	volumes := make(map[string]core.StorageVolume, len(s.volumes))
-	for k, v := range s.volumes {
-		volumes[k] = v
-	}
-	s.mu.RUnlock()
-
 	// For each volume, scan and remove empty directories
-	for _, volume := range volumes {
+	for _, volume := range s.volumeSnapshot() {
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
 
-		removed, err := s.cleanupEmptyDirsInVolume(ctx, volume)
+		removed, err := s.cleanupEmptyDirsInVolume(ctx, volume, "")
+		stats.EmptyDirectoriesRemoved += removed
+		if err != nil {
+			return stats, err
+		}
+	}
+
+	return stats, nil
+}
+
+// CleanupEmptyDirectoriesForTenant removes empty directories for one tenant
+// only, on every configured volume.
+//
+// The sweep is bounded to the tenant's own directory on each volume, so it never
+// inspects or removes another tenant's directories. Every safety rule of the
+// all-tenant sweep applies unchanged: the volume root, the tenant directory (the
+// minimum protection depth of a tenant-scoped sweep) and the volume's shard
+// directories are never removed. A tenant that has not materialized a directory
+// on a volume is skipped; directory removal stays best-effort per directory, and
+// walk failures and context cancellation are reported so a failed sweep is never
+// reported as success.
+//
+// The tenant lookup is read-only: an unknown tenant is rejected instead of being
+// created as a side effect.
+//
+// Errors:
+//   - ErrInvalidArgument when tenantID is empty or unsafe as a path segment
+//   - ErrTenantNotFound when no tenant with that ID exists
+func (s *cleanupService) CleanupEmptyDirectoriesForTenant(ctx context.Context, tenantID string) (*core.CleanupStatistics, error) {
+	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// The tenant identifier becomes a path segment, so it is validated before it
+	// can be joined onto a volume root.
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		return stats, fmt.Errorf("invalid tenant identifier for directory cleanup: %w", err)
+	}
+
+	if _, ok, err := s.tenantManager.TryGetTenant(ctx, tenantID); err != nil {
+		return stats, fmt.Errorf("failed to read tenant %s: %w", tenantID, err)
+	} else if !ok {
+		return stats, fmt.Errorf("tenant %s does not exist: %w", tenantID, core.ErrTenantNotFound)
+	}
+
+	for _, volume := range s.volumeSnapshot() {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+
+		removed, err := s.cleanupEmptyDirsInVolume(ctx, volume, tenantID)
 		stats.EmptyDirectoriesRemoved += removed
 		if err != nil {
 			return stats, err
@@ -319,15 +374,39 @@ func (s *cleanupService) CleanupEmptyDirectories(ctx context.Context) (*core.Cle
 
 // cleanupEmptyDirsInVolume removes empty directories in a specific volume.
 //
+// scopeTenantID restricts the sweep to that tenant's directory below the volume
+// mount; an empty value sweeps the whole volume. The caller must have validated
+// the tenant identifier before it reaches this helper.
+//
 // Removal repeats until no further directory can be removed, so a nested chain of
 // now-empty parents is reclaimed within a single cycle. Directories are re-checked
 // for emptiness at removal time because removing a child makes its parent empty.
-func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume core.StorageVolume) (int, error) {
+func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume core.StorageVolume, scopeTenantID string) (int, error) {
 	mountPath := volume.MountPath()
+	rootPath := mountPath
+
+	if scopeTenantID != "" {
+		rootPath = filepath.Join(mountPath, scopeTenantID)
+
+		// A tenant that has not materialized a directory on this volume has
+		// nothing to clean. Any other stat failure means the subtree could not be
+		// inspected, which is reported rather than reported as success.
+		info, err := os.Stat(rootPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return 0, nil
+			}
+			return 0, fmt.Errorf("failed to inspect tenant directory %s on volume %s: %w", scopeTenantID, volume.VolumeID(), err)
+		}
+		if !info.IsDir() {
+			return 0, nil
+		}
+	}
+
 	removed := 0
 
 	for {
-		candidates, err := s.emptyDirCandidates(ctx, mountPath)
+		candidates, err := s.emptyDirCandidates(ctx, volume, rootPath)
 		if err != nil {
 			if removed == 0 {
 				return 0, err
@@ -368,19 +447,26 @@ func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume co
 	}
 }
 
-// emptyDirCandidates walks one volume and returns every unprotected directory
-// that is empty right now.
-func (s *cleanupService) emptyDirCandidates(ctx context.Context, mountPath string) ([]string, error) {
+// emptyDirCandidates walks one subtree of a volume and returns every unprotected
+// directory that is empty right now.
+//
+// rootPath is the volume mount for an all-tenant sweep, or one tenant's
+// directory for a tenant-scoped sweep. Protection is always evaluated relative
+// to the volume mount, so neither the volume root, nor the tenant level, nor a
+// shard directory is ever a candidate.
+func (s *cleanupService) emptyDirCandidates(ctx context.Context, volume core.StorageVolume, rootPath string) ([]string, error) {
+	mountPath := volume.MountPath()
+	shards := volumeShardDepth(volume)
 	candidates := make([]string, 0)
 
-	walkErr := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
+	walkErr := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		if err != nil {
 			// The walk root itself is not optional: report it so callers can tell
 			// an unavailable volume apart from an empty one.
-			if path == mountPath {
+			if path == rootPath {
 				return err
 			}
 			return nil
@@ -388,7 +474,7 @@ func (s *cleanupService) emptyDirCandidates(ctx context.Context, mountPath strin
 		if info == nil || !info.IsDir() {
 			return nil
 		}
-		if isProtectedSystemDirectory(mountPath, path) {
+		if isProtectedSystemDirectory(mountPath, path, shards) {
 			return nil
 		}
 
@@ -417,7 +503,39 @@ func pathDepth(path string) int {
 	return strings.Count(cleaned, string(filepath.Separator))
 }
 
-func isProtectedSystemDirectory(mountPath string, path string) bool {
+// shardDepthProtection describes how the shard chain below a volume's tenant
+// directory is protected from empty-directory removal.
+type shardDepthProtection struct {
+	// depth is the number of two-character shard segments directly below the
+	// tenant directory.
+	depth int
+	// exact reports whether depth is the volume's own reported value. When it is
+	// false, the structural heuristic is used instead.
+	exact bool
+}
+
+// volumeShardDepth resolves shard protection for one volume.
+//
+// A volume that implements core.ShardingDepthProvider reports its configured
+// sharding depth, which is then used exactly: the tenant directory and every
+// segment down to the last shard level are protected, and nothing deeper is. The
+// structural heuristic is only a fallback for volumes that cannot report a
+// depth, where the layout has to be inferred from the path segments.
+func volumeShardDepth(volume core.StorageVolume) shardDepthProtection {
+	provider, ok := volume.(core.ShardingDepthProvider)
+	if !ok {
+		return shardDepthProtection{}
+	}
+
+	depth := provider.ShardingDepth()
+	if depth < 0 {
+		depth = 0
+	}
+
+	return shardDepthProtection{depth: depth, exact: true}
+}
+
+func isProtectedSystemDirectory(mountPath string, path string, shards shardDepthProtection) bool {
 	cleanMountPath := filepath.Clean(mountPath)
 	cleanPath := filepath.Clean(path)
 
@@ -446,7 +564,22 @@ func isProtectedSystemDirectory(mountPath string, path string) bool {
 		return true
 	}
 
-	return isProtectedDateHierarchy(parts) || isProtectedShardHierarchy(parts)
+	// Date-partitioned hierarchies are a separate system layout, so they stay
+	// protected however the shard depth is known.
+	if isProtectedDateHierarchy(parts) {
+		return true
+	}
+
+	if shards.exact {
+		// parts[0] is the tenant directory, so the shard chain occupies
+		// parts[1:1+depth]. The reported depth is used exactly: it protects every
+		// directory a concurrent WriteFile could be creating with MkdirAll, and
+		// it protects nothing deeper, so directories that merely look like shards
+		// far below the chain are still reclaimed.
+		return len(parts) <= 1+shards.depth
+	}
+
+	return isProtectedShardHierarchy(parts)
 }
 
 func isProtectedDateHierarchy(parts []string) bool {
