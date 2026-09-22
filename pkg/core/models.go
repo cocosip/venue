@@ -566,6 +566,33 @@ type FileWatcherRootConfiguration struct {
 
 	// MaxConcurrentImports limits concurrent imports per generated watcher.
 	MaxConcurrentImports int
+
+	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
+	// automatic tenant-directory creation. Zero selects the runtime default.
+	AutoCreateTenantDirectoriesCacheTTL time.Duration
+
+	// FileStabilityCheckDelay is the delay before the second stability probe.
+	// Zero selects the runtime default; a negative value disables the probe.
+	FileStabilityCheckDelay time.Duration
+
+	// SkipStabilityCheckAfterAge skips the second stability probe for older
+	// files. Zero selects the runtime default; a negative value always probes.
+	SkipStabilityCheckAfterAge time.Duration
+
+	// EnableImportedFilesPruneThrottle throttles stale import-history pruning.
+	EnableImportedFilesPruneThrottle bool
+
+	// ImportedFilesPruneInterval is the minimum delay between prune runs while
+	// the throttle is enabled. Zero selects the runtime default.
+	ImportedFilesPruneInterval time.Duration
+
+	// EnableImportedFilesHistoryFlushDebounce coalesces import-history writes.
+	EnableImportedFilesHistoryFlushDebounce bool
+
+	// ImportedFilesHistoryFlushInterval is the minimum delay between
+	// import-history writes while the debounce is enabled. Zero selects the
+	// runtime default.
+	ImportedFilesHistoryFlushInterval time.Duration
 }
 
 // FileWatcherServiceOptions configures the background file watcher service
