@@ -23,9 +23,6 @@ vendor/
 logs/
 *.log
 
-# Repository-local Go caches and work directories
-.gotmp/
-
 Locus-Code/
 .claude/
 
@@ -63,3 +60,4 @@ CHANGELOG.md
 .kilo/
 docs/superpowers/
 .superpowers/
+.cache/

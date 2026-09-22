@@ -155,14 +155,14 @@ Testing rules:
 - Run race tests before any commit.
 - Do not weaken assertions, add retries, or serialize tests merely to hide a race.
 
-If the default Go cache is not writable in the current environment, point the caches and temporary directory at an ignored repository-local directory:
+If the default Go cache is not writable in the current environment, point the caches and temporary directory at the ignored repository-local `.cache` directory. Do not create additional cache directories:
 
 ```powershell
-$env:GOCACHE="$PWD/.gotmp/go-build"
-$env:GOLANGCI_LINT_CACHE="$PWD/.gotmp/golangci-lint"
-$env:GOTMPDIR="$PWD/.gotmp/tmp"
-$env:TMP="$PWD/.gotmp/tmp"
-$env:TEMP="$PWD/.gotmp/tmp"
+$env:GOCACHE="$PWD/.cache/go-build"
+$env:GOLANGCI_LINT_CACHE="$PWD/.cache/golangci-lint"
+$env:GOTMPDIR="$PWD/.cache/tmp"
+$env:TMP="$PWD/.cache/tmp"
+$env:TEMP="$PWD/.cache/tmp"
 ```
 
 ## Benchmarks
@@ -188,3 +188,6 @@ go test -run '^$' -bench=. -benchmem ./test/benchmark
 - Preserve unrelated user changes in a dirty worktree.
 - Do not stage, commit, pull, push, create branches, or rewrite history unless explicitly requested.
 - Work on the current branch when requested; do not create a worktree or branch.
+
+## Cache Directory
+- The `.cache` directory is used for project build and package caching, and is already added to `.gitignore`. During testing and debugging, relevant caches can be configured under this directory. No additional cache directories should be created.

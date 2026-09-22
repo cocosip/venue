@@ -12,6 +12,9 @@ paths, queue state, retries, and cleanup.
 - Retry scheduling with optional exponential backoff.
 - Background cleanup, directory watchers, and database health checks.
 - Optional orphan-file recovery that rebuilds metadata lost in the write window.
+- Optional bounded in-process statistics with an optional periodic log summary.
+- Opt-in consistent metadata backups with offline restore.
+- Per-volume startup health retry and an optional advisory write-path warm-up.
 - A public configuration model that does not depend on a configuration-file library.
 - Optional Viper integration through the separate `viperconfig` package.
 - Instance-scoped structured logging without reading or replacing `slog.Default()`.
@@ -159,6 +162,7 @@ The configuration lifecycle is:
 | `AutoCreateTenants` | `autoCreateTenants` | Allow unknown tenants to be created on demand |
 | `DefaultTenantQuota` | `defaultTenantQuota` | Default maximum file count; `0` is unlimited |
 | `EnableDatabaseHealthCheck` | `enableDatabaseHealthCheck` | Start database and volume health checks |
+| `FailFastOnStartupRecoveryFailure` | `failFastOnStartupRecoveryFailure` | Fail startup when a metadata database was quarantined and no backup could be restored |
 | `RetryPolicy` | `retryPolicy` | Retry count, delay, and backoff behavior |
 | `TenantManager` | `tenantManagerOptions` | Tenant metadata path and cache TTL |
 | `Metadata` | `metadataOptions` | Active metadata cache settings |
@@ -172,6 +176,7 @@ The configuration lifecycle is:
 | `Cleanup` | `cleanupOptions` | Cleanup intervals, retention, and processing timeout |
 | `OrphanRecovery` | `orphanRecoveryOptions` | Optional orphan-file recovery (disabled by default) |
 | `DatabaseHealthCheck` | `databaseHealthCheckOptions` | Health-check retry and scheduling settings |
+| `Statistics` | `statisticsOptions` | In-process runtime statistics and optional periodic log output |
 | `Logging` | not bindable | Instance-scoped `slog.Handler`; inject in Go code only |
 
 Tenant and directory quotas count managed files, not bytes. Pending,
@@ -200,6 +205,11 @@ Each configuration module has its own constructor and chainable methods:
 | `CleanupConfig` | `config.NewCleanupConfig()` | Cleanup and processing timeouts |
 | `OrphanRecoveryConfig` | `config.NewOrphanRecoveryConfig()` | Opt-in orphan-file recovery |
 | `DatabaseHealthCheckConfig` | `config.NewDatabaseHealthCheckConfig()` | Startup and periodic checks |
+| `StatisticsConfig` | `config.NewStatisticsConfig()` | In-process statistics, dimensions, and periodic output |
+| `StatisticsDimensionConfig` | `config.NewStatisticsDimensionConfig()` | Retained statistics dimensions |
+| `StatisticsOutputConfig` | `config.NewStatisticsOutputConfig()` | Periodic statistics log output |
+| `DeadLetterConfig` | `config.NewDeadLetterConfig()` | Dead-letter root, tenant/date partitioning, and sharding |
+| `RetiredVolumeConfig` | `config.NewRetiredVolumeConfig(id)` | Retired-volume disposition |
 
 Collection methods have explicit semantics:
 
@@ -240,6 +250,9 @@ The important runtime defaults are:
 | Timed-out reclaim on empty queue | enabled (`30s` per-tenant cooldown) |
 | Corrupted database recovery | disabled (`72h` quarantine retention) |
 | Volume health probe cache | `30s` |
+| Volume startup initial delay | `2s` (applied before the first retry only) |
+| Volume startup health-check delay | `500ms` between attempts |
+| Volume warm-up write | disabled |
 | Permanently failed retention | `3d` |
 | Permanently failed disposition | `MoveToDeadLetter` |
 | Dead-letter root | `.deadletter` (per volume, tenant + date partition, shard depth `2`) |
@@ -249,6 +262,16 @@ The important runtime defaults are:
 | Completed-file retention | `0` (next cleanup cycle) |
 | Orphaned-metadata cleanup | disabled (opt-in; one existence check per record) |
 | Orphan-file recovery | disabled (`6h` interval, `10s` initial delay when enabled) |
+| Empty-queue timed-out reclaim batch | `32` |
+| Background timed-out reclaim | enabled (`8` per pass) |
+| Metadata backup runner | disabled (empty `backupDirectory`); `1h` interval and `168h` retention when enabled |
+| Automatic restore from backup | disabled |
+| Fail-fast on unrecoverable startup recovery | disabled (degraded state is reported and startup continues) |
+| Runtime statistics | disabled (`5m` window, `1h` retention, `16,384` max series) |
+| Statistics dimensions | `volume_id`, `watcher_id`, `operation` retained; `tenant_id` dropped |
+| Statistics log output | disabled (`Logging` sink, `1m` interval, `15m` query window) |
+| Advanced watcher settings | `60s` tenant-directory cache, `100ms` stability delay, `1m` stability skip age |
+| Watcher history throttle/debounce | both enabled (`5m` prune interval, `2s` flush interval) |
 | Watcher polling interval | `30s` |
 | Watcher polling bounds | `5s` minimum, `1h` maximum |
 | Watcher parallel scans | `4` |
@@ -260,6 +283,12 @@ post-import action. `enabled` and `includeSubdirectories` are booleans: the Go
 constructor `config.NewFileWatcherConfig()` sets them to `true` (matching Locus),
 but a boolean key that is absent from a bound file cannot be distinguished from
 an explicit `false`. Always set both explicitly in file configuration.
+
+The two advanced housekeeping switches are the deliberate exception:
+`disableImportedFilesPruneThrottle` and
+`disableImportedFilesHistoryFlushDebounce` are named in the negative precisely so
+that their zero value means "keep the default behavior" (the throttle and the
+debounce are on), and only an explicit `true` turns them off.
 
 See [`venue-config-example.yaml`](venue-config-example.yaml) for all bindable
 settings.
@@ -509,12 +538,24 @@ claim. Use `errors.Is` for classification and `errors.As` with
 `*core.FileProcessingLeaseMismatchError` for diagnostics.
 
 A worker whose process died leaves its file in `Processing` until either the
-cleanup cycle or an immediate reclaim releases it. Immediate reclaim is enabled
-by default: when a claim finds no available work, Venue resets up to 32 timed-out
-files for that tenant and retries once. `Cleanup.RecoverTimedOutOnEmptyQueue`
-disables it and `Cleanup.TimedOutReclaimCooldown` (default `30s`) bounds how
-often one tenant can trigger it. Reclaim always goes through the lease check, so
-a stale worker can never unseat a newer claim.
+cleanup cycle or a reclaim pass releases it. Reclaim is enabled by default on two
+independent paths:
+
+- When a claim finds no available work, Venue resets up to
+  `Cleanup.EmptyQueueReclaimBatchSize` (default `32`) timed-out files for that
+  tenant and retries once. `Cleanup.RecoverTimedOutOnEmptyQueue` disables this
+  path, and a negative batch size disables the synchronous reclaim as well.
+- A successful claim also triggers an opportunistic background pass bounded by
+  `Cleanup.BackgroundTimedOutReclaimBatchSize` (default `8`), so timed-out
+  records are recovered even when cleanup is disabled or its interval is long.
+  `Cleanup.EnableBackgroundTimedOutReclaim` (default `true`) turns it off.
+
+`Cleanup.TimedOutReclaimCooldown` (default `30s`) bounds each path separately:
+the scheduler keeps independent per-tenant cooldown state for the synchronous
+empty-queue reclaim and for the background pass, so a recent background pass
+cannot delay the emergency empty-queue reclaim, while both paths use the same
+configured cooldown value. Reclaim always goes through the lease check, so a
+stale worker can never unseat a newer claim.
 
 ### Quota Repair
 
@@ -579,16 +620,67 @@ The runtime exposes the lower-level services for operational workflows:
 | --- | --- |
 | `FileScheduler()` | Queue transitions and timeout recovery |
 | `TenantQuotaManager()` | Tenant file-count quota checks and updates |
+| `TenantQuotaAdministrator()` | Optional per-tenant and global limit administration; `(nil, false)` only for a caller-supplied manager |
 | `DirectoryQuotaManager()` | Logical-directory file-count quotas |
+| `MetadataRepository()` | Metadata persistence and status queries |
 | `CleanupService()` | Completed, failed, timed-out, orphan-metadata, junk-file, and database cleanup |
 | `OrphanRecovery()` | Orphan-file recovery (`nil` unless `OrphanRecovery.Enabled`) |
 | `FileWatcher()` | Watched-directory import management |
 | `FileWatcherAutoManager()` | Watcher derivation from configured roots (`nil` when no roots) |
 | `FileWatcherService()` | Background watcher service, including its global options |
 | `DatabaseHealthChecker()` | Startup and on-demand database health checks |
+| `Statistics()` | Aggregated in-process statistics snapshots (never `nil`) |
+| `StatisticsRecorder()` | Records application measurements into the same bounded window set (never `nil`) |
+| `MetadataBackupService()` | Periodic metadata backup runner (`nil` unless backups are configured) |
 | `Volumes()` | Configured storage volumes and their health/capacity |
 | `Config()` | Cloned runtime configuration |
 | `Logging()` | Instance-scoped logging runtime |
+
+`TenantQuotaAdministrator` is an optional capability rather than part of
+`TenantQuotaManager`, so a read-only or test implementation of the manager stays
+valid. The runtime's own manager always provides it:
+
+```go
+admin, ok := runtime.TenantQuotaAdministrator()
+if ok {
+    limit, err := admin.GetEffectiveLimit(ctx, "tenant-001") // override, else global
+    if err != nil {
+        return err
+    }
+    if err := admin.SetTenantLimit(ctx, "tenant-001", 250_000); err != nil {
+        return err
+    }
+    if err := admin.RemoveTenantLimit(ctx, "tenant-001"); err != nil { // falls back to the global limit
+        return err
+    }
+    if err := admin.SetGlobalLimit(ctx, int64(limit)); err != nil {
+        return err
+    }
+    _, err = admin.GetGlobalLimit(ctx)
+    if err != nil {
+        return err
+    }
+}
+```
+
+Two cleanup and recovery capabilities are also optional and are reached by type
+assertion, so a minimal `core.CleanupService` or `core.OrphanRecoveryService`
+implementation or test double remains valid:
+
+| Capability | Obtained from | Adds |
+| --- | --- | --- |
+| `core.DatabaseOptimizationService` | `Venue.CleanupService()` | `OptimizeDatabasesDetailed(ctx)` and its reclaimed-byte totals |
+| `core.TenantCleanupService` | `Venue.CleanupService()` | `CleanupEmptyDirectoriesForTenant(ctx, tenantID)` |
+| `core.TenantOrphanRecoveryService` | `Venue.OrphanRecovery()` | `RecoverOrphanedFilesForTenant(ctx, tenantID)` |
+
+```go
+if detailed, ok := runtime.CleanupService().(core.DatabaseOptimizationService); ok {
+    result, err := detailed.OptimizeDatabasesDetailed(ctx) // includes reclaimed bytes
+}
+if perTenant, ok := runtime.CleanupService().(core.TenantCleanupService); ok {
+    stats, err := perTenant.CleanupEmptyDirectoriesForTenant(ctx, "tenant-001")
+}
+```
 
 `EnableWatcher`/`DisableWatcher` decisions are persisted under
 `FileWatcherConfigurationDirectory` (`watcher-state.json`, written atomically).
@@ -632,6 +724,136 @@ only derived watchers, never manually registered ones. The global service
 options (including enablement) are persisted in
 `file-watcher-options.json` under the same configuration directory, and
 `Venue.FileWatcherService().UpdateOptions(ctx, ...)` applies them at runtime.
+Setting `watcherServiceOptions.enabled: false` really starts the service
+disabled: the initial construction state carries the configured value
+explicitly, so no watcher is scanned until an operator re-enables it. A
+persisted operator decision still outranks the configured value. Like the
+per-watcher booleans, this key must be written explicitly in a bound file,
+because an absent key also binds as `false`. The service itself only exists when
+at least one entry in `fileWatchers` or `watcherRoots` is configured.
+
+The advanced per-watcher settings on `fileWatchers[]` and `watcherRoots[]` tune
+the import pipeline:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `autoCreateTenantDirectoriesCacheTtl` | `60s` | How long the tenant list used by `autoCreateTenantDirectories` is cached |
+| `fileStabilityCheckDelay` | `100ms` | Delay before the second stability probe; negative disables the probe |
+| `skipStabilityCheckAfterAge` | `1m` | Skip the second probe for candidates at least this old; negative always probes |
+| `disableImportedFilesPruneThrottle` | `false` | Deliberately inverted: the prune throttle is **on** by default, so the zero value keeps it on and `true` turns it off |
+| `importedFilesPruneInterval` | `5m` | Minimum delay between prune runs while the throttle is on |
+| `disableImportedFilesHistoryFlushDebounce` | `false` | Deliberately inverted: the write debounce is **on** by default, so the zero value keeps it on and `true` turns it off |
+| `importedFilesHistoryFlushInterval` | `2s` | Minimum delay between import-history persistence writes while the debounce is on |
+
+The double-negative naming is intentional: both switches are on by default, so a
+configuration file that omits them keeps the throttled, debounced behavior
+instead of silently disabling it.
+
+The `Venue` local filesystem volume also implements the optional volume
+capabilities `core.StorageVolumeHealthProbe` (`ProbeHealth`, the forced probe
+that bypasses and refreshes the health cache),
+`core.StorageVolumeWritePathWarmup` (`WarmWritePathCache`, the throwaway write
+behind `volumes[].warmupOnStartup`), and
+`core.StorageVolumeWritePathDiagnostics` (`WritePathStatistics`, an aggregated
+write-path snapshot).
+
+### Statistics and Metadata Backups
+
+In-process statistics are disabled by default. When `Statistics.Enabled` is
+true, the runtime records bounded windowed counters for the storage, metadata,
+and watcher paths; `Venue.Statistics()` returns a reader whose `Snapshot(query)`
+aggregates the measurements in `[query.From, query.To)` and returns a
+`core.StatisticsSnapshot` with the known totals filled in. Both
+`Venue.Statistics()` and `Venue.StatisticsRecorder()` are never `nil`: when
+statistics are disabled they return the noop implementations, so a `Snapshot`
+call answers with an empty snapshot and a `Record` call drops its value.
+
+```go
+snapshot := runtime.Statistics().Snapshot(core.StatisticsQuery{
+    From: time.Now().Add(-15 * time.Minute),
+    To:   time.Now(),
+})
+fmt.Println(snapshot.WriteFileCount, snapshot.WriteBytes)
+
+runtime.StatisticsRecorder().Record("app.batch.size", int64(len(batch)), time.Now(), nil)
+```
+
+`Statistics.Dimensions` selects which low-cardinality dimensions are retained;
+`tenant_id` is off by default because it is high-cardinality.
+`Statistics.MaxSeries` (default `16,384`, valid range `1024`–`262144`) bounds the
+retained series so a high-cardinality workload cannot grow memory without limit,
+and `Statistics.Retention` must be greater than or equal to
+`Statistics.WindowSize`. When `Statistics.Output.Enabled` is true and
+`Statistics.Output.Sink` is `Logging` (the only supported sink), the runtime logs
+a periodic summary through the injected handler at `Output.Interval`, covering
+`Output.QueryWindow`; `Output.IncludeEmptySnapshots` also emits an all-zero
+summary.
+
+Metadata backups are opt-in and need an operator-owned directory:
+
+```yaml
+venue:
+  badgerDBOptions:
+    backupDirectory: ./venue-backups
+    backupInterval: 1h
+    backupRetention: 168h
+    autoRestoreFromBackup: false
+```
+
+With `backupDirectory` set and a positive `backupInterval`, the runtime starts a
+backup runner with the other background services and writes consistent online
+backups named `metadata.<yyyyMMddTHHmmssZ>.bak`; the run does not stop the queue
+or block writers. `backupRetention` (default `168h`; `0` disables pruning)
+removes backups older than the window on the next cycle, and
+`autoRestoreFromBackup` restores the newest valid backup into a metadata database
+that had to be quarantined instead of leaving it empty. `autoRestoreFromBackup`
+requires `recoverCorruptedDatabase: true` and a non-empty `backupDirectory`, and
+the restored state is only as new as the newest backup.
+
+- `Venue.BackupMetadata(ctx, w)` writes one ad-hoc backup stream to `w` and
+  returns the engine sequence number it was taken at.
+- `venue.RestoreMetadata(ctx, cfg, r)` restores that stream into the metadata
+  database directory `cfg` describes. It is an offline step: the directory must
+  be absent or empty, and the caller must not have a runtime running against it
+  (restore first, then call `NewVenue`). A non-empty directory is rejected and
+  left untouched, and a failed restore removes the directory it created.
+- `Venue.MetadataBackupInfo()` reports the newest backup on disk
+  (`core.MetadataBackupInfo`: path, timestamp, count, and total bytes). It reads
+  the filesystem rather than the running service, so it also works when backup
+  scheduling is disabled.
+- `Venue.MetadataBackupService()` returns the periodic runner (`nil` unless
+  backups are configured); its `LatestBackup` accessor is the observable "closest
+  recoverable point".
+
+Venue's recoverability is therefore **backup-period granularity**, not Locus's
+per-event queue journal: a restore returns every record committed before the
+backup instant and nothing committed after it.
+
+If a metadata database has to be quarantined and no backup can be restored, the
+runtime reports a degraded state and continues with an empty database. Set
+`FailFastOnStartupRecoveryFailure: true` to fail startup instead, for example
+when serving an empty queue is worse than not starting.
+
+### Startup Volume Preparation
+
+`NewVenue` waits for every configured volume to be usable before any component
+can select one, and performs the optional warm-up write:
+
+- A volume that answers the first probe is never delayed.
+- A volume that does not answer is retried with `volumes[].initialDelay`
+  (default `2s`) before the first retry, then up to **10** attempts separated by
+  `volumes[].healthCheckDelay` (default `500ms`), and must answer **two
+  consecutive** healthy probes to count as ready.
+- A volume that never becomes healthy fails startup with
+  `core.ErrStorageVolumeUnavailable`.
+- `volumes[].warmupOnStartup` (default `false`) performs one throwaway write
+  through the real write path after the health checks, so the first real write
+  does not pay for a cold path. Warm-up is advisory: a failure is logged and
+  never disables the volume.
+
+Both delays are validated as non-negative. They are `time.Duration` fields on
+`VolumeConfig`, so set them by direct assignment or in the configuration file
+(there is no fluent setter for them).
 
 `DatabaseHealthChecker` verifies the real metadata and quota database
 directories (`<metadataDirectory>/shared/metadata` and
@@ -675,33 +897,58 @@ deliberate and are part of the supported behaviour:
 - **Tenant quota `0` means unlimited.** Locus treats a stored `0` as "inherit
   the global limit". Venue's semantics are explicit: a `nil` tenant quota
   inherits `DefaultTenantQuota`; an explicit `0` is unlimited.
-- **Processing-timeout recovery** runs on the cleanup cycle *and* immediately
-  when a claim finds an empty queue (`Cleanup.RecoverTimedOutOnEmptyQueue`,
-  default enabled, `Cleanup.TimedOutReclaimCooldown` default `30s`). Locus
-  additionally reclaims at a low rate in the background; Venue covers that with
-  the cleanup cycle.
+- **Processing-timeout recovery** runs on the cleanup cycle, immediately when a
+  claim finds an empty queue (`Cleanup.RecoverTimedOutOnEmptyQueue`, default
+  enabled), and opportunistically in the background after a successful claim
+  (`Cleanup.EnableBackgroundTimedOutReclaim`, default enabled). Each path has its
+  own batch bound (`Cleanup.EmptyQueueReclaimBatchSize` default `32`,
+  `Cleanup.BackgroundTimedOutReclaimBatchSize` default `8`) and its own per-tenant
+  cooldown state, both bounded by `Cleanup.TimedOutReclaimCooldown` (default
+  `30s`), so a recent background pass cannot delay the emergency reclaim.
 - **Status scans are paged** for maintenance paths (`core.StatusPageReader`,
   500 records per page), so a large store is never materialised at once.
+- **Startup volume preparation** retries a volume that does not answer its first
+  probe with `volumes[].initialDelay` (default `2s`) before the first retry, up to
+  10 attempts separated by `volumes[].healthCheckDelay` (default `500ms`), and
+  requires two consecutive healthy probes. `volumes[].warmupOnStartup` performs
+  one advisory throwaway write through the real write path.
+- **Metadata recoverability is backup-based.** Locus rebuilds from its per-event
+  queue journal; Venue writes opt-in consistent Badger backups
+  (`badgerDBOptions.backupDirectory`, `backupInterval` default `1h`,
+  `backupRetention` default `168h`) and restores them offline. A restore is
+  therefore only as new as the newest backup, and
+  `FailFastOnStartupRecoveryFailure` (default `false`) decides whether an
+  unrecoverable quarantine fails startup or continues degraded.
+- **Runtime statistics are in-process and bounded**
+  (`statisticsOptions.enabled`, default `false`), with optional periodic log
+  output through the injected handler rather than an external metrics sink.
 - **Tenant metadata is not migrated from Locus.** Locus persists numeric
   `TenantStatus` values with different numbers (`Enabled = 1`); Venue uses
   `Enabled = 0`. Do not copy Locus tenant JSON files into a Venue metadata
   directory.
 
-Not implemented (out of scope for this project, listed for completeness): the
-durable per-tenant `queue.log` journal with projections, snapshots, and
-compaction (see `docs/locus-feature-gaps.md` for the recovery guarantee this
-affects and the planned mitigation); the optional in-process statistics
-recorder/reader and its periodic logging output; the Locus quota
-projection/compensation managers (Venue rebuilds counts from stored metadata at
-startup and on demand instead); queue-projection observability; and the Locus
-volume write-path diagnostics/warmup surface.
+Not implemented (out of scope for this project, listed for completeness):
+
+- The durable per-tenant `queue.log` journal with projections, snapshots, and
+  compaction, together with the queue-projection observability surface built on
+  it (lag, snapshot, gap, and corrupt-tail diagnostics). Venue's metadata is a
+  shared BadgerDB store with synchronous transactions, so queue state cannot be
+  replayed event by event; `docs/locus-feature-gaps.md` records the recovery
+  guarantee this affects and the mitigation that is in place.
+- The Locus quota projection/compensation managers. Venue rebuilds tenant and
+  directory counts from stored metadata at startup and on demand through
+  `ReconcileQuotaCounts`, and compensates on the write path.
 
 Implemented and aligned with Locus: permanently-failed disposition with
 dead-letter storage, junk-file cleanup, quarantined-database cleanup,
 retired-volume policy, cumulative cleanup statistics, watcher root derivation,
-global watcher options with a persisted global enablement switch, and
-`UpdateWatcher`. See `docs/locus-feature-gaps.md` for the tracked remainder
-(W3 statistics, W4 metadata recovery, W5 small parity items).
+global watcher options with a global enable/disable switch and a persisted
+operator decision, `UpdateWatcher`, the advanced per-watcher import knobs,
+runtime statistics with optional periodic log output, metadata backup with
+offline restore, per-volume startup health retry and warmup, configurable
+timed-out reclaim bounds, tenant quota limit administration, per-tenant cleanup
+and orphan-recovery entry points, and the volume probe/warmup/diagnostics
+capabilities. See `docs/locus-feature-gaps.md` for the tracked remainder.
 
 ## Build and Verification
 
@@ -714,14 +961,14 @@ golangci-lint run
 ```
 
 On a restricted environment where the default Go cache is not writable, point
-the caches at an ignored repository-local directory:
+the caches at the ignored repository-local cache directory:
 
 ```powershell
-$env:GOCACHE="$PWD/.gotmp/go-build"
-$env:GOLANGCI_LINT_CACHE="$PWD/.gotmp/golangci-lint"
-$env:GOTMPDIR="$PWD/.gotmp/tmp"
-$env:TMP="$PWD/.gotmp/tmp"
-$env:TEMP="$PWD/.gotmp/tmp"
+$env:GOCACHE="$PWD/.cache/go-build"
+$env:GOLANGCI_LINT_CACHE="$PWD/.cache/golangci-lint"
+$env:GOTMPDIR="$PWD/.cache/tmp"
+$env:TMP="$PWD/.cache/tmp"
+$env:TEMP="$PWD/.cache/tmp"
 ```
 
 ## Benchmarks
@@ -791,6 +1038,7 @@ pkg/recovery/        Opt-in orphan-file recovery
 pkg/watcher/         Watched-directory imports
 pkg/health/          Database and volume health checks
 pkg/logging/         Instance-scoped slog runtime
+pkg/statistics/      Bounded in-process runtime statistics
 examples/            Runnable examples
 test/benchmark/      Public-entry system benchmarks
 ```

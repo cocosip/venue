@@ -1,16 +1,18 @@
-# Venue 示例
+# Venue Examples
 
-仓库包含两个可运行示例，均使用公共入口 `venue.NewVenue(*config.Config)`。
+The repository ships two runnable examples. Both go through the public entry
+point `venue.NewVenue(*config.Config)`.
 
-## 程序化配置
+## Programmatic Configuration
 
-`simple-venue` 展示链式配置、实例生命周期、租户获取以及文件写入和读取：
+`simple-venue` demonstrates fluent configuration, the instance lifecycle,
+tenant lookup, and file write and read:
 
 ```powershell
 go run ./examples/simple-venue
 ```
 
-核心配置方式：
+The core configuration shape:
 
 ```go
 cfg := config.New().
@@ -27,20 +29,29 @@ cfg := config.New().
 runtime, err := venue.NewVenue(cfg)
 ```
 
-`Config` 以及 `VolumeConfig`、`TenantConfig`、`RetryPolicyConfig`、
-`TenantManagerConfig`、`MetadataConfig`、`BadgerDBConfig`、
-`FileWatcherConfig`、`CleanupConfig`、`OrphanRecoveryConfig` 和
-`DatabaseHealthCheckConfig` 都支持链式配置。顶层的 `WithVolumes`、
-`WithTenants`、`WithFileWatchers` 替换整个集合；需要追加时使用
-`AddVolume`、`AddTenant`、`AddFileWatcher`。
+`Config` and the nested types `VolumeConfig`, `TenantConfig`,
+`RetryPolicyConfig`, `TenantManagerConfig`, `MetadataConfig`, `BadgerDBConfig`,
+`FileWatcherConfig`, `FileWatcherRootConfig`, `FileWatcherServiceConfig`,
+`CleanupConfig`, `DeadLetterConfig`, `RetiredVolumeConfig`,
+`OrphanRecoveryConfig`, `DatabaseHealthCheckConfig`, and `StatisticsConfig`
+(plus `StatisticsDimensionConfig` and `StatisticsOutputConfig`) all support
+fluent construction. The top-level `WithVolumes`, `WithTenants`, and
+`WithFileWatchers` replace the whole collection; use `AddVolume`, `AddTenant`,
+and `AddFileWatcher` to append.
 
-租户 ID 会作为元数据文件名和物理存储目录段使用，因此所有入口都会先校验：
-包含 `/`、`\`、`:`、控制字符、前导/尾随点或空格、Windows 设备名，或超过
-128 字节的 ID 会被拒绝为 `core.ErrInvalidArgument`。
+A few settings have no fluent setter and are set by direct assignment, for
+example `VolumeConfig.InitialDelay` and `VolumeConfig.HealthCheckDelay`.
 
-## Viper 适配
+Tenant IDs become metadata file names and physical storage directory segments,
+so every entry point validates them first: an ID containing `/`, `\`, `:`,
+control characters, a leading or trailing dot, surrounding whitespace, a Windows
+device name, or more than 128 bytes is rejected with
+`core.ErrInvalidArgument`.
 
-`viper-config` 展示由独立适配器加载 YAML、JSON 或应用已有的 Viper 节点：
+## Viper Adapter
+
+`viper-config` demonstrates loading YAML or JSON through the separate adapter, or
+binding from a Viper instance the application already owns:
 
 ```powershell
 go run ./examples/viper-config
@@ -51,22 +62,35 @@ cfg, err := viperconfig.LoadFromFile("venue-config-example.yaml")
 runtime, err := venue.NewVenue(cfg)
 ```
 
-依赖方向固定为 `viperconfig -> config`。基础 `config` 包不导入
-Viper，也不读取文件；不使用适配器的应用不会被迫依赖 Viper API。
+The dependency direction is fixed at `viperconfig -> config`. The base `config`
+package does not import Viper and does not read files, so an application that
+does not use the adapter is not forced to depend on the Viper API.
 
-所有公共配置字段都提供 `json`、`yaml`、`mapstructure` 标签，因此应用也可
-选择其他解析器绑定到 `config.Config`。`Logging` 是运行时对象，三个标签均为
-`-`，必须在解析完成后由应用程序注入。
+Every public configuration field carries `json`, `yaml`, and `mapstructure`
+tags, so an application may bind `config.Config` with another decoder.
+`Logging` is a runtime object whose three tags are all `-`, and it must be
+injected by the application after decoding.
 
-## 配置文件
+## Configuration Files
 
-- [`../venue-config-example.yaml`](../venue-config-example.yaml)：带 `venue` 根节点的完整示例。
-- [`viper-config/venue-config.yaml`](viper-config/venue-config.yaml)：根节点配置示例。
-- [`viper-config/venue-config.json`](viper-config/venue-config.json)：JSON 配置示例。
+- [`../venue-config-example.yaml`](../venue-config-example.yaml): the complete
+  example with a `venue` root node, including the statistics, metadata-backup,
+  per-volume startup, advanced watcher, and timed-out reclaim options.
+- [`viper-config/venue-config.yaml`](viper-config/venue-config.yaml): a
+  root-level configuration example.
+- [`viper-config/venue-config.json`](viper-config/venue-config.json): a JSON
+  configuration example.
 
-从文件绑定时，`enabled` 与 `includeSubdirectories` 这类布尔键必须显式写出：
-源文件中缺失的布尔键与显式的 `false` 无法区分。Go 侧的
-`config.NewFileWatcherConfig()` 会把它们默认设为 `true`。
+When binding from a file, boolean keys such as `enabled` and
+`includeSubdirectories` must be written explicitly: a boolean key that is absent
+from the source cannot be distinguished from an explicit `false`. The Go
+constructor `config.NewFileWatcherConfig()` defaults them to `true`. The same
+applies to the advanced watcher switches
+`disableImportedFilesPruneThrottle` and
+`disableImportedFilesHistoryFlushDebounce`, which are deliberately inverted: the
+throttle and the debounce are on by default, so the zero value keeps them on and
+only an explicit `true` turns them off.
 
-示例会在本地创建临时数据目录，仅用于演示，不应直接作为生产目录规划；生成的
-数据库与配置转储已被 `.gitignore` 排除。
+The examples create temporary local data directories for demonstration only;
+they are not a production directory layout. The generated databases and
+configuration dumps are excluded by `.gitignore`.

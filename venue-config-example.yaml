@@ -20,6 +20,12 @@ venue:
   # Enable database health checking on startup
   enableDatabaseHealthCheck: true
 
+  # Fail startup instead of continuing when a metadata database had to be
+  # quarantined and no backup could be restored. The default (false) reports the
+  # degraded state and continues with an empty database until the operator acts;
+  # set it to true when starting with an empty store is worse than not starting.
+  failFastOnStartupRecoveryFailure: false
+
   # Retry policy for failed file operations
   retryPolicy:
     maxRetryCount: 3
@@ -61,6 +67,22 @@ venue:
     recoverCorruptedDatabase: false
     # How long a quarantined database directory is kept before startup removes it
     corruptedDatabaseRetention: 72h
+    # Directory for periodic consistent metadata backups. Empty disables the
+    # backup runner, so leaving it empty keeps the runtime from writing any
+    # backup file at all. When set, the runner starts and stops with the runtime
+    # and writes metadata.<yyyyMMddTHHmmssZ>.bak files into it.
+    backupDirectory: ""
+    # Delay between periodic metadata backups
+    backupInterval: 1h
+    # How long backup files are kept. A backup older than this is removed by the
+    # next backup cycle; 0 disables pruning and keeps every backup forever.
+    backupRetention: 168h  # 7 days
+    # Restore the newest valid backup into a metadata database that had to be
+    # quarantined, instead of leaving it empty. It requires
+    # recoverCorruptedDatabase: true and a non-empty backupDirectory. The
+    # restored state is only as new as the newest backup, so this is a recovery
+    # aid and not a substitute for an operator.
+    autoRestoreFromBackup: false
 
   # Storage volumes configuration
   volumes:
@@ -73,6 +95,21 @@ venue:
       # Cache the volume health probe for this long (0 = default 30s,
       # negative disables caching so every operation probes the volume)
       healthCheckCacheTTL: 30s
+      # How long startup waits before the first health-check *retry*. A volume
+      # that answers the first probe is never delayed, so the wait only happens
+      # when the volume is not ready yet (for example a network volume still
+      # mounting). 0 disables the delay.
+      initialDelay: 2s
+      # Delay between startup health-check attempts after a volume failed its
+      # first probe. The runtime makes up to 10 attempts and requires two
+      # consecutive healthy probes; startup fails when the volume never becomes
+      # healthy. 0 disables the inter-attempt delay.
+      healthCheckDelay: 500ms
+      # Perform one throwaway write through the real write path once the volume
+      # passed its startup health checks, so the first real write does not pay
+      # for a cold write path. Warm-up is advisory: a failure is reported and
+      # never disables the volume.
+      warmupOnStartup: false
 
     - volumeId: vol-002
       mountPath: ./venue-data/storage/volume-2
@@ -80,6 +117,9 @@ venue:
       shardingDepth: 2
       enableFsync: true
       healthCheckCacheTTL: 30s
+      initialDelay: 2s
+      healthCheckDelay: 500ms
+      warmupOnStartup: false
 
   # Tenant configurations
   tenants:
@@ -122,6 +162,32 @@ venue:
       maxFileSizeBytes: 104857600  # 100MB
       minFileAge: 3s
       maxConcurrentImports: 16
+      # How long the tenant list used by autoCreateTenantDirectories is cached.
+      # 0 selects the default (60s).
+      autoCreateTenantDirectoriesCacheTtl: 60s
+      # Delay before the stability probe re-checks a candidate's size and
+      # modification time. A negative value disables the delayed second probe.
+      # 0 selects the default (100ms).
+      fileStabilityCheckDelay: 100ms
+      # Skip the second stability probe for candidates at least this old, which
+      # avoids paying for a delay on files that are already settled. A negative
+      # value always probes. 0 selects the default (1m).
+      skipStabilityCheckAfterAge: 1m
+      # The two history-housekeeping switches are deliberately named in the
+      # negative: the throttle and the debounce are ON by default, so leaving
+      # them unset (false) keeps the default behaviour, and only an explicit
+      # true turns them off.
+      # Turn off the throttle that limits how often stale import-history pruning
+      # rewrites the history file.
+      disableImportedFilesPruneThrottle: false
+      # Minimum delay between prune runs while the throttle is enabled.
+      # 0 selects the default (5m).
+      importedFilesPruneInterval: 5m
+      # Turn off the debounce that coalesces import-history writes.
+      disableImportedFilesHistoryFlushDebounce: false
+      # Minimum delay between import-history persistence writes while the
+      # debounce is enabled. 0 selects the default (2s).
+      importedFilesHistoryFlushInterval: 2s
 
     # Shared watcher for all regular tenants
     - watcherId: watcher-all-regular-tenants
@@ -139,6 +205,13 @@ venue:
       maxFileSizeBytes: 0  # No limit
       minFileAge: 5s
       maxConcurrentImports: 8
+      autoCreateTenantDirectoriesCacheTtl: 60s
+      fileStabilityCheckDelay: 100ms
+      skipStabilityCheckAfterAge: 1m
+      disableImportedFilesPruneThrottle: false
+      importedFilesPruneInterval: 5m
+      disableImportedFilesHistoryFlushDebounce: false
+      importedFilesHistoryFlushInterval: 2s
 
   # Root watcher templates: every immediate subdirectory of rootPath becomes one
   # single-tenant watcher (ID auto-<rootBase>-<tenantDir>). Applying a root is
@@ -156,14 +229,31 @@ venue:
   #     maxFileSizeBytes: 0
   #     minFileAge: 5s
   #     maxConcurrentImports: 4
+  #     autoCreateTenantDirectoriesCacheTtl: 60s
+  #     fileStabilityCheckDelay: 100ms
+  #     skipStabilityCheckAfterAge: 1m
+  #     disableImportedFilesPruneThrottle: false
+  #     importedFilesPruneInterval: 5m
+  #     disableImportedFilesHistoryFlushDebounce: false
+  #     importedFilesHistoryFlushInterval: 2s
 
   # Global file watcher service options (enablement is persisted across restarts)
   watcherServiceOptions:
+    # Start the background watcher service at all. false now really starts the
+    # service disabled: no watcher is scanned until an operator re-enables it,
+    # either through the persisted state or through
+    # Venue.FileWatcherService().UpdateOptions.
     enabled: true
+    # Polling interval used when a watcher does not set one
     defaultPollingInterval: 30s
+    # Clamp applied to short per-watcher polling intervals
     minimumPollingInterval: 5s
+    # Clamp applied to long per-watcher polling intervals
     maximumPollingInterval: 1h
+    # How often a disabled service rechecks whether it should resume
     disabledCheckInterval: 1m
+    # How many watchers one cycle scans in parallel (0 = runtime default,
+    # negative = sequential scanning)
     maxParallelWatcherScans: 4
 
   # Enable background cleanup service
@@ -184,8 +274,23 @@ venue:
     # Reclaim timed-out files immediately when a worker finds no available work,
     # so a crashed worker's file is not stuck until the next cleanup cycle
     recoverTimedOutOnEmptyQueue: true
-    # Minimum interval between immediate reclaim attempts per tenant
+    # Minimum interval between immediate reclaim attempts per tenant. The
+    # synchronous empty-queue reclaim and the opportunistic background reclaim
+    # keep independent cooldown state, so a recent background pass cannot delay
+    # the emergency reclaim. This value bounds each path separately.
     timedOutReclaimCooldown: 30s
+    # How many timed-out files the synchronous reclaim resets when a claim
+    # finds an empty queue. 0 selects the default (32); a negative value
+    # disables the synchronous empty-queue reclaim.
+    emptyQueueReclaimBatchSize: 32
+    # Let a successful claim reclaim timed-out files in the background, so
+    # timed-out records are recovered even when cleanup is disabled or its
+    # interval is long
+    enableBackgroundTimedOutReclaim: true
+    # How many timed-out files one background reclaim pass recovers. 0 selects
+    # the default (8); a negative value disables the background pass (a
+    # non-positive runtime value disables it, but 0 here means "use default").
+    backgroundTimedOutReclaimBatchSize: 8
     # Cleanup permanently failed files
     cleanupPermanentlyFailedFiles: true
     # How a permanently failed payload is handled once the retention elapses:
@@ -248,3 +353,42 @@ venue:
     checkOnStartupOnly: true
     # Periodic check interval (if not startup-only)
     periodicCheckInterval: 1h
+
+  # In-process runtime statistics (disabled by default)
+  # When enabled, the runtime records bounded windowed counters for the storage,
+  # metadata, and watcher paths, and callers read aggregated snapshots through
+  # Venue.Statistics(). Venue.StatisticsRecorder() adds application measurements
+  # to the same bounded window set.
+  statisticsOptions:
+    # Turn statistics collection on. When false, recording costs one call per
+    # instrumented operation and allocates nothing.
+    enabled: false
+    # Aggregation bucket size
+    windowSize: 5m
+    # How long in-memory buckets are kept. Must be greater than or equal to
+    # windowSize.
+    retention: 1h
+    # Bound on the number of retained time-bucket and dimension series, so a
+    # high-cardinality workload cannot grow memory without limit.
+    # Valid range: 1024 to 262144.
+    maxSeries: 16384
+    # Which low-cardinality dimensions are retained. tenantId is off by default
+    # because it is high-cardinality.
+    dimensions:
+      tenantId: false
+      volumeId: true
+      watcherId: true
+      operation: true
+    # Optional periodic log output of a statistics summary. output.enabled
+    # requires statisticsOptions.enabled.
+    output:
+      # Turn periodic output on
+      enabled: false
+      # Summary destination. Only "Logging" is supported.
+      sink: Logging
+      # Delay between summaries
+      interval: 1m
+      # Time range included in each summary
+      queryWindow: 15m
+      # Log a summary even when every counter is zero
+      includeEmptySnapshots: false
