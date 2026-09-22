@@ -92,3 +92,14 @@ jobs:
 
     - name: Build
       run: go build -v ./...
+
+    - name: Vet
+      run: go vet ./...
+
+    - name: Check formatting
+      run: |
+        gofmt -l . | tee /tmp/gofmt.out
+        test ! -s /tmp/gofmt.out
+
+    - name: Check whitespace errors
+      run: git diff --check
