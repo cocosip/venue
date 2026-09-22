@@ -7,11 +7,38 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/logging"
+)
+
+const (
+	// importedFilesHistoryFileName is the persisted import de-duplication history.
+	importedFilesHistoryFileName = "imported-files.json"
+
+	// importedFilesHistoryTempFileName is the staging file used for the atomic
+	// temp-file + rename history write.
+	importedFilesHistoryTempFileName = "imported-files.json.tmp"
+
+	// maxImportedFilesHistory caps the persisted history so it cannot grow
+	// without bound. Oldest entries are dropped first.
+	maxImportedFilesHistory = 10000
+
+	// maxRecordedErrorsPerScanResult caps the errors carried by one scan result.
+	maxRecordedErrorsPerScanResult = 100
+
+	// defaultImportFingerprint is recorded when a stable fingerprint could not be
+	// computed for an imported file. Such a file is still imported only once.
+	defaultImportFingerprint = "-"
+
+	// wildcardPattern matches every file name.
+	wildcardPattern = "*"
 )
 
 // FileWatcherOptions configures the file watcher.
@@ -30,15 +57,55 @@ type FileWatcherOptions struct {
 	Logging *logging.Runtime
 }
 
-// fileWatcher implements the FileWatcher interface.
+// importedFileRecord is the persisted de-duplication state for one source path.
+type importedFileRecord struct {
+	// Fingerprint identifies the exact content revision that was imported.
+	Fingerprint string `json:"fingerprint"`
+
+	// ImportedAtUnix is when the record was written; used to cap history size.
+	ImportedAtUnix int64 `json:"time"`
+
+	// InFlightToken is set only in memory while an import owns the path; it is
+	// never persisted.
+	InFlightToken string `json:"-"`
+}
+
+// fileWatcher implements the core.FileWatcher interface.
+//
+// De-duplication invariant: a source path is imported once per fingerprint
+// (size + modification time) while it is already imported, or while an import
+// of the same revision is in flight. The record is removed once a Delete or
+// Move post-import action succeeds, so a refilled source path is imported
+// again; Keep retains it.
 type fileWatcher struct {
-	tenantMgr       core.TenantManager
-	storagePool     core.StoragePool
-	watchers        sync.Map     // map[string]*core.FileWatcherConfiguration
-	configRoot      string       // Configuration root directory
-	importedFiles   sync.Map     // map[string]string: filePath -> fileKey (imported files history)
-	importedFilesMu sync.RWMutex // Lock for persisting imported files
-	logger          *logging.Runtime
+	tenantMgr   core.TenantManager
+	storagePool core.StoragePool
+	watchers    sync.Map // map[string]*watcherEntry
+	configRoot  string   // Configuration root directory
+	logger      *logging.Runtime
+
+	// importedFilesMu guards importedFilesCount and serializes history writes.
+	importedFilesMu sync.Mutex
+	importedFiles   sync.Map // map[string]importedFileRecord
+	importedCount   int
+
+	// watcherStateMu guards watcherState and serializes state file writes.
+	// watcherState holds the operator's runtime enable/disable decisions, which
+	// outrank the configured Enabled flag on registration.
+	watcherStateMu sync.Mutex
+	watcherState   map[string]bool // map[string]bool: watcher ID -> enabled
+
+	// flushDone is non-nil while a history write is in flight.
+	flushDone chan struct{}
+
+	closed bool
+}
+
+// watcherEntry stores one registered watcher. config is an immutable snapshot;
+// mu guards its Enabled flag and any later replacement.
+type watcherEntry struct {
+	mu     sync.Mutex
+	config *core.FileWatcherConfiguration
 }
 
 // NewFileWatcher creates a new file watcher.
@@ -83,10 +150,50 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 		fw.emit(context.Background(), slog.LevelWarn, "history_load_failed", "Failed to load imported files history", errorTypeAttr(err))
 	}
 
+	// Load the persisted runtime enable/disable decisions. This is best-effort
+	// runtime state: an unreadable document is ignored with a safe warning
+	// instead of failing construction, and the configured Enabled flag applies.
+	if err := fw.loadWatcherState(); err != nil {
+		fw.emit(context.Background(), slog.LevelWarn, "watcher_state_load_failed", "Failed to load watcher runtime state",
+			slog.String("state_file", watcherStateFileName), errorTypeAttr(err))
+	}
+
 	return fw, nil
 }
 
+// Close persists the import de-duplication history.
+//
+// Close is safe to call multiple times and is intended to be deferred next to
+// the watcher's lifetime; it does not stop the background service that drives
+// scans.
+func (w *fileWatcher) Close() error {
+	w.importedFilesMu.Lock()
+	if w.closed {
+		w.importedFilesMu.Unlock()
+
+		return nil
+	}
+	w.closed = true
+	w.importedFilesMu.Unlock()
+
+	w.awaitPendingHistoryFlush()
+
+	return w.saveImportedFilesHistory()
+}
+
 // RegisterWatcher adds a new file watcher configuration.
+//
+// Registration normalizes the configuration into an immutable snapshot:
+// defaults are applied, blank file patterns are dropped (falling back to "*"),
+// invalid globs are rejected, and negative concurrency is clamped to 1. The
+// watch directory is created when missing.
+//
+// Precedence: a persisted runtime enable/disable decision for the watcher ID
+// (written by EnableWatcher/DisableWatcher and stored under
+// ConfigurationRootDir) overrides the configured Enabled flag, so an operator's
+// decision survives a process restart. A watcher ID without a persisted
+// decision keeps the configured Enabled value. Registration never clears
+// persisted state; UnregisterWatcher does.
 func (w *fileWatcher) RegisterWatcher(ctx context.Context, config *core.FileWatcherConfiguration) error {
 	if config == nil {
 		return fmt.Errorf("configuration cannot be nil: %w", core.ErrInvalidArgument)
@@ -96,104 +203,260 @@ func (w *fileWatcher) RegisterWatcher(ctx context.Context, config *core.FileWatc
 		return fmt.Errorf("watcher ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	if config.WatchPath == "" {
-		return fmt.Errorf("watch path cannot be empty: %w", core.ErrInvalidArgument)
+	stored, err := w.prepareConfiguration(config)
+	if err != nil {
+		return err
 	}
 
-	// Validate tenant in single-tenant mode
-	if !config.MultiTenantMode && config.TenantID == "" {
-		return fmt.Errorf("tenant ID required in single-tenant mode: %w", core.ErrInvalidArgument)
-	}
-
-	// Set defaults
-	if config.PollingInterval == 0 {
-		config.PollingInterval = 30 * time.Second
-	}
-
-	if config.MinFileAge == 0 {
-		config.MinFileAge = 3 * time.Second
-	}
-
-	if config.MaxConcurrentImports == 0 {
-		config.MaxConcurrentImports = 4
-	}
-
-	// Store configuration
-	w.watchers.Store(config.WatcherID, config)
+	w.watchers.Store(stored.WatcherID, &watcherEntry{config: stored})
 
 	// Auto-create tenant directories if enabled
-	if config.MultiTenantMode && config.AutoCreateTenantDirectories {
-		if err := w.createTenantDirectories(ctx, config); err != nil {
-			w.emit(ctx, slog.LevelWarn, "tenant_directories_create_failed", "Failed to auto-create tenant directories", slog.String("watcher_id", config.WatcherID), errorTypeAttr(err))
+	if stored.MultiTenantMode && stored.AutoCreateTenantDirectories {
+		if err := w.createTenantDirectories(ctx, stored); err != nil {
+			w.emit(ctx, slog.LevelWarn, "tenant_directories_create_failed", "Failed to auto-create tenant directories", slog.String("watcher_id", stored.WatcherID), errorTypeAttr(err))
 		}
 	}
 
 	return nil
 }
 
-// UnregisterWatcher removes a file watcher.
+// UpdateWatcher replaces the configuration of an existing watcher in place.
+//
+// The watcher ID is the identity of record: the entry keeps its slot in the
+// registry, so a scan that is already running is unaffected and no caller has to
+// unregister and re-register to change a setting. Only the configuration is
+// replaced — the persisted import de-duplication history and the operator's
+// persisted enable/disable decision are owned by the watcher ID and are
+// therefore preserved, exactly as they are on registration.
+//
+// Validation and normalization are shared with RegisterWatcher, so an update
+// cannot accept a configuration that registration would reject. A rejected
+// update leaves the previous configuration untouched.
+//
+// Errors:
+//   - ErrWatcherNotFound when no watcher has that ID
+//   - ErrInvalidArgument when the configuration is invalid
+func (w *fileWatcher) UpdateWatcher(ctx context.Context, config *core.FileWatcherConfiguration) error {
+	if config == nil {
+		return fmt.Errorf("configuration cannot be nil: %w", core.ErrInvalidArgument)
+	}
+
+	if config.WatcherID == "" {
+		return fmt.Errorf("watcher ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	entry, err := w.loadEntry(config.WatcherID)
+	if err != nil {
+		return err
+	}
+
+	// Validate before mutating anything: a rejected update must not leave a
+	// half-applied configuration behind.
+	stored, err := w.prepareConfiguration(config)
+	if err != nil {
+		return err
+	}
+
+	entry.mu.Lock()
+	entry.config = stored
+	entry.mu.Unlock()
+
+	// Keep the schedule bookkeeping honest: a watcher that moved or changed its
+	// interval must be re-evaluated by the background service on its next cycle,
+	// which reads the new configuration from the registry.
+	w.emit(ctx, slog.LevelInfo, "watcher_updated", "Updated file watcher configuration",
+		slog.String("watcher_id", stored.WatcherID),
+		slog.Bool("enabled", stored.Enabled),
+		slog.Bool("multi_tenant_mode", stored.MultiTenantMode))
+
+	if stored.MultiTenantMode && stored.AutoCreateTenantDirectories {
+		if err := w.createTenantDirectories(ctx, stored); err != nil {
+			w.emit(ctx, slog.LevelWarn, "tenant_directories_create_failed", "Failed to auto-create tenant directories", slog.String("watcher_id", stored.WatcherID), errorTypeAttr(err))
+		}
+	}
+
+	return nil
+}
+
+// prepareConfiguration validates a caller-supplied configuration with
+// RegisterWatcher's rules and returns the immutable snapshot to store.
+//
+// The snapshot is normalized: blank file patterns are dropped (falling back to
+// "*"), invalid globs are rejected, negative concurrency is rejected, zero
+// polling interval and minimum file age fall back to the runtime defaults, and
+// the watch directory is created when missing. A persisted runtime
+// enable/disable decision for the watcher ID outranks the configured Enabled
+// flag.
+//
+// The returned pointer is owned by the caller and must not alias caller state.
+func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration) (*core.FileWatcherConfiguration, error) {
+	if config.WatchPath == "" {
+		return nil, fmt.Errorf("watch path cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	// Validate tenant in single-tenant mode
+	if !config.MultiTenantMode && config.TenantID == "" {
+		return nil, fmt.Errorf("tenant ID required in single-tenant mode: %w", core.ErrInvalidArgument)
+	}
+
+	if config.MaxConcurrentImports < 0 {
+		return nil, fmt.Errorf("max concurrent imports cannot be negative: %w", core.ErrInvalidArgument)
+	}
+
+	patterns, err := normalizeFilePatterns(config.FilePatterns)
+	if err != nil {
+		return nil, err
+	}
+
+	stored := *config
+	stored.FilePatterns = patterns
+
+	if stored.PollingInterval == 0 {
+		stored.PollingInterval = 30 * time.Second
+	}
+
+	if stored.MinFileAge == 0 {
+		stored.MinFileAge = 3 * time.Second
+	}
+
+	// A negative value would panic make(chan struct{}, n); clamp defensively.
+	if stored.MaxConcurrentImports == 0 {
+		stored.MaxConcurrentImports = 4
+	}
+	if stored.MaxConcurrentImports < 1 {
+		stored.MaxConcurrentImports = 1
+	}
+
+	// Locus creates the watch path during registration so a missing directory is
+	// prepared once instead of erroring on every scan cycle.
+	if err := os.MkdirAll(stored.WatchPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create watch path: %w", err)
+	}
+
+	// A persisted runtime decision outranks the configured Enabled flag.
+	if enabled, ok := w.persistedEnabled(stored.WatcherID); ok {
+		stored.Enabled = enabled
+	}
+
+	return &stored, nil
+}
+
+// UnregisterWatcher removes a file watcher and drops its persisted runtime
+// enable/disable decision, so a later registration of the same watcher ID
+// starts from configuration again.
+//
+// Dropping the persisted entry is best-effort: if the state file cannot be
+// written the watcher is still removed in memory and nil is returned, because
+// the state file records a runtime decision and never configuration of record.
 func (w *fileWatcher) UnregisterWatcher(ctx context.Context, watcherID string) error {
+	if watcherID == "" {
+		return fmt.Errorf("watcher ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
 	w.watchers.Delete(watcherID)
+	w.removeWatcherState(ctx, watcherID)
+
 	return nil
 }
 
 // GetWatcher retrieves a watcher configuration by ID.
+// The returned configuration is a copy: callers cannot mutate stored state.
 func (w *fileWatcher) GetWatcher(ctx context.Context, watcherID string) (*core.FileWatcherConfiguration, error) {
-	value, ok := w.watchers.Load(watcherID)
-	if !ok {
-		return nil, fmt.Errorf("watcher not found: %s", watcherID)
+	entry, err := w.loadEntry(watcherID)
+	if err != nil {
+		return nil, err
 	}
 
-	config := value.(*core.FileWatcherConfiguration)
-	return config, nil
+	return snapshotConfig(entry), nil
 }
 
-// GetAllWatchers retrieves all watcher configurations.
+// GetAllWatchers retrieves all watcher configurations, sorted by watcher ID.
+// Each returned configuration is a copy.
 func (w *fileWatcher) GetAllWatchers(ctx context.Context) ([]*core.FileWatcherConfiguration, error) {
-	var configs []*core.FileWatcherConfiguration
+	configs := make([]*core.FileWatcherConfiguration, 0)
 
-	w.watchers.Range(func(key, value interface{}) bool {
-		config := value.(*core.FileWatcherConfiguration)
-		configs = append(configs, config)
+	w.watchers.Range(func(_, value interface{}) bool {
+		entry, ok := value.(*watcherEntry)
+		if !ok {
+			return true
+		}
+
+		configs = append(configs, snapshotConfig(entry))
+
 		return true
 	})
+
+	sort.Slice(configs, func(i, j int) bool { return configs[i].WatcherID < configs[j].WatcherID })
 
 	return configs, nil
 }
 
-// EnableWatcher enables a watcher.
-func (w *fileWatcher) EnableWatcher(ctx context.Context, watcherID string) error {
-	value, ok := w.watchers.Load(watcherID)
-	if !ok {
-		return fmt.Errorf("watcher not found: %s", watcherID)
+// GetWatchersForTenant returns the watchers that import for one tenant, sorted
+// by watcher ID. Each returned configuration is a copy.
+//
+// Only single-tenant watchers are attributed to a tenant: a multi-tenant
+// watcher imports for whichever tenants its subdirectories name, so it is not
+// returned for any tenant query.
+//
+// Errors:
+//   - ErrInvalidArgument when tenantID is empty
+func (w *fileWatcher) GetWatchersForTenant(ctx context.Context, tenantID string) ([]*core.FileWatcherConfiguration, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
-	config := value.(*core.FileWatcherConfiguration)
-	config.Enabled = true
-	w.watchers.Store(watcherID, config)
+	configs := make([]*core.FileWatcherConfiguration, 0)
 
-	return nil
+	w.watchers.Range(func(_, value interface{}) bool {
+		entry, ok := value.(*watcherEntry)
+		if !ok {
+			return true
+		}
+
+		config := snapshotConfig(entry)
+		if config.MultiTenantMode || config.TenantID != tenantID {
+			return true
+		}
+
+		configs = append(configs, config)
+
+		return true
+	})
+
+	sort.Slice(configs, func(i, j int) bool { return configs[i].WatcherID < configs[j].WatcherID })
+
+	return configs, nil
 }
 
-// DisableWatcher disables a watcher.
+// EnableWatcher enables a watcher and persists the runtime decision so it
+// survives a process restart.
+//
+// Persisting is best-effort: if the state file cannot be written the in-memory
+// change is kept, the failure is logged safely, and nil is returned.
+func (w *fileWatcher) EnableWatcher(ctx context.Context, watcherID string) error {
+	return w.setEnabled(ctx, watcherID, true)
+}
+
+// DisableWatcher disables a watcher and persists the runtime decision so it
+// survives a process restart.
+//
+// Persisting is best-effort: if the state file cannot be written the in-memory
+// change is kept, the failure is logged safely, and nil is returned.
 func (w *fileWatcher) DisableWatcher(ctx context.Context, watcherID string) error {
-	value, ok := w.watchers.Load(watcherID)
-	if !ok {
-		return fmt.Errorf("watcher not found: %s", watcherID)
-	}
-
-	config := value.(*core.FileWatcherConfiguration)
-	config.Enabled = false
-	w.watchers.Store(watcherID, config)
-
-	return nil
+	return w.setEnabled(ctx, watcherID, false)
 }
 
 // ScanNow manually triggers a scan for the specified watcher.
+//
+// A disabled watcher is rejected with an error instead of being scanned.
 func (w *fileWatcher) ScanNow(ctx context.Context, watcherID string) (*core.FileWatcherScanResult, error) {
 	config, err := w.GetWatcher(ctx, watcherID)
 	if err != nil {
 		return nil, err
+	}
+
+	if !config.Enabled {
+		return nil, fmt.Errorf("watcher %s is disabled: %w", watcherID, core.ErrInvalidArgument)
 	}
 
 	return w.scanWatcher(ctx, config)
@@ -205,8 +468,12 @@ func (w *fileWatcher) ScanAllWatchers(ctx context.Context) (map[string]*core.Fil
 
 	w.watchers.Range(func(key, value interface{}) bool {
 		watcherID := key.(string)
-		config := value.(*core.FileWatcherConfiguration)
+		entry, ok := value.(*watcherEntry)
+		if !ok {
+			return true
+		}
 
+		config := snapshotConfig(entry)
 		if !config.Enabled {
 			return true // Skip disabled watchers
 		}
@@ -220,6 +487,7 @@ func (w *fileWatcher) ScanAllWatchers(ctx context.Context) (map[string]*core.Fil
 		}
 
 		results[watcherID] = result
+
 		return true
 	})
 
@@ -234,9 +502,17 @@ func (w *fileWatcher) scanWatcher(ctx context.Context, config *core.FileWatcherC
 		Errors: make([]string, 0),
 	}
 
-	// Check if watch path exists
-	if _, err := os.Stat(config.WatchPath); os.IsNotExist(err) {
-		return result, fmt.Errorf("watch path does not exist: %s", config.WatchPath)
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+
+	info, err := os.Stat(config.WatchPath)
+	if err != nil {
+		return result, fmt.Errorf("watch path is not accessible: %w", err)
+	}
+
+	if !info.IsDir() {
+		return result, fmt.Errorf("watch path is not a directory")
 	}
 
 	if config.MultiTenantMode {
@@ -257,46 +533,22 @@ func (w *fileWatcher) scanSingleTenant(ctx context.Context, config *core.FileWat
 	}
 
 	// Discover files
-	files, err := w.discoverFiles(config.WatchPath, config)
+	files, err := w.discoverFiles(ctx, config.WatchPath, config)
 	if err != nil {
 		return result, fmt.Errorf("failed to discover files: %w", err)
 	}
 
 	result.FilesDiscovered = len(files)
 
-	// Import files with concurrency control
-	semaphore := make(chan struct{}, config.MaxConcurrentImports)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
+	discovered := make([]discoveredFile, 0, len(files))
 	for _, filePath := range files {
-		wg.Add(1)
-		semaphore <- struct{}{} // Acquire
-
-		go func(path string) {
-			defer wg.Done()
-			defer func() { <-semaphore }() // Release
-
-			imported, bytes, err := w.importFile(ctx, tenant, path, config)
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			if err != nil {
-				result.FilesFailed++
-				result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", path, err))
-			} else if imported {
-				result.FilesImported++
-				result.BytesImported += bytes
-			} else {
-				result.FilesSkipped++
-			}
-		}(filePath)
+		discovered = append(discovered, discoveredFile{path: filePath, tenant: tenant})
 	}
 
-	wg.Wait()
+	w.importDiscoveredFiles(ctx, config, result, discovered)
 
 	result.ScanDuration = time.Since(startTime)
+
 	return result, nil
 }
 
@@ -315,12 +567,13 @@ func (w *fileWatcher) scanMultiTenant(ctx context.Context, config *core.FileWatc
 		return result, fmt.Errorf("failed to read watch path: %w", err)
 	}
 
-	// Process each tenant directory
-	semaphore := make(chan struct{}, config.MaxConcurrentImports)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+	discovered := make([]discoveredFile, 0)
 
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+
 		if !entry.IsDir() {
 			continue // Skip non-directories
 		}
@@ -328,147 +581,267 @@ func (w *fileWatcher) scanMultiTenant(ctx context.Context, config *core.FileWatc
 		tenantID := entry.Name()
 		tenantPath := filepath.Join(config.WatchPath, tenantID)
 
-		wg.Add(1)
-		go func(tid string, tpath string) {
-			defer wg.Done()
+		// Resolve the tenant up front so a per-tenant failure is reported once
+		// instead of once per file.
+		tenant, err := w.tenantMgr.GetTenant(ctx, tenantID)
+		if err != nil {
+			w.addResultError(result, fmt.Sprintf("watcher %s tenant resolution failed: %v", config.WatcherID, err))
+			continue
+		}
 
-			// Get tenant context
-			tenant, err := w.tenantMgr.GetTenant(ctx, tid)
-			if err != nil {
-				mu.Lock()
-				result.Errors = append(result.Errors, fmt.Sprintf("tenant %s: %v", tid, err))
-				mu.Unlock()
-				return
-			}
+		files, err := w.discoverFiles(ctx, tenantPath, config)
+		if err != nil {
+			w.addResultError(result, fmt.Sprintf("watcher %s discovery failed: %v", config.WatcherID, err))
+			continue
+		}
 
-			// Discover files in tenant directory
-			files, err := w.discoverFiles(tpath, config)
-			if err != nil {
-				mu.Lock()
-				result.Errors = append(result.Errors, fmt.Sprintf("tenant %s: %v", tid, err))
-				mu.Unlock()
-				return
-			}
-
-			mu.Lock()
-			result.FilesDiscovered += len(files)
-			mu.Unlock()
-
-			// Import files for this tenant
-			for _, filePath := range files {
-				semaphore <- struct{}{} // Acquire
-
-				imported, bytes, err := w.importFile(ctx, tenant, filePath, config)
-
-				<-semaphore // Release
-
-				mu.Lock()
-				if err != nil {
-					result.FilesFailed++
-					result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", filePath, err))
-				} else if imported {
-					result.FilesImported++
-					result.BytesImported += bytes
-				} else {
-					result.FilesSkipped++
-				}
-				mu.Unlock()
-			}
-		}(tenantID, tenantPath)
+		for _, filePath := range files {
+			discovered = append(discovered, discoveredFile{path: filePath, tenant: tenant})
+		}
 	}
 
-	wg.Wait()
+	result.FilesDiscovered = len(discovered)
+
+	w.importDiscoveredFiles(ctx, config, result, discovered)
 
 	result.ScanDuration = time.Since(startTime)
+
 	return result, nil
 }
 
-// discoverFiles discovers files in a directory based on configuration.
-func (w *fileWatcher) discoverFiles(dirPath string, config *core.FileWatcherConfiguration) ([]string, error) {
-	var files []string
+// discoveredFile pairs a discovered file with the tenant it belongs to, so
+// nested files cannot be attributed to the wrong tenant.
+type discoveredFile struct {
+	path   string
+	tenant core.TenantContext
+}
 
-	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
+// importDiscoveredFiles imports files with bounded concurrency and merges the
+// per-file outcome into result.
+func (w *fileWatcher) importDiscoveredFiles(
+	ctx context.Context,
+	config *core.FileWatcherConfiguration,
+	result *core.FileWatcherScanResult,
+	files []discoveredFile,
+) {
+	if len(files) == 0 {
+		return
+	}
+
+	limit := config.MaxConcurrentImports
+	if limit < 1 {
+		limit = 1
+	}
+
+	semaphore := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, file := range files {
+		if ctx.Err() != nil {
+			break
 		}
 
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire
+
+		go func(entry discoveredFile) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release
+
+			imported, bytes, err := w.importFile(ctx, entry.tenant, entry.path, config)
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil {
+				result.FilesFailed++
+				w.addResultError(result, fmt.Sprintf("watcher %s import failed: %v", config.WatcherID, err))
+
+				return
+			}
+
+			if imported {
+				result.FilesImported++
+				result.BytesImported += bytes
+			} else {
+				result.FilesSkipped++
+			}
+		}(file)
+	}
+
+	wg.Wait()
+}
+
+// addResultError records a scan error without leaking physical paths or
+// original file names, capped at maxRecordedErrorsPerScanResult entries.
+func (w *fileWatcher) addResultError(result *core.FileWatcherScanResult, message string) {
+	if len(result.Errors) >= maxRecordedErrorsPerScanResult {
+		return
+	}
+
+	result.Errors = append(result.Errors, message)
+}
+
+// discoverFiles discovers files in a directory based on configuration.
+//
+// IncludeSubdirectories selects recursive discovery; otherwise only the top
+// directory is scanned. Errors are reported to the caller instead of being
+// silently swallowed so an unreadable directory is visible in the scan result.
+func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config *core.FileWatcherConfiguration) ([]string, error) {
+	var files []string
+
+	appendFile := func(path string, info os.FileInfo) {
 		if info.IsDir() {
-			return nil // Skip directories
+			return
 		}
 
 		// Check file age
-		if time.Since(info.ModTime()) < config.MinFileAge {
-			return nil // Skip files that are too young
+		if config.MinFileAge > 0 && time.Since(info.ModTime()) < config.MinFileAge {
+			return
 		}
 
 		// Check file size
 		if config.MaxFileSizeBytes > 0 && info.Size() > config.MaxFileSizeBytes {
-			return nil // Skip files that are too large
+			return
 		}
 
 		// Check file patterns
-		if len(config.FilePatterns) > 0 {
-			matched := false
-			for _, pattern := range config.FilePatterns {
-				if matchPattern(info.Name(), pattern) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				return nil // Skip files that don't match patterns
-			}
+		if !matchesAnyPattern(info.Name(), config.FilePatterns) {
+			return
 		}
 
 		files = append(files, path)
+	}
+
+	if !config.IncludeSubdirectories {
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read directory: %w", err)
+		}
+
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+
+			if entry.IsDir() {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			appendFile(filepath.Join(dirPath, entry.Name()), info)
+		}
+
+		return files, nil
+	}
+
+	walkErr := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip unreadable entries; the parent walk continues.
+		}
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+
+		appendFile(path, info)
+
 		return nil
 	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("failed to walk directory: %w", walkErr)
+	}
 
-	return files, err
+	return files, nil
 }
 
 // importFile imports a single file into the storage pool.
+//
+// Ordering invariant: the post-import Delete/Move action runs before the file is
+// recorded as imported, so a failed action leaves the source file eligible for
+// the next cycle instead of silently marking it done.
 func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext, filePath string, config *core.FileWatcherConfiguration) (bool, int64, error) {
-	// Check if file was already imported (especially important for PostImportAction.Keep mode)
-	if w.isFileAlreadyImported(filePath) {
-		return false, 0, nil // Skip already imported file
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
 	}
 
-	// Open file
 	file, err := os.Open(filePath)
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer func() { _ = file.Close() }()
 
-	// Get file info
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	// Extract original filename
+	if fileInfo.IsDir() {
+		return false, 0, nil
+	}
+
+	fingerprint := fileFingerprint(fileInfo)
+
+	alreadyImported, inFlight := w.isFileAlreadyImported(filePath, fingerprint)
+	if inFlight || alreadyImported {
+		return false, 0, nil
+	}
+
+	token := fmt.Sprintf("%d-%d", time.Now().UnixNano(), nextReservationSequence())
+	if !w.reserveImportSlot(filePath, token, fingerprint) {
+		return false, 0, nil
+	}
+
+	defer w.releaseImportSlot(filePath, token)
+
+	// Extract original filename for diagnostics only; physical paths are never
+	// derived from caller-supplied names.
 	originalFileName := filepath.Base(filePath)
 
-	// Import to storage pool
 	fileKey, err := w.storagePool.WriteFile(ctx, tenant, file, &originalFileName)
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to import file: %w", err)
 	}
 
-	// Mark file as imported to prevent re-importing
-	w.markFileAsImported(filePath, fileKey)
-
-	// Post-import action
-	if err := w.performPostImportAction(filePath, config); err != nil {
-		w.emit(ctx, slog.LevelWarn, "post_import_action_failed", "Failed to perform post-import action", slog.Any("action", config.PostImportAction), errorTypeAttr(err))
+	// Close the source before the post-import Delete/Move action: on Windows an
+	// open handle blocks the rename or delete.
+	if err := file.Close(); err != nil {
+		return false, 0, fmt.Errorf("failed to close source file: %w", err)
 	}
+
+	if err := w.performPostImportAction(ctx, filePath, config); err != nil {
+		w.emit(ctx, slog.LevelWarn, "post_import_action_failed", "Failed to perform post-import action",
+			slog.String("watcher_id", config.WatcherID), slog.Any("action", config.PostImportAction), errorTypeAttr(err))
+
+		return false, 0, fmt.Errorf("post-import action failed: %w", err)
+	}
+
+	switch config.PostImportAction {
+	case core.PostImportActionDelete, core.PostImportActionMove:
+		// Nothing remains at the source path; a later file with the same name is a
+		// new revision that must be imported.
+		w.removeImportedRecord(filePath)
+	default:
+		w.storeImportedRecord(filePath, fingerprint, time.Now())
+	}
+
+	w.emit(ctx, slog.LevelInfo, "file_imported", "Imported watched file",
+		slog.String("watcher_id", config.WatcherID), slog.String("file_key", fileKey), slog.Int64("bytes", fileInfo.Size()))
 
 	return true, fileInfo.Size(), nil
 }
 
 // performPostImportAction performs the configured action after successful import.
-func (w *fileWatcher) performPostImportAction(filePath string, config *core.FileWatcherConfiguration) error {
+func (w *fileWatcher) performPostImportAction(ctx context.Context, filePath string, config *core.FileWatcherConfiguration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	switch config.PostImportAction {
 	case core.PostImportActionDelete:
 		return os.Remove(filePath)
@@ -478,15 +851,11 @@ func (w *fileWatcher) performPostImportAction(filePath string, config *core.File
 			return fmt.Errorf("move directory not configured")
 		}
 
-		// Ensure target directory exists
 		if err := os.MkdirAll(config.MoveToDirectory, 0755); err != nil {
 			return fmt.Errorf("failed to create move directory: %w", err)
 		}
 
-		fileName := filepath.Base(filePath)
-		targetPath := filepath.Join(config.MoveToDirectory, fileName)
-
-		return os.Rename(filePath, targetPath)
+		return moveWithoutOverwrite(filePath, config.MoveToDirectory)
 
 	case core.PostImportActionKeep:
 		// Do nothing
@@ -494,6 +863,33 @@ func (w *fileWatcher) performPostImportAction(filePath string, config *core.File
 
 	default:
 		return fmt.Errorf("unknown post-import action: %d", config.PostImportAction)
+	}
+}
+
+// moveWithoutOverwrite moves filePath into targetDir, adding a _1/_2... suffix
+// when the destination name is already taken (Locus FileWatcher.cs:1775-1784).
+func moveWithoutOverwrite(filePath string, targetDir string) error {
+	fileName := filepath.Base(filePath)
+	extension := filepath.Ext(fileName)
+	nameWithoutExt := strings.TrimSuffix(fileName, extension)
+
+	targetPath := filepath.Join(targetDir, fileName)
+
+	// os.Rename replaces an existing destination on Windows, so collisions are
+	// detected before the move instead of relying on a rename error.
+	const maxCollisionAttempts = 10000
+	for attempt := 1; ; attempt++ {
+		if _, err := os.Lstat(targetPath); os.IsNotExist(err) {
+			return os.Rename(filePath, targetPath)
+		} else if err != nil {
+			return err
+		}
+
+		if attempt > maxCollisionAttempts {
+			return fmt.Errorf("unable to find a free destination name after %d attempts", maxCollisionAttempts)
+		}
+
+		targetPath = filepath.Join(targetDir, fmt.Sprintf("%s_%d%s", nameWithoutExt, attempt, extension))
 	}
 }
 
@@ -511,6 +907,10 @@ func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.
 
 	// Create directory for each tenant
 	for _, tenant := range tenants {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		tenantPath := filepath.Join(config.WatchPath, tenant.ID)
 		if err := os.MkdirAll(tenantPath, 0755); err != nil {
 			w.emit(ctx, slog.LevelWarn, "tenant_directory_create_failed", "Failed to create tenant directory", slog.String("tenant_id", tenant.ID), errorTypeAttr(err))
@@ -522,14 +922,69 @@ func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.
 	return nil
 }
 
-// matchPattern matches a filename against a glob pattern.
-func matchPattern(name, pattern string) bool {
-	// Simple glob matching: * = any characters, ? = single character
-	if pattern == "*" || pattern == "*.*" {
+// normalizeFilePatterns trims patterns, drops blanks and duplicates, validates
+// each glob and falls back to "*" when nothing usable remains.
+func normalizeFilePatterns(patterns []string) ([]string, error) {
+	normalized := make([]string, 0, len(patterns))
+
+	for _, pattern := range patterns {
+		trimmed := strings.TrimSpace(pattern)
+		if trimmed == "" {
+			continue
+		}
+
+		if _, err := filepath.Match(trimmed, "validation-probe"); err != nil {
+			return nil, fmt.Errorf("invalid file pattern %q: %w", trimmed, core.ErrInvalidArgument)
+		}
+
+		duplicate := false
+		for _, existing := range normalized {
+			if existing == trimmed {
+				duplicate = true
+				break
+			}
+		}
+
+		if !duplicate {
+			normalized = append(normalized, trimmed)
+		}
+	}
+
+	if len(normalized) == 0 {
+		normalized = append(normalized, wildcardPattern)
+	}
+
+	return normalized, nil
+}
+
+// matchesAnyPattern reports whether name matches any configured pattern. An
+// empty pattern list matches everything; matching is case-insensitive on
+// Windows, matching the platform's filesystem semantics.
+func matchesAnyPattern(name string, patterns []string) bool {
+	if len(patterns) == 0 {
 		return true
 	}
 
-	// Use filepath.Match for glob patterns
+	for _, pattern := range patterns {
+		if matchPattern(name, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// matchPattern matches a filename against a glob pattern.
+func matchPattern(name, pattern string) bool {
+	if pattern == "" || pattern == wildcardPattern {
+		return true
+	}
+
+	if runtime.GOOS == "windows" {
+		name = strings.ToLower(name)
+		pattern = strings.ToLower(pattern)
+	}
+
 	matched, err := filepath.Match(pattern, name)
 	if err != nil {
 		return false
@@ -538,80 +993,397 @@ func matchPattern(name, pattern string) bool {
 	return matched
 }
 
-// loadImportedFilesHistory loads the imported files history from persistent storage.
-// This prevents re-importing files after restart, especially important for PostImportAction.Keep mode.
-func (w *fileWatcher) loadImportedFilesHistory() error {
-	historyPath := filepath.Join(w.configRoot, "imported-files.json")
+// fileFingerprint identifies one content revision of a file.
+func fileFingerprint(info os.FileInfo) string {
+	if info == nil {
+		return defaultImportFingerprint
+	}
 
-	// Check if file exists
+	return fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
+}
+
+// loadEntry returns the stored entry for a watcher ID.
+//
+// A missing watcher is reported as core.ErrWatcherNotFound so callers can use
+// errors.Is instead of matching message text.
+func (w *fileWatcher) loadEntry(watcherID string) (*watcherEntry, error) {
+	if watcherID == "" {
+		return nil, fmt.Errorf("watcher ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	value, ok := w.watchers.Load(watcherID)
+	if !ok {
+		return nil, fmt.Errorf("watcher not found: %s: %w", watcherID, core.ErrWatcherNotFound)
+	}
+
+	entry, ok := value.(*watcherEntry)
+	if !ok {
+		return nil, fmt.Errorf("watcher not found: %s: %w", watcherID, core.ErrWatcherNotFound)
+	}
+
+	return entry, nil
+}
+
+// snapshotConfig returns a copy of a watcher's configuration.
+func snapshotConfig(entry *watcherEntry) *core.FileWatcherConfiguration {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	config := *entry.config
+	config.FilePatterns = append([]string(nil), entry.config.FilePatterns...)
+
+	return &config
+}
+
+// setEnabled updates a watcher's enabled flag under its own lock and persists
+// the runtime decision for that watcher ID.
+//
+// Persisting is best-effort: the state file is runtime state, not configuration
+// of record, so a failed write keeps the in-memory change, logs a warning, and
+// still returns nil. Only a missing watcher ID is an error.
+func (w *fileWatcher) setEnabled(ctx context.Context, watcherID string, enabled bool) error {
+	entry, err := w.loadEntry(watcherID)
+	if err != nil {
+		return err
+	}
+
+	entry.mu.Lock()
+	entry.config.Enabled = enabled
+	entry.mu.Unlock()
+
+	// Persist outside the entry lock: the state write performs file I/O and
+	// must not block readers of this watcher's configuration.
+	w.recordWatcherState(ctx, watcherID, enabled)
+
+	return nil
+}
+
+// loadImportedFilesHistory loads the imported files history from persistent
+// storage, pruning records whose source file no longer exists and capping the
+// in-memory history at maxImportedFilesHistory.
+func (w *fileWatcher) loadImportedFilesHistory() error {
+	historyPath := filepath.Join(w.configRoot, importedFilesHistoryFileName)
+
 	if _, err := os.Stat(historyPath); os.IsNotExist(err) {
 		return nil // File doesn't exist yet, no history to load
 	}
 
-	// Read file
 	data, err := os.ReadFile(historyPath)
 	if err != nil {
 		return fmt.Errorf("failed to read imported files history: %w", err)
 	}
 
-	// Parse JSON
-	var history map[string]string
+	var history map[string]importedFileRecord
 	if err := json.Unmarshal(data, &history); err != nil {
 		return fmt.Errorf("failed to parse imported files history: %w", err)
 	}
 
-	// Load into sync.Map
-	for filePath, fileKey := range history {
-		w.importedFiles.Store(filePath, fileKey)
+	live := make([]importedRecord, 0, len(history))
+	pruned := 0
+
+	for filePath, record := range history {
+		if _, err := os.Stat(filePath); err != nil {
+			pruned++
+			continue
+		}
+
+		live = append(live, importedRecord{
+			path:        filePath,
+			fingerprint: record.Fingerprint,
+			importedAt:  time.Unix(record.ImportedAtUnix, 0),
+		})
 	}
 
-	w.emit(context.Background(), slog.LevelInfo, "history_loaded", "Loaded imported files history", slog.Int("count", len(history)))
+	trimmed := 0
+	if len(live) > maxImportedFilesHistory {
+		sort.Slice(live, func(i, j int) bool { return live[i].importedAt.Before(live[j].importedAt) })
+		trimmed = len(live) - maxImportedFilesHistory
+		live = live[len(live)-maxImportedFilesHistory:]
+	}
+
+	for _, record := range live {
+		w.storeImportedRecordSync(record.path, record.fingerprint, record.importedAt)
+	}
+
+	w.emit(context.Background(), slog.LevelInfo, "history_loaded", "Loaded imported files history",
+		slog.Int("count", len(live)), slog.Int("pruned", pruned), slog.Int("trimmed", trimmed))
+
 	return nil
 }
 
-// saveImportedFilesHistory saves the imported files history to persistent storage.
+// storeImportedRecordSync records an entry without scheduling a history write.
+func (w *fileWatcher) storeImportedRecordSync(filePath, fingerprint string, importedAt time.Time) {
+	w.importedFilesMu.Lock()
+	defer w.importedFilesMu.Unlock()
+
+	w.importedFiles.Store(filePath, importedFileRecord{
+		Fingerprint:    fingerprint,
+		ImportedAtUnix: importedAt.Unix(),
+	})
+	w.importedCount++
+}
+
+// saveImportedFilesHistory persists the history atomically, dropping the oldest
+// entries beyond maxImportedFilesHistory.
+//
+// Writes are serialized and publish through a temp file + rename, so a crash or
+// concurrent caller can never leave a truncated history behind.
 func (w *fileWatcher) saveImportedFilesHistory() error {
 	w.importedFilesMu.Lock()
 	defer w.importedFilesMu.Unlock()
 
-	// Convert sync.Map to regular map
-	history := make(map[string]string)
-	w.importedFiles.Range(func(key, value interface{}) bool {
-		history[key.(string)] = value.(string)
-		return true
-	})
+	records := w.snapshotImportedRecords()
+	if len(records) > maxImportedFilesHistory {
+		sort.Slice(records, func(i, j int) bool { return records[i].importedAt.Before(records[j].importedAt) })
+		records = records[len(records)-maxImportedFilesHistory:]
+	}
 
-	// Marshal to JSON
+	history := make(map[string]importedFileRecord, len(records))
+	for _, record := range records {
+		history[record.path] = importedFileRecord{
+			Fingerprint:    record.fingerprint,
+			ImportedAtUnix: record.importedAt.Unix(),
+		}
+	}
+
 	data, err := json.MarshalIndent(history, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal imported files history: %w", err)
 	}
 
-	// Write to file
-	historyPath := filepath.Join(w.configRoot, "imported-files.json")
-	if err := os.WriteFile(historyPath, data, 0644); err != nil {
+	historyPath := filepath.Join(w.configRoot, importedFilesHistoryFileName)
+	tempPath := filepath.Join(w.configRoot, importedFilesHistoryTempFileName)
+
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write imported files history: %w", err)
+	}
+
+	if err := os.Rename(tempPath, historyPath); err != nil {
+		_ = os.Remove(tempPath)
+
+		return fmt.Errorf("failed to publish imported files history: %w", err)
 	}
 
 	return nil
 }
 
-// isFileAlreadyImported checks if a file has already been imported.
-func (w *fileWatcher) isFileAlreadyImported(filePath string) bool {
-	_, exists := w.importedFiles.Load(filePath)
-	return exists
+// importedRecord is one entry of an in-memory history snapshot.
+type importedRecord struct {
+	path        string
+	fingerprint string
+	importedAt  time.Time
 }
 
-// markFileAsImported marks a file as imported and persists the history.
-func (w *fileWatcher) markFileAsImported(filePath, fileKey string) {
-	w.importedFiles.Store(filePath, fileKey)
+// snapshotImportedRecords copies the current history into a slice.
+func (w *fileWatcher) snapshotImportedRecords() []importedRecord {
+	records := make([]importedRecord, 0)
 
-	// Persist to disk asynchronously to avoid blocking
+	w.importedFiles.Range(func(key, value interface{}) bool {
+		record, ok := value.(importedFileRecord)
+		if !ok {
+			return true
+		}
+
+		records = append(records, importedRecord{
+			path:        key.(string),
+			fingerprint: record.Fingerprint,
+			importedAt:  time.Unix(record.ImportedAtUnix, 0),
+		})
+
+		return true
+	})
+
+	return records
+}
+
+// isFileAlreadyImported reports whether the path is already recorded and
+// whether an import of the same revision is currently in flight.
+func (w *fileWatcher) isFileAlreadyImported(filePath, fingerprint string) (bool, bool) {
+	value, exists := w.importedFiles.Load(filePath)
+	if !exists {
+		return false, false
+	}
+
+	record, ok := value.(importedFileRecord)
+	if !ok {
+		return false, false
+	}
+
+	if record.InFlightToken != "" {
+		return false, true
+	}
+
+	return record.Fingerprint == fingerprint, false
+}
+
+// reserveImportSlot atomically claims filePath for the given fingerprint.
+//
+// The claim is published with LoadOrStore and carries a unique token, so two
+// concurrent scans can never both believe they own the same path: only the
+// goroutine whose token is still stored may proceed.
+func (w *fileWatcher) reserveImportSlot(filePath, token, fingerprint string) bool {
+	claim := importedFileRecord{InFlightToken: token, ImportedAtUnix: time.Now().Unix()}
+
+	if _, loaded := w.importedFiles.LoadOrStore(filePath, claim); loaded {
+		value, exists := w.importedFiles.Load(filePath)
+		if !exists {
+			return false
+		}
+
+		record, ok := value.(importedFileRecord)
+		if !ok || record.InFlightToken != "" {
+			return false
+		}
+
+		if record.Fingerprint == fingerprint {
+			return false
+		}
+
+		// Claim the slot for this revision only if the stale record is still the
+		// exact value we inspected.
+		if !w.importedFiles.CompareAndSwap(filePath, value, claim) {
+			return false
+		}
+	} else {
+		w.incrementImportedCount()
+	}
+
+	// Ownership re-check: another goroutine may have replaced the entry between
+	// our CAS and this load.
+	current, exists := w.importedFiles.Load(filePath)
+	if !exists {
+		return false
+	}
+
+	stored, ok := current.(importedFileRecord)
+	if !ok || stored.InFlightToken != token {
+		return false
+	}
+
+	return true
+}
+
+// releaseImportSlot removes an owned in-flight claim, leaving committed records.
+func (w *fileWatcher) releaseImportSlot(filePath, token string) {
+	if token == "" {
+		return
+	}
+
+	value, exists := w.importedFiles.Load(filePath)
+	if !exists {
+		return
+	}
+
+	record, ok := value.(importedFileRecord)
+	if !ok || record.InFlightToken != token {
+		return
+	}
+
+	if w.importedFiles.CompareAndDelete(filePath, value) {
+		w.importedFilesMu.Lock()
+		w.importedCount--
+		w.importedFilesMu.Unlock()
+	}
+}
+
+// reservationSequence disambiguates claims made within the same clock tick.
+var reservationSequence atomic.Uint64
+
+// nextReservationSequence returns the next claim sequence number.
+func nextReservationSequence() uint64 {
+	return reservationSequence.Add(1)
+}
+
+// storeImportedRecord writes an entry, replacing any previous revision, and
+// persists the history.
+func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, importedAt time.Time) {
+	if importedAt.IsZero() {
+		importedAt = time.Now()
+	}
+
+	w.importedFilesMu.Lock()
+	if _, loaded := w.importedFiles.LoadAndDelete(filePath); !loaded {
+		w.importedCount++
+	}
+	w.importedFiles.Store(filePath, importedFileRecord{
+		Fingerprint:    fingerprint,
+		ImportedAtUnix: importedAt.Unix(),
+	})
+	w.importedFilesMu.Unlock()
+
+	w.persistHistoryAsync()
+}
+
+// removeImportedRecord drops an entry and persists the history.
+func (w *fileWatcher) removeImportedRecord(filePath string) {
+	w.importedFilesMu.Lock()
+	if _, loaded := w.importedFiles.LoadAndDelete(filePath); loaded {
+		w.importedCount--
+	}
+	w.importedFilesMu.Unlock()
+
+	w.persistHistoryAsync()
+}
+
+// incrementImportedCount tracks history size without scanning the sync.Map.
+func (w *fileWatcher) incrementImportedCount() {
+	w.importedFilesMu.Lock()
+	w.importedCount++
+	w.importedFilesMu.Unlock()
+}
+
+// importedEntryCount returns the current number of history entries.
+func (w *fileWatcher) importedEntryCount() int {
+	w.importedFilesMu.Lock()
+	defer w.importedFilesMu.Unlock()
+
+	return w.importedCount
+}
+
+// persistHistoryAsync writes the history off the import hot path.
+//
+// Exactly one flusher goroutine is active at a time; callers that arrive during
+// a flush are coalesced instead of racing on the temp file. The caller can
+// observe completion through flushDone.
+func (w *fileWatcher) persistHistoryAsync() {
+	w.importedFilesMu.Lock()
+	if w.flushDone != nil {
+		w.importedFilesMu.Unlock()
+
+		return
+	}
+
+	done := make(chan struct{})
+	w.flushDone = done
+	w.importedFilesMu.Unlock()
+
 	go func() {
+		defer close(done)
+
 		if err := w.saveImportedFilesHistory(); err != nil {
 			w.emit(context.Background(), slog.LevelError, "history_save_failed", "Failed to save imported files history", errorTypeAttr(err))
 		}
+
+		w.importedFilesMu.Lock()
+		w.flushDone = nil
+		w.importedFilesMu.Unlock()
 	}()
+}
+
+// awaitPendingHistoryFlush blocks until any in-flight history write completes.
+// It is used by shutdown and tests so the state directory is quiescent.
+func (w *fileWatcher) awaitPendingHistoryFlush() {
+	for {
+		w.importedFilesMu.Lock()
+		done := w.flushDone
+		w.importedFilesMu.Unlock()
+
+		if done == nil {
+			return
+		}
+
+		<-done
+	}
 }
 
 func (w *fileWatcher) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {
