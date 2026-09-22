@@ -36,6 +36,9 @@ const (
 	defaultSkipStabilityCheckAfterAge          = time.Minute
 	defaultImportedFilesPruneInterval          = 5 * time.Minute
 	defaultImportedFilesHistoryFlushInterval   = 2 * time.Second
+	defaultMaxPostImportActionRetryCount       = 5
+	defaultPostImportActionRetryInitialDelay   = 5 * time.Second
+	defaultPostImportActionRetryMaxDelay       = 5 * time.Minute
 )
 
 // Config configures one Venue runtime instance.
@@ -220,20 +223,23 @@ type TenantConfig struct {
 
 // FileWatcherConfig configures one import watcher.
 type FileWatcherConfig struct {
-	WatcherID                   string        `json:"watcherId" yaml:"watcherId" mapstructure:"watcherId"`
-	TenantID                    string        `json:"tenantId" yaml:"tenantId" mapstructure:"tenantId"`
-	MultiTenantMode             bool          `json:"multiTenantMode" yaml:"multiTenantMode" mapstructure:"multiTenantMode"`
-	AutoCreateTenantDirectories bool          `json:"autoCreateTenantDirectories" yaml:"autoCreateTenantDirectories" mapstructure:"autoCreateTenantDirectories"`
-	WatchPath                   string        `json:"watchPath" yaml:"watchPath" mapstructure:"watchPath"`
-	Enabled                     bool          `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
-	IncludeSubdirectories       bool          `json:"includeSubdirectories" yaml:"includeSubdirectories" mapstructure:"includeSubdirectories"`
-	FilePatterns                []string      `json:"filePatterns" yaml:"filePatterns" mapstructure:"filePatterns"`
-	PostImportAction            string        `json:"postImportAction" yaml:"postImportAction" mapstructure:"postImportAction"`
-	MoveToDirectory             string        `json:"moveToDirectory" yaml:"moveToDirectory" mapstructure:"moveToDirectory"`
-	PollingInterval             time.Duration `json:"pollingInterval" yaml:"pollingInterval" mapstructure:"pollingInterval"`
-	MaxFileSizeBytes            int64         `json:"maxFileSizeBytes" yaml:"maxFileSizeBytes" mapstructure:"maxFileSizeBytes"`
-	MinFileAge                  time.Duration `json:"minFileAge" yaml:"minFileAge" mapstructure:"minFileAge"`
-	MaxConcurrentImports        int           `json:"maxConcurrentImports" yaml:"maxConcurrentImports" mapstructure:"maxConcurrentImports"`
+	WatcherID                         string        `json:"watcherId" yaml:"watcherId" mapstructure:"watcherId"`
+	TenantID                          string        `json:"tenantId" yaml:"tenantId" mapstructure:"tenantId"`
+	MultiTenantMode                   bool          `json:"multiTenantMode" yaml:"multiTenantMode" mapstructure:"multiTenantMode"`
+	AutoCreateTenantDirectories       bool          `json:"autoCreateTenantDirectories" yaml:"autoCreateTenantDirectories" mapstructure:"autoCreateTenantDirectories"`
+	WatchPath                         string        `json:"watchPath" yaml:"watchPath" mapstructure:"watchPath"`
+	Enabled                           bool          `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
+	IncludeSubdirectories             bool          `json:"includeSubdirectories" yaml:"includeSubdirectories" mapstructure:"includeSubdirectories"`
+	FilePatterns                      []string      `json:"filePatterns" yaml:"filePatterns" mapstructure:"filePatterns"`
+	PostImportAction                  string        `json:"postImportAction" yaml:"postImportAction" mapstructure:"postImportAction"`
+	MoveToDirectory                   string        `json:"moveToDirectory" yaml:"moveToDirectory" mapstructure:"moveToDirectory"`
+	PollingInterval                   time.Duration `json:"pollingInterval" yaml:"pollingInterval" mapstructure:"pollingInterval"`
+	MaxFileSizeBytes                  int64         `json:"maxFileSizeBytes" yaml:"maxFileSizeBytes" mapstructure:"maxFileSizeBytes"`
+	MinFileAge                        time.Duration `json:"minFileAge" yaml:"minFileAge" mapstructure:"minFileAge"`
+	MaxConcurrentImports              int           `json:"maxConcurrentImports" yaml:"maxConcurrentImports" mapstructure:"maxConcurrentImports"`
+	MaxPostImportActionRetryCount     int           `json:"maxPostImportActionRetryCount" yaml:"maxPostImportActionRetryCount" mapstructure:"maxPostImportActionRetryCount"`
+	PostImportActionRetryInitialDelay time.Duration `json:"postImportActionRetryInitialDelay" yaml:"postImportActionRetryInitialDelay" mapstructure:"postImportActionRetryInitialDelay"`
+	PostImportActionRetryMaxDelay     time.Duration `json:"postImportActionRetryMaxDelay" yaml:"postImportActionRetryMaxDelay" mapstructure:"postImportActionRetryMaxDelay"`
 
 	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
 	// AutoCreateTenantDirectories. Zero selects the default (60s).
@@ -305,6 +311,15 @@ type FileWatcherRootConfig struct {
 
 	// MaxConcurrentImports limits concurrent imports per derived watcher.
 	MaxConcurrentImports int `json:"maxConcurrentImports" yaml:"maxConcurrentImports" mapstructure:"maxConcurrentImports"`
+
+	// MaxPostImportActionRetryCount limits delete or move attempts after import.
+	MaxPostImportActionRetryCount int `json:"maxPostImportActionRetryCount" yaml:"maxPostImportActionRetryCount" mapstructure:"maxPostImportActionRetryCount"`
+
+	// PostImportActionRetryInitialDelay is the first action retry delay.
+	PostImportActionRetryInitialDelay time.Duration `json:"postImportActionRetryInitialDelay" yaml:"postImportActionRetryInitialDelay" mapstructure:"postImportActionRetryInitialDelay"`
+
+	// PostImportActionRetryMaxDelay caps exponential action retry backoff.
+	PostImportActionRetryMaxDelay time.Duration `json:"postImportActionRetryMaxDelay" yaml:"postImportActionRetryMaxDelay" mapstructure:"postImportActionRetryMaxDelay"`
 
 	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
 	// AutoCreateTenantDirectories. Zero selects the default (60s).
@@ -855,6 +870,15 @@ func (c *Config) ApplyDefaults() {
 // settings. A negative duration is preserved: it selects the documented
 // "disabled" behavior rather than the default.
 func applyFileWatcherAdvancedDefaults(watcher *FileWatcherConfig) {
+	if watcher.MaxPostImportActionRetryCount == 0 {
+		watcher.MaxPostImportActionRetryCount = defaultMaxPostImportActionRetryCount
+	}
+	if watcher.PostImportActionRetryInitialDelay == 0 {
+		watcher.PostImportActionRetryInitialDelay = defaultPostImportActionRetryInitialDelay
+	}
+	if watcher.PostImportActionRetryMaxDelay == 0 {
+		watcher.PostImportActionRetryMaxDelay = defaultPostImportActionRetryMaxDelay
+	}
 	if watcher.AutoCreateTenantDirectoriesCacheTTL == 0 {
 		watcher.AutoCreateTenantDirectoriesCacheTTL = defaultAutoCreateTenantDirectoriesCacheTTL
 	}
@@ -875,6 +899,15 @@ func applyFileWatcherAdvancedDefaults(watcher *FileWatcherConfig) {
 // applyFileWatcherRootAdvancedDefaults fills the zero-valued advanced settings of
 // a root template, using the same defaults as a single watcher.
 func applyFileWatcherRootAdvancedDefaults(root *FileWatcherRootConfig) {
+	if root.MaxPostImportActionRetryCount == 0 {
+		root.MaxPostImportActionRetryCount = defaultMaxPostImportActionRetryCount
+	}
+	if root.PostImportActionRetryInitialDelay == 0 {
+		root.PostImportActionRetryInitialDelay = defaultPostImportActionRetryInitialDelay
+	}
+	if root.PostImportActionRetryMaxDelay == 0 {
+		root.PostImportActionRetryMaxDelay = defaultPostImportActionRetryMaxDelay
+	}
 	if root.AutoCreateTenantDirectoriesCacheTTL == 0 {
 		root.AutoCreateTenantDirectoriesCacheTTL = defaultAutoCreateTenantDirectoriesCacheTTL
 	}
@@ -1010,6 +1043,15 @@ func (c *Config) Validate() error {
 		}
 		if watcher.MaxConcurrentImports < 0 {
 			return fmt.Errorf("fileWatcher[%d]: MaxConcurrentImports cannot be negative", i)
+		}
+		if watcher.MaxPostImportActionRetryCount < 0 {
+			return fmt.Errorf("fileWatcher[%d]: MaxPostImportActionRetryCount cannot be negative", i)
+		}
+		if watcher.PostImportActionRetryInitialDelay < 0 {
+			return fmt.Errorf("fileWatcher[%d]: PostImportActionRetryInitialDelay cannot be negative", i)
+		}
+		if watcher.PostImportActionRetryMaxDelay < 0 {
+			return fmt.Errorf("fileWatcher[%d]: PostImportActionRetryMaxDelay cannot be negative", i)
 		}
 		if watcher.MinFileAge < 0 {
 			return fmt.Errorf("fileWatcher[%d]: MinFileAge cannot be negative", i)
@@ -1322,6 +1364,15 @@ func validateFileWatcherRoots(roots []FileWatcherRootConfig) error {
 		}
 		if root.MaxConcurrentImports < 0 {
 			return fmt.Errorf("watcherRoots[%d]: MaxConcurrentImports cannot be negative", i)
+		}
+		if root.MaxPostImportActionRetryCount < 0 {
+			return fmt.Errorf("watcherRoots[%d]: MaxPostImportActionRetryCount cannot be negative", i)
+		}
+		if root.PostImportActionRetryInitialDelay < 0 {
+			return fmt.Errorf("watcherRoots[%d]: PostImportActionRetryInitialDelay cannot be negative", i)
+		}
+		if root.PostImportActionRetryMaxDelay < 0 {
+			return fmt.Errorf("watcherRoots[%d]: PostImportActionRetryMaxDelay cannot be negative", i)
 		}
 		if root.MinFileAge < 0 {
 			return fmt.Errorf("watcherRoots[%d]: MinFileAge cannot be negative", i)

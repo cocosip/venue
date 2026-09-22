@@ -46,7 +46,7 @@ const (
 	// revision inside the database itself, so a future ALTER has a hook that
 	// does not depend on the engine's user_version pragma.
 	sqliteSchemaVersionKey = "schema_version"
-	sqliteSchemaVersion    = "1"
+	sqliteSchemaVersion    = "2"
 
 	// sqliteUnlimitedQueryLimit bounds a status query that asks for no limit.
 	// SQLite accepts a negative LIMIT as "unlimited"; -1 is bound explicitly so
@@ -83,8 +83,14 @@ CREATE TABLE IF NOT EXISTS files (
     dead_lettered_at                INTEGER,
     available_for_processing_at     INTEGER NOT NULL DEFAULT 0,
     original_file_name              TEXT    NOT NULL DEFAULT '',
-    file_extension                  TEXT    NOT NULL DEFAULT ''
+    file_extension                  TEXT    NOT NULL DEFAULT '',
+    import_operation_id             TEXT
 )`
+
+	sqliteFilesImportOperationIndexDDL = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_import_operation
+    ON files(tenant_id, import_operation_id)
+    WHERE import_operation_id IS NOT NULL AND import_operation_id <> ''`
 
 	sqliteFilesStatusAvailableIndexDDL = `
 CREATE INDEX IF NOT EXISTS idx_files_status_available
@@ -113,25 +119,9 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 )`
 
 	sqliteSchemaVersionDDL = `
-INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1')
-    ON CONFLICT(key) DO NOTHING`
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`
 )
-
-// sqliteSchemaStatements is the DDL script every tenant database is initialized
-// with. PRAGMAs are asserted first and the schema second, mirroring the order
-// the design fixes; the DSN already carries the same pragma values, so the
-// PRAGMA statements are an idempotent re-assertion that also makes the effective
-// values observable through a query.
-var sqliteSchemaStatements = []string{
-	sqliteFilesTableDDL,
-	sqliteFilesStatusAvailableIndexDDL,
-	sqliteFilesStatusCreatedAtIndexDDL,
-	sqliteFilesStatusCompletedAtIndexDDL,
-	sqliteFilesStatusLastFailedAtIndexDDL,
-	sqliteFilesProcessingStartIndexDDL,
-	sqliteSchemaMetaTableDDL,
-	sqliteSchemaVersionDDL,
-}
 
 // sqliteFileMetadataColumns is the projection every row read uses. It is
 // spelled out instead of "SELECT *" so a future additive column cannot silently
@@ -140,7 +130,7 @@ const sqliteFileMetadataColumns = `file_key, tenant_id, volume_id, physical_path
     file_size, created_at, updated_at, status, retry_count,
     last_failed_at, last_error, processing_start_time, released_processing_start_time,
     completed_at, dead_lettered_at, available_for_processing_at,
-    original_file_name, file_extension`
+    original_file_name, file_extension, import_operation_id`
 
 // sqliteFileMetadataUpsertSQL inserts or replaces one file record.
 //
@@ -152,12 +142,12 @@ INSERT INTO files (
     file_key, tenant_id, volume_id, physical_path, directory_path, file_size,
     created_at, updated_at, status, retry_count, last_failed_at, last_error,
     processing_start_time, released_processing_start_time, completed_at, dead_lettered_at,
-    available_for_processing_at, original_file_name, file_extension)
+    available_for_processing_at, original_file_name, file_extension, import_operation_id)
 VALUES (
     @file_key, @tenant_id, @volume_id, @physical_path, @directory_path, @file_size,
     @created_at, @updated_at, @status, @retry_count, @last_failed_at, @last_error,
     @processing_start_time, @released_processing_start_time, @completed_at, @dead_lettered_at,
-    @available_for_processing_at, @original_file_name, @file_extension)
+    @available_for_processing_at, @original_file_name, @file_extension, @import_operation_id)
 ON CONFLICT(file_key) DO UPDATE SET
     tenant_id                       = excluded.tenant_id,
     volume_id                       = excluded.volume_id,
@@ -176,7 +166,8 @@ ON CONFLICT(file_key) DO UPDATE SET
     dead_lettered_at                = excluded.dead_lettered_at,
     available_for_processing_at     = excluded.available_for_processing_at,
     original_file_name              = excluded.original_file_name,
-    file_extension                  = excluded.file_extension`
+    file_extension                  = excluded.file_extension,
+    import_operation_id             = excluded.import_operation_id`
 
 // SQLiteRepositoryOptions configures the SQLite metadata repository.
 type SQLiteRepositoryOptions struct {
@@ -600,6 +591,44 @@ func (r *SQLiteMetadataRepository) Get(ctx context.Context, tenantID string, fil
 	}
 
 	r.cacheRecord(metadata)
+	return metadata, nil
+}
+
+// GetByImportOperationID returns the metadata record that owns operationID for
+// one tenant. The lookup is served directly by SQLite's unique partial index;
+// no operation-ID map is retained in process memory.
+func (r *SQLiteMetadataRepository) GetByImportOperationID(
+	ctx context.Context,
+	tenantID string,
+	operationID string,
+) (*core.FileMetadata, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if strings.TrimSpace(operationID) == "" {
+		return nil, fmt.Errorf("import operation ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	handle, err := r.begin(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer r.end(handle)
+
+	row := handle.db.QueryRowContext(ctx,
+		`SELECT `+sqliteFileMetadataColumns+`
+		 FROM files
+		 WHERE tenant_id = @tenant AND import_operation_id = @operation_id
+		 LIMIT 1`,
+		sql.Named("tenant", tenantID),
+		sql.Named("operation_id", operationID))
+	metadata, err := sqliteScanMetadata(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, core.ErrFileNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get metadata by import operation ID: %w", err)
+	}
 	return metadata, nil
 }
 
@@ -1609,7 +1638,10 @@ func (r *SQLiteMetadataRepository) applyPragmas(ctx context.Context, db *sql.DB)
 // migration so a database created by an older revision of this schema gains a
 // column it is missing instead of failing on the first statement that selects it.
 func (r *SQLiteMetadataRepository) applySchema(ctx context.Context, db *sql.DB) error {
-	for _, statement := range sqliteSchemaStatements {
+	// Tables must exist before version inspection and additive migration. The
+	// operation-ID index is deliberately created only after the column has been
+	// added to databases created by schema version 1.
+	for _, statement := range []string{sqliteFilesTableDDL, sqliteSchemaMetaTableDDL} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return err
 		}
@@ -1617,7 +1649,23 @@ func (r *SQLiteMetadataRepository) applySchema(ctx context.Context, db *sql.DB) 
 	if err := verifySchemaVersion(ctx, db); err != nil {
 		return err
 	}
-	return migrateAdditiveColumns(ctx, db, "files", sqliteFilesAdditiveColumns)
+	if err := migrateAdditiveColumns(ctx, db, "files", sqliteFilesAdditiveColumns); err != nil {
+		return err
+	}
+	for _, statement := range []string{
+		sqliteFilesStatusAvailableIndexDDL,
+		sqliteFilesStatusCreatedAtIndexDDL,
+		sqliteFilesStatusCompletedAtIndexDDL,
+		sqliteFilesStatusLastFailedAtIndexDDL,
+		sqliteFilesProcessingStartIndexDDL,
+		sqliteFilesImportOperationIndexDDL,
+		sqliteSchemaVersionDDL,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // verifySchemaVersion rejects a database written by a newer schema revision.
@@ -1660,7 +1708,9 @@ type sqliteAdditiveColumn struct {
 // sqliteFilesAdditiveColumns is the ordered inventory of columns added to the
 // files table after its first revision. It is empty today and exists so a future
 // revision appends an entry instead of inventing a second migration path.
-var sqliteFilesAdditiveColumns = []sqliteAdditiveColumn{}
+var sqliteFilesAdditiveColumns = []sqliteAdditiveColumn{
+	{name: "import_operation_id", definition: "TEXT"},
+}
 
 // migrateAdditiveColumns adds every column of wanted that the table does not have
 // yet.
@@ -1817,7 +1867,11 @@ func sqliteUpsertMetadata(ctx context.Context, tx *sql.Tx, metadata *core.FileMe
 		sql.Named("dead_lettered_at", timePtrToNanos(metadata.DeadLetteredAt)),
 		sql.Named("available_for_processing_at", optionalTimeToNanos(metadata.AvailableForProcessingAt)),
 		sql.Named("original_file_name", metadata.OriginalFileName),
-		sql.Named("file_extension", metadata.FileExtension))
+		sql.Named("file_extension", metadata.FileExtension),
+		sql.Named("import_operation_id", sql.NullString{
+			String: metadata.ImportOperationID,
+			Valid:  metadata.ImportOperationID != "",
+		}))
 	return err
 }
 
@@ -1867,6 +1921,7 @@ func sqliteScanMetadata(scanner sqliteScanner) (*core.FileMetadata, error) {
 		directoryPath     sql.NullString
 		originalFileName  sql.NullString
 		fileExtensionText sql.NullString
+		importOperationID sql.NullString
 	)
 	if err := scanner.Scan(
 		&metadata.FileKey,
@@ -1888,6 +1943,7 @@ func sqliteScanMetadata(scanner sqliteScanner) (*core.FileMetadata, error) {
 		&availableFor,
 		&originalFileName,
 		&fileExtensionText,
+		&importOperationID,
 	); err != nil {
 		return nil, err
 	}
@@ -1898,6 +1954,7 @@ func sqliteScanMetadata(scanner sqliteScanner) (*core.FileMetadata, error) {
 	metadata.LastError = lastError.String
 	metadata.OriginalFileName = originalFileName.String
 	metadata.FileExtension = fileExtensionText.String
+	metadata.ImportOperationID = importOperationID.String
 	metadata.Status = core.FileProcessingStatus(status)
 	metadata.CreatedAt = nanosToTime(createdAt)
 	metadata.UpdatedAt = nanosToTime(updatedAt)

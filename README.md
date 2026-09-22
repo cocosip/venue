@@ -281,6 +281,7 @@ The important runtime defaults are:
 | Watcher parallel scans | `4` |
 | Watcher minimum file age | `5s` |
 | Watcher concurrent imports | `4` |
+| Watcher post-import action attempts | `5` (`5s` initial delay, exponential backoff capped at `5m`) |
 
 Watcher defaults are applied for durations, capacities, patterns, and the
 post-import action. `enabled` and `includeSubdirectories` are booleans: the Go
@@ -712,6 +713,9 @@ venue:
       pollingInterval: 30s
       minFileAge: 5s
       maxConcurrentImports: 4
+      maxPostImportActionRetryCount: 5
+      postImportActionRetryInitialDelay: 5s
+      postImportActionRetryMaxDelay: 5m
   watcherServiceOptions:
     enabled: true
     defaultPollingInterval: 30s
@@ -744,6 +748,9 @@ the import pipeline:
 | `autoCreateTenantDirectoriesCacheTtl` | `60s` | How long the tenant list used by `autoCreateTenantDirectories` is cached |
 | `fileStabilityCheckDelay` | `100ms` | Delay before the second stability probe; negative disables the probe |
 | `skipStabilityCheckAfterAge` | `1m` | Skip the second probe for candidates at least this old; negative always probes |
+| `maxPostImportActionRetryCount` | `5` | Maximum delete or move attempts after the storage write succeeds; exhaustion quarantines the source revision |
+| `postImportActionRetryInitialDelay` | `5s` | Initial retry delay; retries use exponential backoff |
+| `postImportActionRetryMaxDelay` | `5m` | Maximum delay between post-import action attempts |
 | `disableImportedFilesPruneThrottle` | `false` | Deliberately inverted: the prune throttle is **on** by default, so the zero value keeps it on and `true` turns it off |
 | `importedFilesPruneInterval` | `5m` | Minimum delay between prune runs while the throttle is on |
 | `disableImportedFilesHistoryFlushDebounce` | `false` | Deliberately inverted: the write debounce is **on** by default, so the zero value keeps it on and `true` turns it off |
@@ -752,6 +759,26 @@ the import pipeline:
 The double-negative naming is intentional: both switches are on by default, so a
 configuration file that omits them keeps the throttled, debounced behavior
 instead of silently disabling it.
+
+Watcher fingerprints include file size, modification time, and SHA-256 hashes
+of bounded beginning/middle/end content samples. Before a Delete or Move action,
+the watcher persists a pending-action record. A restart therefore resumes only
+the source action and does not repeat the storage write. The stable operation ID
+is persisted in the tenant's SQLite `files.import_operation_id` column with a
+tenant-scoped unique index. Venue keeps no operation-ID cache: only 256 striped
+mutexes are held in memory, and deleting the metadata row also deletes the
+idempotency record.
+
+The import itself always copies from the watcher source through `io.Reader` into
+the selected volume, so it does not depend on same-filesystem rename semantics.
+For `PostImportAction.Move`, Venue uses an atomic rename on the fast path and
+falls back to destination-side staging, `fsync`, commit, and source deletion when
+the source and destination are on different filesystems (`EXDEV`).
+
+Background watcher schedules are independent. A slow watcher never delays a
+different watcher, scans of the same watcher never overlap, and the global
+`maxParallelWatcherScans` bound still applies. `Stop` cancels and waits for all
+in-flight scans.
 
 The `Venue` local filesystem volume also implements the optional volume
 capabilities `core.StorageVolumeHealthProbe` (`ProbeHealth`, the forced probe
@@ -953,6 +980,8 @@ dead-letter storage, junk-file cleanup, quarantined-database cleanup,
 retired-volume policy, cumulative cleanup statistics, watcher root derivation,
 global watcher options with a global enable/disable switch and a persisted
 operator decision, `UpdateWatcher`, the advanced per-watcher import knobs,
+content-aware watcher fingerprints, durable idempotent watcher writes,
+post-import retry/quarantine state, independent watcher schedules,
 runtime statistics with optional periodic log output, metadata backup with
 offline restore, per-volume startup health retry and warmup, configurable
 timed-out reclaim bounds, tenant quota limit administration, per-tenant cleanup

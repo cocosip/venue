@@ -178,8 +178,9 @@ func TestEveryConfigModuleSupportsFluentConstruction(t *testing.T) {
 		WithPostImportAction("Keep").
 		WithPollingInterval(time.Second).
 		WithMaxFileSizeBytes(1024).
-		WithMinFileAge(2 * time.Second).
-		WithMaxConcurrentImports(2)
+		WithMinFileAge(2*time.Second).
+		WithMaxConcurrentImports(2).
+		WithPostImportActionRetry(7, 3*time.Second, time.Minute)
 
 	cfg := New().
 		WithMetadataDirectory("metadata").
@@ -196,7 +197,8 @@ func TestEveryConfigModuleSupportsFluentConstruction(t *testing.T) {
 		WithCleanup(NewCleanupConfig().WithProcessingTimeout(time.Hour)).
 		WithDatabaseHealthCheck(NewDatabaseHealthCheckConfig().WithMaxRetries(9))
 
-	if cfg.Volumes[0].ShardingDepth != 3 || cfg.Tenants[0].Quota == nil || cfg.FileWatchers[0].MaxConcurrentImports != 2 {
+	if cfg.Volumes[0].ShardingDepth != 3 || cfg.Tenants[0].Quota == nil ||
+		cfg.FileWatchers[0].MaxConcurrentImports != 2 || cfg.FileWatchers[0].MaxPostImportActionRetryCount != 7 {
 		t.Fatalf("nested fluent config not retained: %#v", cfg)
 	}
 	if cfg.RetryPolicy.MaxRetryCount != 5 || cfg.Metadata.MaxCacheEntries != 50 || cfg.DatabaseHealthCheck.MaxRetries != 9 {
@@ -243,6 +245,14 @@ func TestLocusAlignedWatcherDefaults(t *testing.T) {
 	if watcher.MinFileAge != 5*time.Second {
 		t.Errorf("NewFileWatcherConfig().MinFileAge = %v, want 5s", watcher.MinFileAge)
 	}
+	if watcher.MaxPostImportActionRetryCount != 5 ||
+		watcher.PostImportActionRetryInitialDelay != 5*time.Second ||
+		watcher.PostImportActionRetryMaxDelay != 5*time.Minute {
+		t.Fatalf("post-import retry defaults = {%d %v %v}, want {5 5s 5m}",
+			watcher.MaxPostImportActionRetryCount,
+			watcher.PostImportActionRetryInitialDelay,
+			watcher.PostImportActionRetryMaxDelay)
+	}
 
 	cfg := &Config{}
 	cfg.ApplyDefaults()
@@ -252,6 +262,10 @@ func TestLocusAlignedWatcherDefaults(t *testing.T) {
 	cfg.ApplyDefaults()
 	if cfg.FileWatchers[len(cfg.FileWatchers)-1].MinFileAge != 5*time.Second {
 		t.Errorf("ApplyDefaults MinFileAge = %v, want 5s", cfg.FileWatchers[len(cfg.FileWatchers)-1].MinFileAge)
+	}
+	if cfg.FileWatchers[len(cfg.FileWatchers)-1].MaxPostImportActionRetryCount != 5 {
+		t.Errorf("ApplyDefaults MaxPostImportActionRetryCount = %d, want 5",
+			cfg.FileWatchers[len(cfg.FileWatchers)-1].MaxPostImportActionRetryCount)
 	}
 }
 

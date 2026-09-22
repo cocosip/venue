@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 // defaultCapacityCacheTTL bounds how often capacity reporting probes the
 // volumes. It is short so operational callers still observe near-live values.
 const defaultCapacityCacheTTL = time.Second
+
+const idempotentWriteGuardCount = 256
 
 // StoragePoolOptions configures the storage pool.
 type StoragePoolOptions struct {
@@ -83,6 +86,11 @@ type storagePool struct {
 	now         func() time.Time
 	capacityTTL time.Duration
 	capacity    capacitySnapshot
+
+	// idempotentWriteGuards serialize equal tenant/operation pairs without
+	// retaining operation IDs. The fixed array keeps memory bounded while the
+	// SQLite unique index remains the durable source of truth.
+	idempotentWriteGuards [idempotentWriteGuardCount]sync.Mutex
 }
 
 // capacitySnapshot is the cached aggregate capacity of the healthy volumes.
@@ -179,7 +187,61 @@ func (p *storagePool) recordStatistic(name string, value int64, tenantID, volume
 
 // WriteFile stores a file in the storage pool and returns a system-generated fileKey.
 func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, content io.Reader, originalFileName *string) (string, error) {
-	return p.writeFile(ctx, tenant, content, originalFileName, "/")
+	return p.writeFile(ctx, tenant, content, originalFileName, "/", "")
+}
+
+// WriteFileIdempotently stores one logical write at most once for a tenant.
+// SQLite owns the durable mapping; the fixed striped lock only closes the
+// in-process check/write race and never grows with the number of imports.
+func (p *storagePool) WriteFileIdempotently(
+	ctx context.Context,
+	tenant core.TenantContext,
+	content io.Reader,
+	originalFileName *string,
+	operationID string,
+) (string, error) {
+	if strings.TrimSpace(operationID) == "" {
+		return "", fmt.Errorf("import operation ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	operationRepo, ok := p.metadataRepo.(core.ImportOperationRepository)
+	if !ok {
+		return "", fmt.Errorf("metadata repository does not support import operation lookup: %w", core.ErrInvalidArgument)
+	}
+
+	guard := p.idempotentWriteGuard(tenant.ID, operationID)
+	guard.Lock()
+	defer guard.Unlock()
+
+	existing, err := operationRepo.GetByImportOperationID(ctx, tenant.ID, operationID)
+	if err == nil {
+		return existing.FileKey, nil
+	}
+	if !errors.Is(err, core.ErrFileNotFound) {
+		return "", err
+	}
+
+	fileKey, err := p.writeFile(ctx, tenant, content, originalFileName, "/", operationID)
+	if err == nil {
+		return fileKey, nil
+	}
+
+	// A second process may have won the database unique constraint after our
+	// lookup. The failed write has already rolled its physical file and quotas
+	// back, so returning the durable winner is safe.
+	existing, lookupErr := operationRepo.GetByImportOperationID(ctx, tenant.ID, operationID)
+	if lookupErr == nil {
+		return existing.FileKey, nil
+	}
+	return "", err
+}
+
+func (p *storagePool) idempotentWriteGuard(tenantID string, operationID string) *sync.Mutex {
+	var hash uint32 = 2166136261
+	for _, value := range tenantID + "\n" + operationID {
+		hash ^= uint32(value)
+		hash *= 16777619
+	}
+	return &p.idempotentWriteGuards[hash%idempotentWriteGuardCount]
 }
 
 // WriteFileToDirectory stores a file with a normalized logical directory.
@@ -190,7 +252,7 @@ func (p *storagePool) WriteFileToDirectory(
 	originalFileName *string,
 	logicalDirectoryPath string,
 ) (string, error) {
-	return p.writeFile(ctx, tenant, content, originalFileName, directorypath.Normalize(logicalDirectoryPath))
+	return p.writeFile(ctx, tenant, content, originalFileName, directorypath.Normalize(logicalDirectoryPath), "")
 }
 
 func (p *storagePool) writeFile(
@@ -199,6 +261,7 @@ func (p *storagePool) writeFile(
 	content io.Reader,
 	originalFileName *string,
 	logicalDirectoryPath string,
+	operationID string,
 ) (fileKey string, err error) {
 	// Validate tenant is enabled
 	if !tenant.IsEnabled() {
@@ -272,18 +335,19 @@ func (p *storagePool) writeFile(
 	// Create file metadata
 	now := time.Now()
 	metadata := &core.FileMetadata{
-		FileKey:          fileKey,
-		TenantID:         tenant.ID,
-		VolumeID:         volume.VolumeID(),
-		PhysicalPath:     relativePath,
-		DirectoryPath:    logicalDirectoryPath,
-		FileSize:         fileSize,
-		FileExtension:    fileExtension,
-		OriginalFileName: stringValue(originalFileName),
-		Status:           core.FileStatusPending,
-		RetryCount:       0,
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		FileKey:           fileKey,
+		TenantID:          tenant.ID,
+		ImportOperationID: operationID,
+		VolumeID:          volume.VolumeID(),
+		PhysicalPath:      relativePath,
+		DirectoryPath:     logicalDirectoryPath,
+		FileSize:          fileSize,
+		FileExtension:     fileExtension,
+		OriginalFileName:  stringValue(originalFileName),
+		Status:            core.FileStatusPending,
+		RetryCount:        0,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 
 	// Save metadata

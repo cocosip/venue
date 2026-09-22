@@ -339,6 +339,62 @@ func TestBackgroundFileWatcherService_HonoursPerWatcherPollingInterval(t *testin
 	}
 }
 
+func TestBackgroundFileWatcherService_SlowWatcherDoesNotDelayIndependentSchedule(t *testing.T) {
+	watcher := newStubFileWatcher(
+		&core.FileWatcherConfiguration{WatcherID: "slow", Enabled: true, PollingInterval: 5 * time.Millisecond},
+		&core.FileWatcherConfiguration{WatcherID: "fast", Enabled: true, PollingInterval: 5 * time.Millisecond},
+	)
+	slowStarted := make(chan struct{})
+	fastScans := make(chan struct{}, 8)
+	var slowOnce sync.Once
+	watcher.scanHook = func(ctx context.Context, watcherID string) (*core.FileWatcherScanResult, error) {
+		if watcherID == "slow" {
+			slowOnce.Do(func() { close(slowStarted) })
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		fastScans <- struct{}{}
+		return &core.FileWatcherScanResult{}, nil
+	}
+
+	service := newBackgroundService(t, watcher, func(options *BackgroundFileWatcherServiceOptions) {
+		options.ServiceOptions = core.FileWatcherServiceOptions{
+			Enabled:                 true,
+			DefaultPollingInterval:  5 * time.Millisecond,
+			MinimumPollingInterval:  time.Millisecond,
+			MaximumPollingInterval:  time.Second,
+			DisabledCheckInterval:   time.Millisecond,
+			MaxParallelWatcherScans: 2,
+		}
+	})
+	if err := service.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if service.IsRunning() {
+			if err := service.Stop(); err != nil {
+				t.Errorf("Stop() error = %v", err)
+			}
+		}
+	})
+
+	select {
+	case <-slowStarted:
+	case <-time.After(time.Second):
+		t.Fatal("slow watcher never started")
+	}
+	for scan := 0; scan < 2; scan++ {
+		select {
+		case <-fastScans:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("fast watcher completed only %d scans while slow watcher was running", scan)
+		}
+	}
+	if err := service.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
 func TestBackgroundFileWatcherService_ClampsPollingInterval(t *testing.T) {
 	minimum := 5 * time.Second
 	maximum := 2 * time.Minute

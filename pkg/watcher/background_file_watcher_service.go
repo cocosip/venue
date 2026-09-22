@@ -198,6 +198,13 @@ type BackgroundFileWatcherService struct {
 	scheduleMu   sync.Mutex
 	nextScanDue  map[string]time.Time
 	warnedClamps map[string]bool
+
+	// scanStateMu guards the process-wide concurrency bound and the one-scan-per-
+	// watcher invariant. The map contains only currently running watchers, so it
+	// is bounded by MaxParallelWatcherScans rather than historical watcher IDs.
+	scanStateMu   sync.Mutex
+	activeScans   int
+	inFlightScans map[string]bool
 }
 
 // NewBackgroundFileWatcherService creates a new background file watcher service.
@@ -337,6 +344,7 @@ func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) 
 		configRootDir: configRootDir,
 		nextScanDue:   make(map[string]time.Time),
 		warnedClamps:  make(map[string]bool),
+		inFlightScans: make(map[string]bool),
 	}
 
 	service.options.Store(&options)
@@ -613,7 +621,7 @@ func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 			}
 		}
 
-		interval := s.executeScanCycle(ctx)
+		interval := s.dispatchScanCycle(ctx)
 		s.emit(ctx, slog.LevelDebug, "next_scan", "Next scan cycle", slog.Duration("interval", interval))
 
 		select {
@@ -623,6 +631,81 @@ func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// dispatchScanCycle starts due watcher scans without waiting for them. Each
+// watcher advances its own schedule when dispatched; a slow watcher therefore
+// cannot delay another watcher while the global concurrency bound still holds.
+func (s *BackgroundFileWatcherService) dispatchScanCycle(ctx context.Context) time.Duration {
+	return s.dispatchScanCycleAt(ctx, timeNow())
+}
+
+func (s *BackgroundFileWatcherService) dispatchScanCycleAt(ctx context.Context, now time.Time) time.Duration {
+	options := s.Options()
+	watchers, err := s.fileWatcher.GetAllWatchers(ctx)
+	if err != nil {
+		s.emit(ctx, slog.LevelError, "watchers_get_failed", "Failed to get watchers", errorTypeAttr(err))
+		return options.DefaultPollingInterval
+	}
+
+	enabled := make([]*core.FileWatcherConfiguration, 0, len(watchers))
+	enabledIDs := make(map[string]bool, len(watchers))
+	for _, watcher := range watchers {
+		if watcher.Enabled {
+			enabled = append(enabled, watcher)
+			enabledIDs[watcher.WatcherID] = true
+		}
+	}
+	if len(enabled) == 0 {
+		s.pruneSchedule(nil)
+		return options.DefaultPollingInterval
+	}
+	s.pruneSchedule(enabledIDs)
+
+	dispatched := 0
+	for _, watcher := range enabled {
+		if s.nextDue(watcher, now).After(now) {
+			continue
+		}
+		if !s.reserveWatcherScan(watcher.WatcherID, s.parallelScanLimit()) {
+			continue
+		}
+
+		s.scheduleNext(watcher, now)
+		dispatched++
+		s.wg.Add(1)
+		go func(target *core.FileWatcherConfiguration) {
+			defer s.wg.Done()
+			defer s.releaseWatcherScan(target.WatcherID)
+			s.scanWatcherOnce(ctx, target)
+		}(watcher)
+	}
+
+	if dispatched > 0 {
+		s.emit(ctx, slog.LevelInfo, "watchers_dispatched", "Dispatched due watcher scans",
+			slog.Int("count", dispatched), slog.Int("max_parallel", s.parallelScanLimit()))
+	}
+	return s.delayUntilNextDue(enabled, now)
+}
+
+func (s *BackgroundFileWatcherService) reserveWatcherScan(watcherID string, limit int) bool {
+	s.scanStateMu.Lock()
+	defer s.scanStateMu.Unlock()
+	if s.inFlightScans[watcherID] || s.activeScans >= limit {
+		return false
+	}
+	s.inFlightScans[watcherID] = true
+	s.activeScans++
+	return true
+}
+
+func (s *BackgroundFileWatcherService) releaseWatcherScan(watcherID string) {
+	s.scanStateMu.Lock()
+	delete(s.inFlightScans, watcherID)
+	if s.activeScans > 0 {
+		s.activeScans--
+	}
+	s.scanStateMu.Unlock()
 }
 
 // executeScanCycle scans every watcher that is currently due and returns the
@@ -781,7 +864,13 @@ func (s *BackgroundFileWatcherService) scanWatcher(
 	now time.Time,
 ) scanTotals {
 	defer s.scheduleNext(watcher, now)
+	return s.scanWatcherOnce(ctx, watcher)
+}
 
+func (s *BackgroundFileWatcherService) scanWatcherOnce(
+	ctx context.Context,
+	watcher *core.FileWatcherConfiguration,
+) scanTotals {
 	result, err := s.fileWatcher.ScanNow(ctx, watcher.WatcherID)
 	if err != nil {
 		s.emit(ctx, slog.LevelError, "watcher_scan_failed", "Failed to scan watcher", slog.String("watcher_id", watcher.WatcherID), errorTypeAttr(err))
@@ -789,13 +878,16 @@ func (s *BackgroundFileWatcherService) scanWatcher(
 		return scanTotals{}
 	}
 
-	if result.FilesImported > 0 || result.FilesFailed > 0 {
+	if result.FilesImported > 0 || result.FilesFailed > 0 ||
+		result.PostImportActionsRetried > 0 || result.FilesQuarantined > 0 {
 		s.emit(ctx, slog.LevelInfo, "watcher_scan_completed", "Watcher scan completed",
 			slog.String("watcher_id", watcher.WatcherID),
 			slog.Int("discovered", result.FilesDiscovered),
 			slog.Int("imported", result.FilesImported),
 			slog.Int("skipped", result.FilesSkipped),
 			slog.Int("failed", result.FilesFailed),
+			slog.Int("post_import_actions_retried", result.PostImportActionsRetried),
+			slog.Int("quarantined", result.FilesQuarantined),
 			slog.Int64("bytes", result.BytesImported),
 			slog.Duration("duration", result.ScanDuration))
 

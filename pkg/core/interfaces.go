@@ -102,6 +102,20 @@ type StoragePool interface {
 	GetAvailableSpace(ctx context.Context) (int64, error)
 }
 
+// IdempotentStoragePool is an optional storage capability used by importers
+// that may repeat the same logical write after a crash or a failed follow-up
+// action. operationID is scoped to the tenant and remains valid across process
+// restarts while the corresponding metadata record exists.
+type IdempotentStoragePool interface {
+	WriteFileIdempotently(
+		ctx context.Context,
+		tenant TenantContext,
+		content io.Reader,
+		originalFileName *string,
+		operationID string,
+	) (string, error)
+}
+
 // TenantManager manages tenant lifecycle and multi-tenant isolation.
 type TenantManager interface {
 	// GetTenant retrieves a tenant context by ID.
@@ -565,6 +579,13 @@ type MetadataRepository interface {
 	Close() error
 }
 
+// ImportOperationRepository is the optional persistent lookup used by an
+// IdempotentStoragePool. Implementations must scope operation IDs by tenant and
+// remove the mapping when the owning metadata record is deleted.
+type ImportOperationRepository interface {
+	GetByImportOperationID(ctx context.Context, tenantID string, operationID string) (*FileMetadata, error)
+}
+
 // DirectoryQuotaRepository manages directory quota persistence.
 type DirectoryQuotaRepository interface {
 	// GetOrCreate retrieves directory quota or creates with defaults.
@@ -673,6 +694,18 @@ type FileWatcherConfiguration struct {
 	// MaxConcurrentImports is the maximum number of concurrent file imports.
 	MaxConcurrentImports int
 
+	// MaxPostImportActionRetryCount is the maximum number of delete or move
+	// attempts after storage succeeds. Zero selects the default of 5.
+	MaxPostImportActionRetryCount int
+
+	// PostImportActionRetryInitialDelay is the delay after the first failed
+	// delete or move. Zero retries on the next scan.
+	PostImportActionRetryInitialDelay time.Duration
+
+	// PostImportActionRetryMaxDelay caps exponential action retry backoff. Zero
+	// selects the default of 5 minutes.
+	PostImportActionRetryMaxDelay time.Duration
+
 	// PostImportAction defines what to do after successful import.
 	PostImportAction PostImportAction
 
@@ -729,6 +762,14 @@ type FileWatcherScanResult struct {
 
 	// FilesFailed is the number of files that failed to import.
 	FilesFailed int
+
+	// PostImportActionsRetried is the number of previously persisted delete or
+	// move actions attempted by this scan.
+	PostImportActionsRetried int
+
+	// FilesQuarantined is the number of sources suppressed after exhausting
+	// their post-import action attempts.
+	FilesQuarantined int
 
 	// BytesImported is the total bytes imported.
 	BytesImported int64

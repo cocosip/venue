@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -276,6 +277,119 @@ func TestSQLiteMetadataRepositoryCreateReadUpdateDeleteRoundTrip(t *testing.T) {
 	// Deleting a record that does not exist is not an error.
 	if err := repo.Delete(ctx, tenantID, record.FileKey); err != nil {
 		t.Fatalf("Delete() of a missing record error = %v, want nil", err)
+	}
+}
+
+func TestSQLiteMetadataRepositoryImportOperationIDLifecycle(t *testing.T) {
+	repo := newSQLiteFixtureRepository(t, nil)
+	ctx := context.Background()
+	record := sqliteRecord("tenant-operation", "file-operation", time.Now().UTC())
+	record.ImportOperationID = "watcher-operation-1"
+
+	if err := repo.AddOrUpdate(ctx, record); err != nil {
+		t.Fatalf("AddOrUpdate() error = %v", err)
+	}
+
+	stored, err := repo.GetByImportOperationID(ctx, record.TenantID, record.ImportOperationID)
+	if err != nil {
+		t.Fatalf("GetByImportOperationID() error = %v", err)
+	}
+	if stored.FileKey != record.FileKey || stored.ImportOperationID != record.ImportOperationID {
+		t.Fatalf("stored operation mapping = (%q, %q), want (%q, %q)",
+			stored.FileKey, stored.ImportOperationID, record.FileKey, record.ImportOperationID)
+	}
+
+	if err := repo.Delete(ctx, record.TenantID, record.FileKey); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := repo.GetByImportOperationID(ctx, record.TenantID, record.ImportOperationID); !errors.Is(err, core.ErrFileNotFound) {
+		t.Fatalf("GetByImportOperationID() after delete error = %v, want ErrFileNotFound", err)
+	}
+}
+
+func TestSQLiteMetadataRepositoryImportOperationIDSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := &SQLiteRepositoryOptions{
+		DataPath:        root,
+		CacheTTL:        time.Minute,
+		MaxCacheEntries: 64,
+		Sqlite:          sqlite.DefaultOptions(),
+	}
+
+	firstRepo, err := NewSQLiteMetadataRepository(options)
+	if err != nil {
+		t.Fatalf("NewSQLiteMetadataRepository(first) error = %v", err)
+	}
+	record := sqliteRecord("tenant-operation-restart", "file-operation-restart", time.Now().UTC())
+	record.ImportOperationID = "watcher-operation-restart"
+	if err := firstRepo.AddOrUpdate(ctx, record); err != nil {
+		_ = firstRepo.Close()
+		t.Fatalf("AddOrUpdate() error = %v", err)
+	}
+	if err := firstRepo.Close(); err != nil {
+		t.Fatalf("Close(first) error = %v", err)
+	}
+
+	secondRepo, err := NewSQLiteMetadataRepository(options)
+	if err != nil {
+		t.Fatalf("NewSQLiteMetadataRepository(second) error = %v", err)
+	}
+	t.Cleanup(func() { _ = secondRepo.Close() })
+	operationRepo, ok := secondRepo.(core.ImportOperationRepository)
+	if !ok {
+		t.Fatalf("repository type %T does not implement core.ImportOperationRepository", secondRepo)
+	}
+	stored, err := operationRepo.GetByImportOperationID(ctx, record.TenantID, record.ImportOperationID)
+	if err != nil {
+		t.Fatalf("GetByImportOperationID() after restart error = %v", err)
+	}
+	if stored.FileKey != record.FileKey {
+		t.Fatalf("file key after restart = %q, want %q", stored.FileKey, record.FileKey)
+	}
+}
+
+func TestSQLiteMetadataRepositoryMigratesVersionOneForImportOperations(t *testing.T) {
+	root := t.TempDir()
+	tenantID := "tenant-schema-v1"
+	tenantDir := filepath.Join(root, tenantID)
+	if err := os.MkdirAll(tenantDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	db, err := sqlite.Open(filepath.Join(tenantDir, metadataDatabaseFileName), sqlite.DefaultOptions())
+	if err != nil {
+		t.Fatalf("open version-one fixture: %v", err)
+	}
+	oldFilesDDL := strings.Replace(sqliteFilesTableDDL,
+		",\n    import_operation_id             TEXT", "", 1)
+	for _, statement := range []string{
+		oldFilesDDL,
+		sqliteSchemaMetaTableDDL,
+		`INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("create version-one fixture: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version-one fixture: %v", err)
+	}
+
+	repo := newSQLiteFixtureRepository(t, func(options *SQLiteRepositoryOptions) {
+		options.DataPath = root
+	})
+	record := sqliteRecord(tenantID, "migrated-file", time.Now().UTC())
+	record.ImportOperationID = "migrated-operation"
+	if err := repo.AddOrUpdate(context.Background(), record); err != nil {
+		t.Fatalf("AddOrUpdate() after migration error = %v", err)
+	}
+	stored, err := repo.GetByImportOperationID(context.Background(), tenantID, record.ImportOperationID)
+	if err != nil {
+		t.Fatalf("GetByImportOperationID() after migration error = %v", err)
+	}
+	if stored.FileKey != record.FileKey {
+		t.Fatalf("migrated operation file key = %q, want %q", stored.FileKey, record.FileKey)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -175,6 +176,102 @@ func TestWriteFile(t *testing.T) {
 			t.Errorf("Expected ErrTenantDisabled, got %v", err)
 		}
 	})
+}
+
+func TestWriteFileIdempotentlyReturnsOriginalFileKey(t *testing.T) {
+	ctx := context.Background()
+	tenantMgr := &mockTenantManager{}
+	repo, _ := createTestRepository(t)
+	volumes := createTestVolumes(t)
+	defer cleanupVolumes(volumes)
+	sched, err := scheduler.NewFileScheduler(repo, volumes, nil)
+	if err != nil {
+		t.Fatalf("NewFileScheduler() error = %v", err)
+	}
+
+	storage, err := NewStoragePool(&StoragePoolOptions{
+		TenantManager:      tenantMgr,
+		MetadataRepository: repo,
+		FileScheduler:      sched,
+		Volumes:            volumes,
+	})
+	if err != nil {
+		t.Fatalf("NewStoragePool() error = %v", err)
+	}
+	idempotent, ok := storage.(core.IdempotentStoragePool)
+	if !ok {
+		t.Fatalf("storage pool type %T does not implement core.IdempotentStoragePool", storage)
+	}
+
+	tenant := createTestTenant()
+	first, err := idempotent.WriteFileIdempotently(
+		ctx, tenant, bytes.NewReader([]byte("first payload")), nil, "watcher-operation-1")
+	if err != nil {
+		t.Fatalf("first WriteFileIdempotently() error = %v", err)
+	}
+	second, err := idempotent.WriteFileIdempotently(
+		ctx, tenant, bytes.NewReader([]byte("different payload")), nil, "watcher-operation-1")
+	if err != nil {
+		t.Fatalf("second WriteFileIdempotently() error = %v", err)
+	}
+	if second != first {
+		t.Fatalf("second file key = %q, want original %q", second, first)
+	}
+
+	reader, err := storage.ReadFile(ctx, tenant, first)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	payload, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadFile() read error = %v", err)
+	}
+	if string(payload) != "first payload" {
+		t.Fatalf("stored payload = %q, want first payload", payload)
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	keys := make(chan string, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			key, writeErr := idempotent.WriteFileIdempotently(
+				ctx, tenant, bytes.NewReader([]byte("concurrent payload")), nil, "watcher-operation-concurrent")
+			keys <- key
+			errs <- writeErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(keys)
+	close(errs)
+	for writeErr := range errs {
+		if writeErr != nil {
+			t.Fatalf("concurrent WriteFileIdempotently() error = %v", writeErr)
+		}
+	}
+	concurrentKey := ""
+	for key := range keys {
+		if concurrentKey == "" {
+			concurrentKey = key
+		}
+		if key != concurrentKey {
+			t.Fatalf("concurrent file key = %q, want %q", key, concurrentKey)
+		}
+	}
+	pending, err := repo.GetByStatus(ctx, tenant.ID, core.FileStatusPending, 0)
+	if err != nil {
+		t.Fatalf("GetByStatus() error = %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending records = %d, want 2 logical writes", len(pending))
+	}
 }
 
 // TestReadFile tests reading files from the pool.

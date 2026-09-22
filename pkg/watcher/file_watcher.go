@@ -2,8 +2,13 @@ package watcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
@@ -56,6 +62,12 @@ const (
 	// defaultImportedFilesHistoryFlushInterval is the runtime default of
 	// FileWatcherConfiguration.ImportedFilesHistoryFlushInterval.
 	defaultImportedFilesHistoryFlushInterval = 2 * time.Second
+	defaultMaxPostImportActionRetryCount     = 5
+	defaultPostImportActionRetryMaxDelay     = 5 * time.Minute
+
+	// fingerprintSampleSize matches the latest Locus watcher: the beginning,
+	// middle and end of a file are sampled without loading the whole payload.
+	fingerprintSampleSize = 4 * 1024
 )
 
 // FileWatcherOptions configures the file watcher.
@@ -86,6 +98,18 @@ type importedFileRecord struct {
 	// ImportedAtUnix is when the record was written; used to cap history size.
 	ImportedAtUnix int64 `json:"time"`
 
+	// PendingPostImportAction separates a durable storage success from the
+	// source delete or move that still has to finish.
+	PendingPostImportAction bool                  `json:"pendingPostImportAction,omitempty"`
+	FileKey                 string                `json:"fileKey,omitempty"`
+	WatcherID               string                `json:"watcherId,omitempty"`
+	TenantID                string                `json:"tenantId,omitempty"`
+	PostImportAction        core.PostImportAction `json:"postImportAction,omitempty"`
+	MoveTargetPath          string                `json:"moveTargetPath,omitempty"`
+	FailureCount            int                   `json:"failureCount,omitempty"`
+	NextAttemptUnixNano     int64                 `json:"nextAttemptUnixNano,omitempty"`
+	Quarantined             bool                  `json:"quarantined,omitempty"`
+
 	// InFlightToken is set only in memory while an import owns the path; it is
 	// never persisted.
 	InFlightToken string `json:"-"`
@@ -94,7 +118,7 @@ type importedFileRecord struct {
 // fileWatcher implements the core.FileWatcher interface.
 //
 // De-duplication invariant: a source path is imported once per fingerprint
-// (size + modification time) while it is already imported, or while an import
+// (size + modification time + sampled content hash) while it is already imported, or while an import
 // of the same revision is in flight. The record is removed once a Delete or
 // Move post-import action succeeds, so a refilled source path is imported
 // again; Keep retains it.
@@ -389,6 +413,15 @@ func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration
 	if config.MaxConcurrentImports < 0 {
 		return nil, fmt.Errorf("max concurrent imports cannot be negative: %w", core.ErrInvalidArgument)
 	}
+	if config.MaxPostImportActionRetryCount < 0 {
+		return nil, fmt.Errorf("max post-import action retry count cannot be negative: %w", core.ErrInvalidArgument)
+	}
+	if config.PostImportActionRetryInitialDelay < 0 {
+		return nil, fmt.Errorf("post-import action retry initial delay cannot be negative: %w", core.ErrInvalidArgument)
+	}
+	if config.PostImportActionRetryMaxDelay < 0 {
+		return nil, fmt.Errorf("post-import action retry max delay cannot be negative: %w", core.ErrInvalidArgument)
+	}
 
 	patterns, err := normalizeFilePatterns(config.FilePatterns)
 	if err != nil {
@@ -403,7 +436,7 @@ func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration
 	}
 
 	if stored.MinFileAge == 0 {
-		stored.MinFileAge = 3 * time.Second
+		stored.MinFileAge = 5 * time.Second
 	}
 
 	// A negative value would panic make(chan struct{}, n); clamp defensively.
@@ -412,6 +445,12 @@ func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration
 	}
 	if stored.MaxConcurrentImports < 1 {
 		stored.MaxConcurrentImports = 1
+	}
+	if stored.MaxPostImportActionRetryCount == 0 {
+		stored.MaxPostImportActionRetryCount = defaultMaxPostImportActionRetryCount
+	}
+	if stored.PostImportActionRetryMaxDelay == 0 {
+		stored.PostImportActionRetryMaxDelay = defaultPostImportActionRetryMaxDelay
 	}
 
 	// Locus creates the watch path during registration so a missing directory is
@@ -780,11 +819,19 @@ func (w *fileWatcher) importDiscoveredFiles(
 			defer wg.Done()
 			defer func() { <-semaphore }() // Release
 
-			imported, bytes, err := w.importFile(ctx, entry.tenant, entry.path, config)
+			outcome, err := w.importFile(ctx, entry.tenant, entry.path, config)
 
 			mu.Lock()
 			defer mu.Unlock()
 
+			result.PostImportActionsRetried += outcome.postImportActionsRetried
+			if outcome.quarantined {
+				result.FilesQuarantined++
+			}
+			if outcome.imported {
+				result.FilesImported++
+				result.BytesImported += outcome.bytesImported
+			}
 			if err != nil {
 				result.FilesFailed++
 				w.addResultError(result, fmt.Sprintf("watcher %s import failed: %v", config.WatcherID, err))
@@ -792,10 +839,7 @@ func (w *fileWatcher) importDiscoveredFiles(
 				return
 			}
 
-			if imported {
-				result.FilesImported++
-				result.BytesImported += bytes
-			} else {
+			if !outcome.imported {
 				result.FilesSkipped++
 			}
 		}(file)
@@ -900,9 +944,17 @@ func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config 
 // A candidate that fails the delayed stability probe is reported as skipped
 // rather than failed: it is still being written and is expected to be importable
 // on a later scan.
-func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext, filePath string, config *core.FileWatcherConfiguration) (bool, int64, error) {
+type fileImportOutcome struct {
+	imported                 bool
+	bytesImported            int64
+	postImportActionsRetried int
+	quarantined              bool
+}
+
+func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext, filePath string, config *core.FileWatcherConfiguration) (fileImportOutcome, error) {
+	var outcome fileImportOutcome
 	if err := ctx.Err(); err != nil {
-		return false, 0, err
+		return outcome, err
 	}
 
 	// Probe before the candidate is claimed or opened: a file that is still
@@ -910,38 +962,49 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	// that other imports need.
 	stable, err := w.confirmFileStable(ctx, filePath, config)
 	if err != nil {
-		return false, 0, err
+		return outcome, err
 	}
 
 	if !stable {
-		return false, 0, nil
+		return outcome, nil
 	}
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		return false, 0, fmt.Errorf("failed to open file: %w", err)
+		return outcome, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer func() { _ = file.Close() }()
 
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return false, 0, fmt.Errorf("failed to stat file: %w", err)
+		return outcome, fmt.Errorf("failed to stat file: %w", err)
 	}
 
 	if fileInfo.IsDir() {
-		return false, 0, nil
+		return outcome, nil
 	}
 
-	fingerprint := fileFingerprint(fileInfo)
+	fingerprint, err := fileFingerprint(file, fileInfo)
+	if err != nil {
+		return outcome, fmt.Errorf("failed to fingerprint file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return outcome, fmt.Errorf("failed to close fingerprint source: %w", err)
+	}
+
+	if handled, pendingOutcome, pendingErr := w.tryProcessPendingPostImportAction(
+		ctx, filePath, fingerprint, config); handled {
+		return pendingOutcome, pendingErr
+	}
 
 	alreadyImported, inFlight := w.isFileAlreadyImported(filePath, fingerprint)
 	if inFlight || alreadyImported {
-		return false, 0, nil
+		return outcome, nil
 	}
 
 	token := fmt.Sprintf("%d-%d", time.Now().UnixNano(), nextReservationSequence())
 	if !w.reserveImportSlot(filePath, token, fingerprint) {
-		return false, 0, nil
+		return outcome, nil
 	}
 
 	defer w.releaseImportSlot(filePath, token)
@@ -949,95 +1012,388 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	// Extract original filename for diagnostics only; physical paths are never
 	// derived from caller-supplied names.
 	originalFileName := filepath.Base(filePath)
-
-	fileKey, err := w.storagePool.WriteFile(ctx, tenant, file, &originalFileName)
+	file, err = os.Open(filePath)
 	if err != nil {
-		return false, 0, fmt.Errorf("failed to import file: %w", err)
+		return outcome, fmt.Errorf("failed to reopen file for import: %w", err)
 	}
+
+	var fileKey string
+	if idempotent, ok := w.storagePool.(core.IdempotentStoragePool); ok {
+		operationID, operationErr := createImportOperationID(tenant.ID, filePath, fingerprint)
+		if operationErr != nil {
+			return outcome, operationErr
+		}
+		fileKey, err = idempotent.WriteFileIdempotently(
+			ctx, tenant, file, &originalFileName, operationID)
+	} else {
+		fileKey, err = w.storagePool.WriteFile(ctx, tenant, file, &originalFileName)
+	}
+	if err != nil {
+		return outcome, fmt.Errorf("failed to import file: %w", err)
+	}
+	outcome.imported = true
+	outcome.bytesImported = fileInfo.Size()
 
 	// Close the source before the post-import Delete/Move action: on Windows an
 	// open handle blocks the rename or delete.
 	if err := file.Close(); err != nil {
-		return false, 0, fmt.Errorf("failed to close source file: %w", err)
+		return outcome, fmt.Errorf("failed to close source file: %w", err)
 	}
 
-	if err := w.performPostImportAction(ctx, filePath, config); err != nil {
+	if config.PostImportAction == core.PostImportActionKeep {
+		w.storeImportedRecord(filePath, fingerprint, time.Now(), config)
+		w.emit(ctx, slog.LevelInfo, "file_imported", "Imported watched file",
+			slog.String("watcher_id", config.WatcherID), slog.String("file_key", fileKey), slog.Int64("bytes", fileInfo.Size()))
+		return outcome, nil
+	}
+
+	pending := importedFileRecord{
+		Fingerprint:             fingerprint,
+		ImportedAtUnix:          w.now().Unix(),
+		PendingPostImportAction: true,
+		FileKey:                 fileKey,
+		WatcherID:               config.WatcherID,
+		TenantID:                tenant.ID,
+		PostImportAction:        config.PostImportAction,
+	}
+	if config.PostImportAction == core.PostImportActionMove {
+		pending.MoveTargetPath, _ = resolveMoveTargetPath(filePath, config.MoveToDirectory)
+		if pending.MoveTargetPath == "" {
+			// Preserve the durable pending-action record even when the move
+			// directory itself is invalid; the action retry path will report and
+			// quarantine the operational filesystem error.
+			pending.MoveTargetPath = filepath.Join(config.MoveToDirectory, filepath.Base(filePath))
+		}
+	}
+	if err := w.storeImportedStateSync(filePath, pending); err != nil {
+		return outcome, fmt.Errorf("failed to persist pending post-import action: %w", err)
+	}
+
+	if err := w.performPostImportAction(ctx, filePath, pending.PostImportAction, pending.MoveTargetPath); err != nil {
 		w.emit(ctx, slog.LevelWarn, "post_import_action_failed", "Failed to perform post-import action",
 			slog.String("watcher_id", config.WatcherID), slog.Any("action", config.PostImportAction), errorTypeAttr(err))
-
-		return false, 0, fmt.Errorf("post-import action failed: %w", err)
+		outcome.quarantined, _ = w.recordPostImportActionFailure(filePath, pending, config)
+		return outcome, fmt.Errorf("post-import action failed: %w", err)
 	}
 
-	switch config.PostImportAction {
-	case core.PostImportActionDelete, core.PostImportActionMove:
-		// Nothing remains at the source path; a later file with the same name is a
-		// new revision that must be imported.
-		w.removeImportedRecord(filePath, config)
-	default:
-		w.storeImportedRecord(filePath, fingerprint, time.Now(), config)
+	if err := w.removeImportedStateSync(filePath); err != nil {
+		w.emit(ctx, slog.LevelWarn, "history_save_failed", "Failed to remove completed post-import state", errorTypeAttr(err))
 	}
 
 	w.emit(ctx, slog.LevelInfo, "file_imported", "Imported watched file",
 		slog.String("watcher_id", config.WatcherID), slog.String("file_key", fileKey), slog.Int64("bytes", fileInfo.Size()))
 
-	return true, fileInfo.Size(), nil
+	return outcome, nil
 }
 
 // performPostImportAction performs the configured action after successful import.
-func (w *fileWatcher) performPostImportAction(ctx context.Context, filePath string, config *core.FileWatcherConfiguration) error {
+func (w *fileWatcher) performPostImportAction(ctx context.Context, filePath string, action core.PostImportAction, moveTargetPath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	switch config.PostImportAction {
+	switch action {
 	case core.PostImportActionDelete:
-		return os.Remove(filePath)
+		err := os.Remove(filePath)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 
 	case core.PostImportActionMove:
-		if config.MoveToDirectory == "" {
+		if moveTargetPath == "" {
 			return fmt.Errorf("move directory not configured")
 		}
-
-		if err := os.MkdirAll(config.MoveToDirectory, 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(moveTargetPath), 0755); err != nil {
 			return fmt.Errorf("failed to create move directory: %w", err)
 		}
-
-		return moveWithoutOverwrite(filePath, config.MoveToDirectory)
+		if _, err := os.Stat(moveTargetPath); err == nil {
+			equivalent, compareErr := filesHaveEquivalentContent(filePath, moveTargetPath)
+			if compareErr != nil {
+				return compareErr
+			}
+			if !equivalent {
+				return fmt.Errorf("move target already exists with different content")
+			}
+			return os.Remove(filePath)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		return moveFileWithFallback(ctx, filePath, moveTargetPath, os.Rename)
 
 	case core.PostImportActionKeep:
 		// Do nothing
 		return nil
 
 	default:
-		return fmt.Errorf("unknown post-import action: %d", config.PostImportAction)
+		return fmt.Errorf("unknown post-import action: %d", action)
 	}
 }
 
-// moveWithoutOverwrite moves filePath into targetDir, adding a _1/_2... suffix
-// when the destination name is already taken (Locus FileWatcher.cs:1775-1784).
-func moveWithoutOverwrite(filePath string, targetDir string) error {
+// moveFileWithFallback keeps the normal same-filesystem rename fast and atomic,
+// but handles a cross-filesystem move without relying on rename semantics that
+// fail with EXDEV on Unix (or ERROR_NOT_SAME_DEVICE on Windows).
+//
+// renameFile is injected for the focused regression test; production callers
+// pass os.Rename.
+func moveFileWithFallback(
+	ctx context.Context,
+	sourcePath string,
+	destinationPath string,
+	renameFile func(string, string) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if err := renameFile(sourcePath, destinationPath); err == nil {
+		return nil
+	} else if !isCrossDeviceRenameError(err) {
+		return err
+	}
+
+	return copyFileAndRemoveSource(ctx, sourcePath, destinationPath, renameFile)
+}
+
+// copyFileAndRemoveSource stages a cross-filesystem move beside its destination
+// so the final rename remains same-filesystem. The source is removed only after
+// the destination has been fully copied and committed.
+func copyFileAndRemoveSource(
+	ctx context.Context,
+	sourcePath string,
+	destinationPath string,
+	renameFile func(string, string) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	sourceInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return core.ErrFileNotFound
+		}
+		return fmt.Errorf("failed to inspect move source: %w", err)
+	}
+
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return core.ErrFileNotFound
+		}
+		return fmt.Errorf("failed to open move source: %w", err)
+	}
+
+	staged, err := os.CreateTemp(filepath.Dir(destinationPath), ".venue-move-*")
+	if err != nil {
+		_ = source.Close()
+		return fmt.Errorf("failed to stage move destination: %w", err)
+	}
+	stagedPath := staged.Name()
+	committed := false
+	defer func() {
+		_ = source.Close()
+		_ = staged.Close()
+		if !committed {
+			_ = os.Remove(stagedPath)
+		}
+	}()
+
+	written, err := io.Copy(staged, source)
+	if err != nil {
+		return fmt.Errorf("failed to copy move source: %w", err)
+	}
+	if written != sourceInfo.Size() {
+		return fmt.Errorf("move copy is incomplete, wrote %d of %d bytes: %w", written, sourceInfo.Size(), io.ErrUnexpectedEOF)
+	}
+
+	// Release the source before deletion; Windows rejects removing an open file.
+	if err := source.Close(); err != nil {
+		return fmt.Errorf("failed to close move source: %w", err)
+	}
+	if err := staged.Sync(); err != nil {
+		return fmt.Errorf("failed to sync staged move copy: %w", err)
+	}
+	if err := staged.Close(); err != nil {
+		return fmt.Errorf("failed to close staged move copy: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if err := renameFile(stagedPath, destinationPath); err != nil {
+		return fmt.Errorf("failed to commit move copy: %w", err)
+	}
+	committed = true
+
+	if err := os.Remove(sourcePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove move source: %w", err)
+	}
+	return nil
+}
+
+// isCrossDeviceRenameError classifies only rename failures that can be
+// satisfied by copying the bytes. Other errors must remain visible to the
+// caller and continue through the normal retry/quarantine path.
+func isCrossDeviceRenameError(err error) bool {
+	if isNotSameDeviceRenameError(err) || errors.Is(err, syscall.EXDEV) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "cross-device link") ||
+		strings.Contains(message, "not same device") ||
+		strings.Contains(message, "different disk drive")
+}
+
+func resolveMoveTargetPath(filePath string, targetDir string) (string, error) {
+	if targetInfo, err := os.Stat(targetDir); err == nil {
+		if !targetInfo.IsDir() {
+			return "", fmt.Errorf("move target %q is not a directory", targetDir)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("failed to inspect move directory %q: %w", targetDir, err)
+	}
+
 	fileName := filepath.Base(filePath)
 	extension := filepath.Ext(fileName)
 	nameWithoutExt := strings.TrimSuffix(fileName, extension)
-
-	targetPath := filepath.Join(targetDir, fileName)
-
-	// os.Rename replaces an existing destination on Windows, so collisions are
-	// detected before the move instead of relying on a rename error.
-	const maxCollisionAttempts = 10000
-	for attempt := 1; ; attempt++ {
-		if _, err := os.Lstat(targetPath); os.IsNotExist(err) {
-			return os.Rename(filePath, targetPath)
-		} else if err != nil {
-			return err
+	for counter := 0; ; counter++ {
+		candidateName := fileName
+		if counter > 0 {
+			candidateName = fmt.Sprintf("%s_%d%s", nameWithoutExt, counter, extension)
 		}
-
-		if attempt > maxCollisionAttempts {
-			return fmt.Errorf("unable to find a free destination name after %d attempts", maxCollisionAttempts)
+		candidate := filepath.Join(targetDir, candidateName)
+		if _, err := os.Stat(candidate); err != nil {
+			if os.IsNotExist(err) {
+				return candidate, nil
+			}
+			return "", fmt.Errorf("failed to inspect move target %q: %w", candidate, err)
 		}
-
-		targetPath = filepath.Join(targetDir, fmt.Sprintf("%s_%d%s", nameWithoutExt, attempt, extension))
 	}
+}
+
+func (w *fileWatcher) tryProcessPendingPostImportAction(
+	ctx context.Context,
+	filePath string,
+	fingerprint string,
+	config *core.FileWatcherConfiguration,
+) (bool, fileImportOutcome, error) {
+	var outcome fileImportOutcome
+	for {
+		value, exists := w.importedFiles.Load(filePath)
+		if !exists {
+			return false, outcome, nil
+		}
+		record, ok := value.(importedFileRecord)
+		if !ok || !record.PendingPostImportAction || record.Fingerprint != fingerprint {
+			return false, outcome, nil
+		}
+		if record.InFlightToken != "" {
+			return true, outcome, nil
+		}
+		if record.Quarantined {
+			outcome.quarantined = true
+			return true, outcome, nil
+		}
+		if record.NextAttemptUnixNano > w.now().UnixNano() {
+			return true, outcome, nil
+		}
+
+		claim := record
+		claim.InFlightToken = fmt.Sprintf("action-%d-%d", time.Now().UnixNano(), nextReservationSequence())
+		if !w.importedFiles.CompareAndSwap(filePath, value, claim) {
+			continue
+		}
+
+		outcome.postImportActionsRetried = 1
+		err := w.performPostImportAction(ctx, filePath, record.PostImportAction, record.MoveTargetPath)
+		if err == nil {
+			if persistErr := w.removeImportedStateSync(filePath); persistErr != nil {
+				return true, outcome, persistErr
+			}
+			return true, outcome, nil
+		}
+
+		record.InFlightToken = ""
+		quarantined, persistErr := w.recordPostImportActionFailure(filePath, record, config)
+		outcome.quarantined = quarantined
+		if persistErr != nil {
+			return true, outcome, errors.Join(err, persistErr)
+		}
+		return true, outcome, fmt.Errorf("post-import action retry failed: %w", err)
+	}
+}
+
+func (w *fileWatcher) recordPostImportActionFailure(
+	filePath string,
+	record importedFileRecord,
+	config *core.FileWatcherConfiguration,
+) (bool, error) {
+	record.FailureCount++
+	maxAttempts := config.MaxPostImportActionRetryCount
+	if maxAttempts < 1 {
+		maxAttempts = defaultMaxPostImportActionRetryCount
+	}
+	record.Quarantined = record.FailureCount >= maxAttempts
+	if record.Quarantined {
+		record.NextAttemptUnixNano = 0
+	} else {
+		record.NextAttemptUnixNano = w.now().Add(postImportActionRetryDelay(config, record.FailureCount)).UnixNano()
+	}
+	return record.Quarantined, w.storeImportedStateSync(filePath, record)
+}
+
+func postImportActionRetryDelay(config *core.FileWatcherConfiguration, failureCount int) time.Duration {
+	delay := config.PostImportActionRetryInitialDelay
+	if delay <= 0 {
+		return 0
+	}
+	maximum := config.PostImportActionRetryMaxDelay
+	if maximum <= 0 {
+		maximum = delay
+	}
+	for attempt := 1; attempt < failureCount; attempt++ {
+		if delay >= maximum || delay > maximum/2 {
+			return maximum
+		}
+		delay *= 2
+	}
+	return min(delay, maximum)
+}
+
+func filesHaveEquivalentContent(firstPath string, secondPath string) (bool, error) {
+	first, err := os.Open(firstPath)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = first.Close() }()
+	second, err := os.Open(secondPath)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = second.Close() }()
+
+	firstInfo, err := first.Stat()
+	if err != nil {
+		return false, err
+	}
+	secondInfo, err := second.Stat()
+	if err != nil {
+		return false, err
+	}
+	if firstInfo.Size() != secondInfo.Size() {
+		return false, nil
+	}
+	firstHash, err := contentSampleHash(first, firstInfo.Size())
+	if err != nil {
+		return false, err
+	}
+	secondHash, err := contentSampleHash(second, secondInfo.Size())
+	if err != nil {
+		return false, err
+	}
+	return firstHash == secondHash, nil
 }
 
 // createTenantDirectories creates subdirectories for all tenants.
@@ -1251,13 +1607,68 @@ func matchPattern(name, pattern string) bool {
 	return matched
 }
 
-// fileFingerprint identifies one content revision of a file.
-func fileFingerprint(info os.FileInfo) string {
+// fileFingerprint identifies one content revision of a file. ReadAt leaves the
+// stream position at zero for the subsequent storage write.
+func fileFingerprint(file *os.File, info os.FileInfo) (string, error) {
 	if info == nil {
-		return defaultImportFingerprint
+		return defaultImportFingerprint, nil
+	}
+	if file == nil {
+		return "", fmt.Errorf("file cannot be nil")
 	}
 
-	return fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
+	contentHash, err := contentSampleHash(file, info.Size())
+	if err != nil {
+		return "", err
+	}
+	modified := info.ModTime().UTC().UnixNano()
+	return fmt.Sprintf("fp:v3:%d:%d:%d:%s", info.Size(), modified, modified, contentHash), nil
+}
+
+func contentSampleHash(file *os.File, size int64) (string, error) {
+	positions := []int64{
+		0,
+		max(0, (size-fingerprintSampleSize)/2),
+		max(0, size-fingerprintSampleSize),
+	}
+	hasher := sha256.New()
+	visited := make(map[int64]struct{}, len(positions))
+	buffer := make([]byte, fingerprintSampleSize)
+	for _, position := range positions {
+		if _, ok := visited[position]; ok {
+			continue
+		}
+		visited[position] = struct{}{}
+
+		remaining := min(int64(fingerprintSampleSize), max(0, size-position))
+		for remaining > 0 {
+			readSize := min(int64(len(buffer)), remaining)
+			n, err := file.ReadAt(buffer[:readSize], position)
+			if n > 0 {
+				_, _ = hasher.Write(buffer[:n])
+				position += int64(n)
+				remaining -= int64(n)
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				return "", err
+			}
+			if n == 0 {
+				break
+			}
+		}
+	}
+
+	return base64.StdEncoding.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func createImportOperationID(tenantID string, filePath string, fingerprint string) (string, error) {
+	normalizedPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to normalize import path: %w", err)
+	}
+	payload := tenantID + "\n" + filepath.Clean(normalizedPath) + "\n" + fingerprint
+	digest := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // loadEntry returns the stored entry for a watcher ID.
@@ -1345,22 +1756,20 @@ func (w *fileWatcher) loadImportedFilesHistory() error {
 			continue
 		}
 
-		live = append(live, importedRecord{
-			path:        filePath,
-			fingerprint: record.Fingerprint,
-			importedAt:  time.Unix(record.ImportedAtUnix, 0),
-		})
+		live = append(live, importedRecord{path: filePath, record: record})
 	}
 
 	trimmed := 0
 	if len(live) > maxImportedFilesHistory {
-		sort.Slice(live, func(i, j int) bool { return live[i].importedAt.Before(live[j].importedAt) })
+		sort.Slice(live, func(i, j int) bool {
+			return live[i].record.ImportedAtUnix < live[j].record.ImportedAtUnix
+		})
 		trimmed = len(live) - maxImportedFilesHistory
 		live = live[len(live)-maxImportedFilesHistory:]
 	}
 
 	for _, record := range live {
-		w.storeImportedRecordSync(record.path, record.fingerprint, record.importedAt)
+		w.storeImportedStateLoaded(record.path, record.record)
 	}
 
 	w.emit(context.Background(), slog.LevelInfo, "history_loaded", "Loaded imported files history",
@@ -1369,16 +1778,24 @@ func (w *fileWatcher) loadImportedFilesHistory() error {
 	return nil
 }
 
-// storeImportedRecordSync records an entry without scheduling a history write.
-func (w *fileWatcher) storeImportedRecordSync(filePath, fingerprint string, importedAt time.Time) {
+// storeImportedStateLoaded records a persisted entry without scheduling a
+// history write while startup is rebuilding the in-memory view.
+func (w *fileWatcher) storeImportedStateLoaded(filePath string, record importedFileRecord) {
 	w.importedFilesMu.Lock()
 	defer w.importedFilesMu.Unlock()
 
-	w.importedFiles.Store(filePath, importedFileRecord{
+	record.InFlightToken = ""
+	w.importedFiles.Store(filePath, record)
+	w.importedCount++
+}
+
+// storeImportedRecordSync is retained for focused history tests and simple
+// non-pending entries.
+func (w *fileWatcher) storeImportedRecordSync(filePath, fingerprint string, importedAt time.Time) {
+	w.storeImportedStateLoaded(filePath, importedFileRecord{
 		Fingerprint:    fingerprint,
 		ImportedAtUnix: importedAt.Unix(),
 	})
-	w.importedCount++
 }
 
 // saveImportedFilesHistory persists the history atomically, dropping the oldest
@@ -1392,16 +1809,17 @@ func (w *fileWatcher) saveImportedFilesHistory() error {
 
 	records := w.snapshotImportedRecords()
 	if len(records) > maxImportedFilesHistory {
-		sort.Slice(records, func(i, j int) bool { return records[i].importedAt.Before(records[j].importedAt) })
+		sort.Slice(records, func(i, j int) bool {
+			return records[i].record.ImportedAtUnix < records[j].record.ImportedAtUnix
+		})
 		records = records[len(records)-maxImportedFilesHistory:]
 	}
 
 	history := make(map[string]importedFileRecord, len(records))
 	for _, record := range records {
-		history[record.path] = importedFileRecord{
-			Fingerprint:    record.fingerprint,
-			ImportedAtUnix: record.importedAt.Unix(),
-		}
+		persisted := record.record
+		persisted.InFlightToken = ""
+		history[record.path] = persisted
 	}
 
 	data, err := json.MarshalIndent(history, "", "  ")
@@ -1416,7 +1834,7 @@ func (w *fileWatcher) saveImportedFilesHistory() error {
 		return fmt.Errorf("failed to write imported files history: %w", err)
 	}
 
-	if err := os.Rename(tempPath, historyPath); err != nil {
+	if err := replaceFile(tempPath, historyPath); err != nil {
 		_ = os.Remove(tempPath)
 
 		return fmt.Errorf("failed to publish imported files history: %w", err)
@@ -1427,9 +1845,8 @@ func (w *fileWatcher) saveImportedFilesHistory() error {
 
 // importedRecord is one entry of an in-memory history snapshot.
 type importedRecord struct {
-	path        string
-	fingerprint string
-	importedAt  time.Time
+	path   string
+	record importedFileRecord
 }
 
 // snapshotImportedRecords copies the current history into a slice.
@@ -1442,11 +1859,7 @@ func (w *fileWatcher) snapshotImportedRecords() []importedRecord {
 			return true
 		}
 
-		records = append(records, importedRecord{
-			path:        key.(string),
-			fingerprint: record.Fingerprint,
-			importedAt:  time.Unix(record.ImportedAtUnix, 0),
-		})
+		records = append(records, importedRecord{path: key.(string), record: record})
 
 		return true
 	})
@@ -1576,16 +1989,29 @@ func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, imported
 	w.persistHistory(config)
 }
 
-// removeImportedRecord drops an entry and schedules the history persistence its
-// configuration asks for.
-func (w *fileWatcher) removeImportedRecord(filePath string, config *core.FileWatcherConfiguration) {
+// storeImportedStateSync persists pending post-import work before the action is
+// attempted, closing the crash window between storage and source cleanup.
+func (w *fileWatcher) storeImportedStateSync(filePath string, record importedFileRecord) error {
+	if record.ImportedAtUnix == 0 {
+		record.ImportedAtUnix = w.now().Unix()
+	}
+	record.InFlightToken = ""
+	w.importedFilesMu.Lock()
+	if _, loaded := w.importedFiles.LoadAndDelete(filePath); !loaded {
+		w.importedCount++
+	}
+	w.importedFiles.Store(filePath, record)
+	w.importedFilesMu.Unlock()
+	return w.saveImportedFilesHistory()
+}
+
+func (w *fileWatcher) removeImportedStateSync(filePath string) error {
 	w.importedFilesMu.Lock()
 	if _, loaded := w.importedFiles.LoadAndDelete(filePath); loaded {
 		w.importedCount--
 	}
 	w.importedFilesMu.Unlock()
-
-	w.persistHistory(config)
+	return w.saveImportedFilesHistory()
 }
 
 // incrementImportedCount tracks history size without scanning the sync.Map.

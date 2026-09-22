@@ -49,8 +49,11 @@ fileWatchers:
     postImportAction: Delete
     pollingInterval: 10s
     maxFileSizeBytes: 104857600  # 100MB
-    minFileAge: 3s
+    minFileAge: 5s
     maxConcurrentImports: 16
+    maxPostImportActionRetryCount: 5
+    postImportActionRetryInitialDelay: 5s
+    postImportActionRetryMaxDelay: 5m
 
   - watcherId: watcher-all-regular-tenants
     tenantId: ""
@@ -66,6 +69,9 @@ fileWatchers:
     maxFileSizeBytes: 0  # unlimited
     minFileAge: 5s
     maxConcurrentImports: 8
+    maxPostImportActionRetryCount: 5
+    postImportActionRetryInitialDelay: 5s
+    postImportActionRetryMaxDelay: 5m
 
 enableBackgroundCleanup: true
 

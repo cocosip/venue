@@ -59,8 +59,11 @@
       "postImportAction": "Delete",
       "pollingInterval": "10s",
       "maxFileSizeBytes": 104857600,
-      "minFileAge": "3s",
-      "maxConcurrentImports": 16
+      "minFileAge": "5s",
+      "maxConcurrentImports": 16,
+      "maxPostImportActionRetryCount": 5,
+      "postImportActionRetryInitialDelay": "5s",
+      "postImportActionRetryMaxDelay": "5m"
     },
     {
       "watcherId": "watcher-all-regular-tenants",
@@ -77,7 +80,10 @@
       "pollingInterval": "30s",
       "maxFileSizeBytes": 0,
       "minFileAge": "5s",
-      "maxConcurrentImports": 8
+      "maxConcurrentImports": 8,
+      "maxPostImportActionRetryCount": 5,
+      "postImportActionRetryInitialDelay": "5s",
+      "postImportActionRetryMaxDelay": "5m"
     }
   ],
   "enableBackgroundCleanup": true,

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -98,13 +99,15 @@ func (f *fakeTenantManager) addTenant(tenantID string) core.TenantContext {
 type writeCall struct {
 	tenantID         string
 	originalFileName string
+	operationID      string
 }
 
 type fakeStoragePool struct {
-	mu       sync.Mutex
-	writes   []writeCall
-	contents []string
-	onWrite  func(ctx context.Context, tenant core.TenantContext, name string) error
+	mu                sync.Mutex
+	writes            []writeCall
+	contents          []string
+	onWrite           func(ctx context.Context, tenant core.TenantContext, name string) error
+	operationFileKeys map[string]string
 }
 
 func (f *fakeStoragePool) WriteFile(ctx context.Context, tenant core.TenantContext, content io.Reader, originalFileName *string) (string, error) {
@@ -113,6 +116,34 @@ func (f *fakeStoragePool) WriteFile(ctx context.Context, tenant core.TenantConte
 
 func (f *fakeStoragePool) WriteFileToDirectory(ctx context.Context, tenant core.TenantContext, content io.Reader, originalFileName *string, _ string) (string, error) {
 	return f.writeFile(ctx, tenant, content, originalFileName)
+}
+
+func (f *fakeStoragePool) WriteFileIdempotently(
+	ctx context.Context,
+	tenant core.TenantContext,
+	content io.Reader,
+	originalFileName *string,
+	operationID string,
+) (string, error) {
+	f.mu.Lock()
+	if fileKey := f.operationFileKeys[tenant.ID+"\n"+operationID]; fileKey != "" {
+		f.mu.Unlock()
+		return fileKey, nil
+	}
+	f.mu.Unlock()
+
+	fileKey, err := f.writeFile(ctx, tenant, content, originalFileName)
+	if err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	if f.operationFileKeys == nil {
+		f.operationFileKeys = make(map[string]string)
+	}
+	f.operationFileKeys[tenant.ID+"\n"+operationID] = fileKey
+	f.writes[len(f.writes)-1].operationID = operationID
+	f.mu.Unlock()
+	return fileKey, nil
 }
 
 func (f *fakeStoragePool) writeFile(ctx context.Context, tenant core.TenantContext, content io.Reader, originalFileName *string) (string, error) {
@@ -205,7 +236,7 @@ func newTestWatcherWithOptions(t *testing.T, mutate func(*FileWatcherOptions)) (
 func newTestWatcherAt(t *testing.T, configRoot string, mutate ...func(*FileWatcherOptions)) (*fileWatcher, *fakeStoragePool) {
 	t.Helper()
 
-	pool := &fakeStoragePool{}
+	pool := &fakeStoragePool{operationFileKeys: make(map[string]string)}
 
 	opts := &FileWatcherOptions{
 		TenantManager:        newFakeTenantManager(),
@@ -338,6 +369,37 @@ func TestScanNow_ReimportsFileWhenFingerprintChanges(t *testing.T) {
 
 	if got := pool.writeCount(); got != 2 {
 		t.Fatalf("WriteFile calls = %d, want 2 (initial revision plus rewritten revision)", got)
+	}
+}
+
+func TestScanNow_ReimportsSameSizeSameTimestampContentChange(t *testing.T) {
+	w, pool := newTestWatcher(t)
+	watchPath := t.TempDir()
+	target := filepath.Join(watchPath, "report.csv")
+	writeAgedFile(t, target, "first")
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	registerWatcher(t, w, newConfig("w1", watchPath, nil))
+
+	if _, err := w.ScanNow(context.Background(), "w1"); err != nil {
+		t.Fatalf("first ScanNow() error = %v", err)
+	}
+	if err := os.WriteFile(target, []byte("other"), 0o644); err != nil {
+		t.Fatalf("rewrite file: %v", err)
+	}
+	if err := os.Chtimes(target, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("restore timestamp: %v", err)
+	}
+
+	result, err := w.ScanNow(context.Background(), "w1")
+	if err != nil {
+		t.Fatalf("second ScanNow() error = %v", err)
+	}
+	if result.FilesImported != 1 || pool.writeCount() != 2 {
+		t.Fatalf("same-size rewrite result = {imported:%d writes:%d}, want 1 imported / 2 writes",
+			result.FilesImported, pool.writeCount())
 	}
 }
 
@@ -504,6 +566,8 @@ func TestScanNow_FailedPostImportActionCountsAsFailure(t *testing.T) {
 	registerWatcher(t, w, newConfig("w1", watchPath, func(config *core.FileWatcherConfiguration) {
 		config.PostImportAction = core.PostImportActionMove
 		config.MoveToDirectory = moveBlocker
+		config.MaxPostImportActionRetryCount = 2
+		config.PostImportActionRetryInitialDelay = 0
 	}))
 
 	target := filepath.Join(watchPath, "report.csv")
@@ -517,21 +581,85 @@ func TestScanNow_FailedPostImportActionCountsAsFailure(t *testing.T) {
 	if result.FilesFailed != 1 {
 		t.Fatalf("FilesFailed = %d, want 1 when the post-import action fails", result.FilesFailed)
 	}
-	if result.FilesImported != 0 {
-		t.Fatalf("FilesImported = %d, want 0 when the post-import action fails", result.FilesImported)
+	if result.FilesImported != 1 {
+		t.Fatalf("FilesImported = %d, want 1 because storage succeeded before the post-import action", result.FilesImported)
 	}
 
-	// The stuck source file must be retried on the next cycle.
+	// The stuck source action must be retried on the next cycle without writing
+	// a duplicate storage record.
 	before := pool.writeCount()
 	result, err = w.ScanNow(context.Background(), "w1")
 	if err != nil {
 		t.Fatalf("ScanNow() error = %v", err)
 	}
-	if pool.writeCount() <= before {
-		t.Fatalf("source file was not retried after the post-import action failed")
+	if pool.writeCount() != before {
+		t.Fatalf("WriteFile calls after retry = %d, want %d (operation ID must deduplicate storage)",
+			pool.writeCount(), before)
 	}
 	if result.FilesFailed != 1 {
 		t.Fatalf("FilesFailed on retry = %d, want 1", result.FilesFailed)
+	}
+	if result.PostImportActionsRetried != 1 || result.FilesQuarantined != 1 {
+		t.Fatalf("retry result = {retried:%d quarantined:%d}, want 1 / 1",
+			result.PostImportActionsRetried, result.FilesQuarantined)
+	}
+
+	result, err = w.ScanNow(context.Background(), "w1")
+	if err != nil {
+		t.Fatalf("third ScanNow() error = %v", err)
+	}
+	if result.FilesSkipped != 1 || result.FilesQuarantined != 1 || result.FilesFailed != 0 {
+		t.Fatalf("quarantined scan = {skipped:%d quarantined:%d failed:%d}, want 1 / 1 / 0",
+			result.FilesSkipped, result.FilesQuarantined, result.FilesFailed)
+	}
+}
+
+func TestScanNow_RestartResumesPendingPostImportActionWithoutStorageWrite(t *testing.T) {
+	configRoot := filepath.Join(t.TempDir(), "watchers")
+	watchPath := t.TempDir()
+	moveBlocker := filepath.Join(t.TempDir(), "processed")
+	if err := os.WriteFile(moveBlocker, []byte("block directory creation"), 0o644); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	config := newConfig("w1", watchPath, func(config *core.FileWatcherConfiguration) {
+		config.PostImportAction = core.PostImportActionMove
+		config.MoveToDirectory = moveBlocker
+		config.MaxPostImportActionRetryCount = 3
+		config.PostImportActionRetryInitialDelay = 0
+	})
+	target := filepath.Join(watchPath, "report.csv")
+	writeAgedFile(t, target, "payload")
+
+	first, firstPool := newTestWatcherAt(t, configRoot)
+	registerWatcher(t, first, config)
+	if _, err := first.ScanNow(context.Background(), "w1"); err != nil {
+		t.Fatalf("first ScanNow() error = %v", err)
+	}
+	if firstPool.writeCount() != 1 {
+		t.Fatalf("first storage writes = %d, want 1", firstPool.writeCount())
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+
+	if err := os.Remove(moveBlocker); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+	second, secondPool := newTestWatcherAt(t, configRoot)
+	registerWatcher(t, second, config)
+	result, err := second.ScanNow(context.Background(), "w1")
+	if err != nil {
+		t.Fatalf("second ScanNow() error = %v", err)
+	}
+	if secondPool.writeCount() != 0 {
+		t.Fatalf("storage writes after restart = %d, want 0", secondPool.writeCount())
+	}
+	if result.PostImportActionsRetried != 1 || result.FilesFailed != 0 {
+		t.Fatalf("restart result = {retried:%d failed:%d errors:%v}, want 1 / 0",
+			result.PostImportActionsRetried, result.FilesFailed, result.Errors)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("source still exists after resumed move: %v", err)
 	}
 }
 
@@ -610,6 +738,61 @@ func TestMoveAction_UsesIncrementingCollisionSuffix(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(moveTo, "report_3.csv")); err != nil {
 		t.Fatalf("expected report_3.csv: %v", err)
+	}
+}
+
+func TestMoveFileWithCrossDeviceFallbackCopiesAndRemovesSource(t *testing.T) {
+	sourceDir := t.TempDir()
+	destinationDir := t.TempDir()
+	sourcePath := filepath.Join(sourceDir, "payload.bin")
+	destinationPath := filepath.Join(destinationDir, "payload.bin")
+	payload := strings.Repeat("payload-", 1024)
+	if err := os.WriteFile(sourcePath, []byte(payload), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	renameCalls := 0
+	rename := func(oldPath string, newPath string) error {
+		renameCalls++
+		if renameCalls == 1 {
+			return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: syscall.EXDEV}
+		}
+		return os.Rename(oldPath, newPath)
+	}
+
+	if err := moveFileWithFallback(context.Background(), sourcePath, destinationPath, rename); err != nil {
+		t.Fatalf("moveFileWithFallback() error = %v", err)
+	}
+	if renameCalls != 2 {
+		t.Fatalf("rename calls = %d, want initial EXDEV plus staged commit", renameCalls)
+	}
+	content, err := os.ReadFile(destinationPath)
+	if err != nil {
+		t.Fatalf("read destination: %v", err)
+	}
+	if string(content) != payload {
+		t.Fatalf("destination content length = %d, want %d", len(content), len(payload))
+	}
+	if _, err := os.Stat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("source still exists after fallback move: %v", err)
+	}
+	entries, err := os.ReadDir(destinationDir)
+	if err != nil {
+		t.Fatalf("read destination directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "payload.bin" {
+		t.Fatalf("destination directory entries = %v, want only payload.bin", entries)
+	}
+}
+
+func TestResolveMoveTargetPath_ReturnsFilesystemErrors(t *testing.T) {
+	targetDir := filepath.Join(t.TempDir(), "target-file")
+	if err := os.WriteFile(targetDir, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write target blocker: %v", err)
+	}
+
+	if _, err := resolveMoveTargetPath(filepath.Join(t.TempDir(), "source.csv"), targetDir); err == nil {
+		t.Fatal("resolveMoveTargetPath() error = nil, want an error for a non-directory target")
 	}
 }
 

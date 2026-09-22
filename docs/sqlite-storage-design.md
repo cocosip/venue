@@ -557,6 +557,7 @@ The Locus DDL is at `MetadataRepository.cs:559-588`. The Venue mapping source is
 | `available_for_processing_at TEXT` | `available_for_processing_at` | `INTEGER NOT NULL DEFAULT 0` | `AvailableForProcessingAt *time.Time` (:226) | **`0` is the sentinel = `nil` = immediately available** (§8.3) |
 | `original_file_name TEXT` | `original_file_name` | `TEXT NOT NULL DEFAULT ''` | `OriginalFileName string` (:223) | Go uses `string` |
 | `file_extension TEXT` | `file_extension` | `TEXT NOT NULL DEFAULT ''` | `FileExtension string` (:222) | Includes the dot, e.g. `.pdf` (`models.go:154`) |
+| (not in Locus) | `import_operation_id` | `TEXT` (nullable) | `ImportOperationID string` (:219) | Tenant-scoped durable idempotency key; partial unique index below |
 | `metadata_json TEXT` | — **omitted** | — | none | §6.4 |
 | (not in Locus) | `updated_at` | `INTEGER NOT NULL` | `UpdatedAt time.Time` (:239) | Venue-specific; the cache's monotonic protection depends on it (`cache.go:75-101`) |
 | (not in Locus) | `released_processing_start_time` | `INTEGER` (nullable) | `ReleasedProcessingStartTimeUTC *time.Time` (:234) | Venue-specific; makes repeated release idempotent (§9.3) |
@@ -583,7 +584,8 @@ CREATE TABLE IF NOT EXISTS files (
     dead_lettered_at                INTEGER,
     available_for_processing_at     INTEGER NOT NULL DEFAULT 0,
     original_file_name              TEXT    NOT NULL DEFAULT '',
-    file_extension                  TEXT    NOT NULL DEFAULT ''
+    file_extension                  TEXT    NOT NULL DEFAULT '',
+    import_operation_id             TEXT
 );
 
 -- The only index serving both claim scans and keyset pagination: covers the full
@@ -606,6 +608,10 @@ CREATE INDEX IF NOT EXISTS idx_files_status_last_failed_at
 -- Timeout reclaim: covers only status = Processing(1) rows (partial index).
 CREATE INDEX IF NOT EXISTS idx_files_processing_start
     ON files(processing_start_time, file_key) WHERE status = 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_import_operation
+    ON files(tenant_id, import_operation_id)
+    WHERE import_operation_id IS NOT NULL AND import_operation_id <> '';
 ```
 
 ### 6.3 Schema version
@@ -617,12 +623,12 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
-INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1')
-    ON CONFLICT(key) DO NOTHING;
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 ```
 
 - Read: `SELECT value FROM schema_meta WHERE key='schema_version';`
-- Future upgrade: `ALTER TABLE ... ADD COLUMN` (SQLite makes "a nullable column with no default" a schema-only O(1) operation), followed by `UPDATE schema_meta SET value='2' WHERE key='schema_version';`
+- Version 2 adds the nullable `import_operation_id` column and its partial unique index. Existing version-1 databases are upgraded additively at open.
 - This mechanism replaces Badger's `metadataSchemaVersion = "3"` (`pkg/metadata/migration.go:13-18`). **Note**: Badger's schema-version semantics (rebuilding secondary indexes) do not exist under the new engine, so `pkg/metadata/migration.go` retires entirely (§14 phase 5).
 
 ### 6.4 Why `metadata_json` and `delete_succeeded_at` are omitted
@@ -663,12 +669,12 @@ INSERT INTO files (
     file_key, tenant_id, volume_id, physical_path, directory_path, file_size,
     created_at, updated_at, status, retry_count, last_failed_at, last_error,
     processing_start_time, released_processing_start_time, completed_at, dead_lettered_at,
-    available_for_processing_at, original_file_name, file_extension)
+    available_for_processing_at, original_file_name, file_extension, import_operation_id)
 VALUES (
     @file_key, @tenant_id, @volume_id, @physical_path, @directory_path, @file_size,
     @created_at, @updated_at, @status, @retry_count, @last_failed_at, @last_error,
     @processing_start_time, @released_processing_start_time, @completed_at, @dead_lettered_at,
-    @available_for_processing_at, @original_file_name, @file_extension)
+    @available_for_processing_at, @original_file_name, @file_extension, @import_operation_id)
 ON CONFLICT(file_key) DO UPDATE SET
     tenant_id                       = excluded.tenant_id,
     volume_id                       = excluded.volume_id,
@@ -687,7 +693,8 @@ ON CONFLICT(file_key) DO UPDATE SET
     dead_lettered_at                = excluded.dead_lettered_at,
     available_for_processing_at     = excluded.available_for_processing_at,
     original_file_name              = excluded.original_file_name,
-    file_extension                  = excluded.file_extension;
+    file_extension                  = excluded.file_extension,
+    import_operation_id             = excluded.import_operation_id;
 ```
 
 > This upsert is an **unconditional** last-write-wins, matching the Badger implementation (the Badger DB write does not compare `UpdatedAt` either). The cache still keeps its `UpdatedAt` monotonic protection (`pkg/metadata/cache.go:88-94`) — that is existing semantics and is not changed by this migration.
@@ -2121,7 +2128,8 @@ CREATE TABLE IF NOT EXISTS files (
     dead_lettered_at                INTEGER,
     available_for_processing_at     INTEGER NOT NULL DEFAULT 0,
     original_file_name              TEXT    NOT NULL DEFAULT '',
-    file_extension                  TEXT    NOT NULL DEFAULT ''
+    file_extension                  TEXT    NOT NULL DEFAULT '',
+    import_operation_id             TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_status_available
@@ -2134,13 +2142,16 @@ CREATE INDEX IF NOT EXISTS idx_files_status_last_failed_at
     ON files(status, last_failed_at, file_key);
 CREATE INDEX IF NOT EXISTS idx_files_processing_start
     ON files(processing_start_time, file_key) WHERE status = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_import_operation
+    ON files(tenant_id, import_operation_id)
+    WHERE import_operation_id IS NOT NULL AND import_operation_id <> '';
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
-INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1')
-    ON CONFLICT(key) DO NOTHING;
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 ```
 
 ### 19.2 Quota database (per-tenant `quotas.db`) initialization script
@@ -2202,7 +2213,7 @@ const (
     walSuffix                      = "-wal"
     shmSuffix                      = "-shm"
     sqliteSchemaVersionKey         = "schema_version"
-    sqliteSchemaVersion            = "1"
+    sqliteSchemaVersion            = "2"
     corruptedDatabaseSuffix        = ".corrupted."                 // retained from corrupted_database.go:21
     corruptedDatabaseTimestampLayout = "20060102T150405Z"          // retained from corrupted_database.go:25
     corruptedDatabasePathCollisionLimit = 100                      // retained from corrupted_database.go:29

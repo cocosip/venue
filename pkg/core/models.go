@@ -213,8 +213,11 @@ type FileInfo struct {
 // FileMetadata is the internal representation of file metadata stored in the database.
 // This extends FileLocation with additional tracking fields.
 type FileMetadata struct {
-	FileKey                  string
-	TenantID                 string
+	FileKey  string
+	TenantID string
+	// ImportOperationID identifies a caller's logical write for durable,
+	// tenant-scoped idempotency. Empty means the write was not idempotent.
+	ImportOperationID        string
 	VolumeID                 string
 	PhysicalPath             string
 	DirectoryPath            string
@@ -566,6 +569,15 @@ type FileWatcherRootConfiguration struct {
 
 	// MaxConcurrentImports limits concurrent imports per generated watcher.
 	MaxConcurrentImports int
+
+	// MaxPostImportActionRetryCount limits delete or move attempts after import.
+	MaxPostImportActionRetryCount int
+
+	// PostImportActionRetryInitialDelay is the first action retry delay.
+	PostImportActionRetryInitialDelay time.Duration
+
+	// PostImportActionRetryMaxDelay caps exponential action retry backoff.
+	PostImportActionRetryMaxDelay time.Duration
 
 	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
 	// automatic tenant-directory creation. Zero selects the runtime default.

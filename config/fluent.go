@@ -184,15 +184,18 @@ func (c *FileWatcherServiceConfig) WithMaxParallelScans(value int) *FileWatcherS
 // NewFileWatcherRootConfig returns a multi-tenant root watcher template.
 func NewFileWatcherRootConfig(rootPath string) *FileWatcherRootConfig {
 	return &FileWatcherRootConfig{
-		RootPath:              rootPath,
-		MultiTenantMode:       true,
-		Enabled:               true,
-		IncludeSubdirectories: true,
-		FilePatterns:          []string{"*.*"},
-		PostImportAction:      "Delete",
-		PollingInterval:       30 * time.Second,
-		MinFileAge:            5 * time.Second,
-		MaxConcurrentImports:  4,
+		RootPath:                          rootPath,
+		MultiTenantMode:                   true,
+		Enabled:                           true,
+		IncludeSubdirectories:             true,
+		FilePatterns:                      []string{"*.*"},
+		PostImportAction:                  "Delete",
+		PollingInterval:                   30 * time.Second,
+		MinFileAge:                        5 * time.Second,
+		MaxConcurrentImports:              4,
+		MaxPostImportActionRetryCount:     defaultMaxPostImportActionRetryCount,
+		PostImportActionRetryInitialDelay: defaultPostImportActionRetryInitialDelay,
+		PostImportActionRetryMaxDelay:     defaultPostImportActionRetryMaxDelay,
 
 		AutoCreateTenantDirectoriesCacheTTL: defaultAutoCreateTenantDirectoriesCacheTTL,
 		FileStabilityCheckDelay:             defaultFileStabilityCheckDelay,
@@ -265,6 +268,14 @@ func (c *FileWatcherRootConfig) WithMinFileAge(value time.Duration) *FileWatcher
 // WithMaxConcurrentImports sets the derived watcher concurrency limit.
 func (c *FileWatcherRootConfig) WithMaxConcurrentImports(value int) *FileWatcherRootConfig {
 	c.MaxConcurrentImports = value
+	return c
+}
+
+// WithPostImportActionRetry configures delete or move retry attempts and backoff.
+func (c *FileWatcherRootConfig) WithPostImportActionRetry(maxAttempts int, initialDelay, maxDelay time.Duration) *FileWatcherRootConfig {
+	c.MaxPostImportActionRetryCount = maxAttempts
+	c.PostImportActionRetryInitialDelay = initialDelay
+	c.PostImportActionRetryMaxDelay = maxDelay
 	return c
 }
 
@@ -718,13 +729,16 @@ func (c *TenantConfig) WithoutQuota() *TenantConfig { c.Quota = nil; return c }
 // false value.
 func NewFileWatcherConfig() *FileWatcherConfig {
 	return &FileWatcherConfig{
-		Enabled:               true,
-		IncludeSubdirectories: true,
-		FilePatterns:          []string{"*.*"},
-		PostImportAction:      "Delete",
-		PollingInterval:       30 * time.Second,
-		MinFileAge:            5 * time.Second,
-		MaxConcurrentImports:  4,
+		Enabled:                           true,
+		IncludeSubdirectories:             true,
+		FilePatterns:                      []string{"*.*"},
+		PostImportAction:                  "Delete",
+		PollingInterval:                   30 * time.Second,
+		MinFileAge:                        5 * time.Second,
+		MaxConcurrentImports:              4,
+		MaxPostImportActionRetryCount:     defaultMaxPostImportActionRetryCount,
+		PostImportActionRetryInitialDelay: defaultPostImportActionRetryInitialDelay,
+		PostImportActionRetryMaxDelay:     defaultPostImportActionRetryMaxDelay,
 
 		AutoCreateTenantDirectoriesCacheTTL: defaultAutoCreateTenantDirectoriesCacheTTL,
 		FileStabilityCheckDelay:             defaultFileStabilityCheckDelay,
@@ -846,6 +860,14 @@ func (c *FileWatcherConfig) WithMinFileAge(value time.Duration) *FileWatcherConf
 // WithMaxConcurrentImports sets the watcher concurrency limit.
 func (c *FileWatcherConfig) WithMaxConcurrentImports(value int) *FileWatcherConfig {
 	c.MaxConcurrentImports = value
+	return c
+}
+
+// WithPostImportActionRetry configures delete or move retry attempts and backoff.
+func (c *FileWatcherConfig) WithPostImportActionRetry(maxAttempts int, initialDelay, maxDelay time.Duration) *FileWatcherConfig {
+	c.MaxPostImportActionRetryCount = maxAttempts
+	c.PostImportActionRetryInitialDelay = initialDelay
+	c.PostImportActionRetryMaxDelay = maxDelay
 	return c
 }
 
