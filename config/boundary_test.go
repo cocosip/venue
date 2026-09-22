@@ -85,6 +85,12 @@ func TestRuntimePackagesDoNotImportViper(t *testing.T) {
 			return walkErr
 		}
 		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".cache", ".kilo", "tmp":
+				// Build output and scratch state are not runtime source; the Go
+				// toolchain writes generated files there while this test walks.
+				return filepath.SkipDir
+			}
 			relative, err := filepath.Rel(repositoryRoot, path)
 			if err != nil {
 				return err

@@ -29,7 +29,7 @@ func TestRepositoryDoesNotEmitThroughSlogDirectly(t *testing.T) {
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
-			case ".git", ".cache", ".kilo":
+			case ".git", ".cache", ".kilo", "tmp":
 				return filepath.SkipDir
 			}
 			if filepath.Clean(path) == loggingDir {
