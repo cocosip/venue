@@ -357,9 +357,9 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 	opts := &FileSchedulerOptions{
 		RetryPolicy: &core.FileRetryPolicy{
 			MaxRetryCount:         5,
-			InitialRetryDelay:     1 * time.Second,
+			InitialRetryDelay:     10 * time.Millisecond,
 			UseExponentialBackoff: true,
-			MaxRetryDelay:         10 * time.Second,
+			MaxRetryDelay:         100 * time.Millisecond,
 		},
 		ProcessingTimeout: 30 * time.Minute,
 	}
@@ -375,39 +375,48 @@ func TestIntegration_ExponentialBackoff(t *testing.T) {
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
 	_ = scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Test error")
 
-	// Check retry delay after first failure (should be 1 second)
+	// Check retry delay after first failure.
 	metadata, _ := repo.Get(ctx, tenant.ID, location.FileKey)
-	if metadata.AvailableForProcessingAt == nil {
-		t.Fatal("Expected AvailableForProcessingAt to be set")
-	}
-
-	delay1 := time.Until(*metadata.AvailableForProcessingAt)
-	if delay1 < 900*time.Millisecond || delay1 > 1100*time.Millisecond {
-		t.Errorf("Expected delay ~1s, got %v", delay1)
-	}
+	assertPersistedRetryDelay(t, metadata, 10*time.Millisecond)
 
 	// Fail again
-	time.Sleep(1100 * time.Millisecond)
+	waitUntilRetryAvailable(metadata)
 	location, _ = scheduler.GetNextFileForProcessing(ctx, tenant)
 	_ = scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Test error 2")
 
-	// Check retry delay after second failure (should be 2 seconds)
+	// Check retry delay after second failure.
 	metadata, _ = repo.Get(ctx, tenant.ID, location.FileKey)
-	delay2 := time.Until(*metadata.AvailableForProcessingAt)
-	if delay2 < 1900*time.Millisecond || delay2 > 2100*time.Millisecond {
-		t.Errorf("Expected delay ~2s, got %v", delay2)
-	}
+	assertPersistedRetryDelay(t, metadata, 20*time.Millisecond)
 
 	// Fail again
-	time.Sleep(2100 * time.Millisecond)
+	waitUntilRetryAvailable(metadata)
 	location, _ = scheduler.GetNextFileForProcessing(ctx, tenant)
 	_ = scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Test error 3")
 
-	// Check retry delay after third failure (should be 4 seconds)
+	// Check retry delay after third failure.
 	metadata, _ = repo.Get(ctx, tenant.ID, location.FileKey)
-	delay3 := time.Until(*metadata.AvailableForProcessingAt)
-	if delay3 < 3900*time.Millisecond || delay3 > 4100*time.Millisecond {
-		t.Errorf("Expected delay ~4s, got %v", delay3)
+	assertPersistedRetryDelay(t, metadata, 40*time.Millisecond)
+}
+
+func assertPersistedRetryDelay(t *testing.T, metadata *core.FileMetadata, want time.Duration) {
+	t.Helper()
+	if metadata.LastFailedAt == nil {
+		t.Fatal("LastFailedAt = nil")
+	}
+	if metadata.AvailableForProcessingAt == nil {
+		t.Fatal("AvailableForProcessingAt = nil")
+	}
+	if got := metadata.AvailableForProcessingAt.Sub(*metadata.LastFailedAt); got != want {
+		t.Errorf("persisted retry delay = %v, want %v", got, want)
+	}
+}
+
+func waitUntilRetryAvailable(metadata *core.FileMetadata) {
+	if metadata.AvailableForProcessingAt == nil {
+		return
+	}
+	if wait := time.Until(*metadata.AvailableForProcessingAt); wait > 0 {
+		time.Sleep(wait)
 	}
 }
 
