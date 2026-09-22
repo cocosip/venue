@@ -39,6 +39,23 @@ const (
 
 	// wildcardPattern matches every file name.
 	wildcardPattern = "*"
+
+	// defaultAutoCreateTenantDirectoriesCacheTTL is the runtime default of
+	// FileWatcherConfiguration.AutoCreateTenantDirectoriesCacheTTL.
+	defaultAutoCreateTenantDirectoriesCacheTTL = 60 * time.Second
+
+	// defaultSkipStabilityCheckAfterAge is the runtime default of
+	// FileWatcherConfiguration.SkipStabilityCheckAfterAge: a candidate at least
+	// this old skips the delayed stability probe.
+	defaultSkipStabilityCheckAfterAge = time.Minute
+
+	// defaultImportedFilesPruneInterval is the runtime default of
+	// FileWatcherConfiguration.ImportedFilesPruneInterval.
+	defaultImportedFilesPruneInterval = 5 * time.Minute
+
+	// defaultImportedFilesHistoryFlushInterval is the runtime default of
+	// FileWatcherConfiguration.ImportedFilesHistoryFlushInterval.
+	defaultImportedFilesHistoryFlushInterval = 2 * time.Second
 )
 
 // FileWatcherOptions configures the file watcher.
@@ -91,10 +108,51 @@ type fileWatcher struct {
 	// statistics optionally receives scan statistics. Nil disables recording.
 	statistics core.StatisticsRecorder
 
-	// importedFilesMu guards importedFilesCount and serializes history writes.
+	// now reads the current time. It is injectable so the tenant-directory cache
+	// TTL, the prune throttle and the flush debounce window can be exercised
+	// deterministically in tests. It must not be replaced once a scan is running.
+	now func() time.Time
+
+	// stabilityWait waits out one delayed stability probe. It is injectable for
+	// the same reason as now; the default observes the scan context.
+	stabilityWait func(ctx context.Context, delay time.Duration) error
+
+	// scheduleHistoryFlush schedules a debounced history write and returns its
+	// cancelable handle. It is injectable for the same reason as now; the
+	// default is time.AfterFunc, which never invokes fn inline.
+	scheduleHistoryFlush func(delay time.Duration, fn func()) *time.Timer
+
+	// tenantCacheMu guards tenantCache.
+	tenantCacheMu sync.Mutex
+	// tenantCache holds the cached tenant enumeration per watcher ID.
+	tenantCache map[string]cachedTenantList
+
+	// pruneMu guards prunedOnce and lastPrunedAt.
+	pruneMu sync.Mutex
+	// prunedOnce reports whether the throttled history prune ran at least once.
+	prunedOnce bool
+	// lastPrunedAt is when the throttled history prune last ran.
+	lastPrunedAt time.Time
+
+	// importedFilesMu guards importedCount and the flush bookkeeping, and
+	// serializes history writes.
 	importedFilesMu sync.Mutex
 	importedFiles   sync.Map // map[string]importedFileRecord
 	importedCount   int
+
+	// historyFlushDirty marks history changes that are not persisted yet.
+	historyFlushDirty bool
+	// historyFlushTimer is non-nil while one debounced write is scheduled. At
+	// most one timer exists, which is what bounds writes to one per interval.
+	historyFlushTimer *time.Timer
+	// lastHistoryFlushAt is when the last debounced write was started.
+	lastHistoryFlushAt time.Time
+
+	// flushDone is non-nil while a history write is in flight.
+	flushDone chan struct{}
+	// flushAgain requests one more write pass after the in-flight one, because a
+	// change arrived after that pass snapshotted the history.
+	flushAgain bool
 
 	// watcherStateMu guards watcherState and serializes state file writes.
 	// watcherState holds the operator's runtime enable/disable decisions, which
@@ -102,10 +160,17 @@ type fileWatcher struct {
 	watcherStateMu sync.Mutex
 	watcherState   map[string]bool // map[string]bool: watcher ID -> enabled
 
-	// flushDone is non-nil while a history write is in flight.
-	flushDone chan struct{}
-
 	closed bool
+}
+
+// cachedTenantList is one watcher's cached tenant enumeration and its expiry.
+type cachedTenantList struct {
+	// tenants is the cached enumeration. It is owned by the cache and never
+	// mutated after publication.
+	tenants []core.TenantContext
+
+	// expiresAt is the instant the entry stops being reusable.
+	expiresAt time.Time
 }
 
 // watcherEntry stores one registered watcher. config is an immutable snapshot;
@@ -146,11 +211,15 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 	}
 
 	fw := &fileWatcher{
-		tenantMgr:   opts.TenantManager,
-		storagePool: opts.StoragePool,
-		configRoot:  configRoot,
-		logger:      logger,
-		statistics:  opts.StatisticsRecorder,
+		tenantMgr:            opts.TenantManager,
+		storagePool:          opts.StoragePool,
+		configRoot:           configRoot,
+		logger:               logger,
+		statistics:           opts.StatisticsRecorder,
+		now:                  time.Now,
+		stabilityWait:        waitForStabilityDelay,
+		scheduleHistoryFlush: time.AfterFunc,
+		tenantCache:          make(map[string]cachedTenantList),
 	}
 
 	// Load imported files history
@@ -173,7 +242,8 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 //
 // Close is safe to call multiple times and is intended to be deferred next to
 // the watcher's lifetime; it does not stop the background service that drives
-// scans.
+// scans. Every history change that is still pending is written before Close
+// returns, including changes a debounced history write had not persisted yet.
 func (w *fileWatcher) Close() error {
 	w.importedFilesMu.Lock()
 	if w.closed {
@@ -182,7 +252,16 @@ func (w *fileWatcher) Close() error {
 		return nil
 	}
 	w.closed = true
+
+	// The synchronous flush below supersedes any scheduled debounced write.
+	timer := w.historyFlushTimer
+	w.historyFlushTimer = nil
+	w.historyFlushDirty = false
 	w.importedFilesMu.Unlock()
+
+	if timer != nil {
+		timer.Stop()
+	}
 
 	w.awaitPendingHistoryFlush()
 
@@ -519,6 +598,10 @@ func (w *fileWatcher) scanWatcher(ctx context.Context, config *core.FileWatcherC
 		return result, err
 	}
 
+	// Stale history entries are pruned once per scan, bounded by the watcher's
+	// throttle when it enables one.
+	w.pruneStaleImportedRecords(ctx, config)
+
 	info, err := os.Stat(config.WatchPath)
 	if err != nil {
 		return result, fmt.Errorf("watch path is not accessible: %w", err)
@@ -813,9 +896,25 @@ func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config 
 // Ordering invariant: the post-import Delete/Move action runs before the file is
 // recorded as imported, so a failed action leaves the source file eligible for
 // the next cycle instead of silently marking it done.
+//
+// A candidate that fails the delayed stability probe is reported as skipped
+// rather than failed: it is still being written and is expected to be importable
+// on a later scan.
 func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext, filePath string, config *core.FileWatcherConfiguration) (bool, int64, error) {
 	if err := ctx.Err(); err != nil {
 		return false, 0, err
+	}
+
+	// Probe before the candidate is claimed or opened: a file that is still
+	// growing must not be imported half-way, and the wait must not hold a lock
+	// that other imports need.
+	stable, err := w.confirmFileStable(ctx, filePath, config)
+	if err != nil {
+		return false, 0, err
+	}
+
+	if !stable {
+		return false, 0, nil
 	}
 
 	file, err := os.Open(filePath)
@@ -873,9 +972,9 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	case core.PostImportActionDelete, core.PostImportActionMove:
 		// Nothing remains at the source path; a later file with the same name is a
 		// new revision that must be imported.
-		w.removeImportedRecord(filePath)
+		w.removeImportedRecord(filePath, config)
 	default:
-		w.storeImportedRecord(filePath, fingerprint, time.Now())
+		w.storeImportedRecord(filePath, fingerprint, time.Now(), config)
 	}
 
 	w.emit(ctx, slog.LevelInfo, "file_imported", "Imported watched file",
@@ -942,15 +1041,19 @@ func moveWithoutOverwrite(filePath string, targetDir string) error {
 }
 
 // createTenantDirectories creates subdirectories for all tenants.
+//
+// The tenant enumeration comes from tenantList, so it is reused for the
+// watcher's AutoCreateTenantDirectoriesCacheTTL instead of being repeated on
+// every scan.
 func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.FileWatcherConfiguration) error {
 	if !config.MultiTenantMode {
 		return nil
 	}
 
 	// Get all tenants
-	tenants, err := w.tenantMgr.GetAllTenants(ctx)
+	tenants, err := w.tenantList(ctx, config)
 	if err != nil {
-		return fmt.Errorf("failed to get tenants: %w", err)
+		return err
 	}
 
 	// Create directory for each tenant
@@ -968,6 +1071,113 @@ func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.
 	}
 
 	return nil
+}
+
+// tenantList returns the tenant enumeration used by AutoCreateTenantDirectories,
+// reusing a per-watcher cache for AutoCreateTenantDirectoriesCacheTTL so
+// repeated scans do not re-enumerate the tenant store.
+//
+// A zero TTL selects defaultAutoCreateTenantDirectoriesCacheTTL (60s); a
+// negative TTL disables caching. The entry expires on read, so a tenant created
+// after a scan becomes visible within at most one TTL. Concurrent readers are
+// serialized by tenantCacheMu, and the returned slice is read-only cache state.
+//
+// Errors:
+//   - the tenant-store error, wrapped, when enumeration fails
+func (w *fileWatcher) tenantList(ctx context.Context, config *core.FileWatcherConfiguration) ([]core.TenantContext, error) {
+	ttl := config.AutoCreateTenantDirectoriesCacheTTL
+	if ttl == 0 {
+		ttl = defaultAutoCreateTenantDirectoriesCacheTTL
+	}
+
+	if ttl > 0 {
+		w.tenantCacheMu.Lock()
+
+		cached, ok := w.tenantCache[config.WatcherID]
+		if ok && w.now().Before(cached.expiresAt) {
+			w.tenantCacheMu.Unlock()
+
+			return cached.tenants, nil
+		}
+
+		w.tenantCacheMu.Unlock()
+	}
+
+	tenants, err := w.tenantMgr.GetAllTenants(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tenants: %w", err)
+	}
+
+	if ttl > 0 {
+		w.tenantCacheMu.Lock()
+		w.tenantCache[config.WatcherID] = cachedTenantList{
+			tenants:   append([]core.TenantContext(nil), tenants...),
+			expiresAt: w.now().Add(ttl),
+		}
+		w.tenantCacheMu.Unlock()
+	}
+
+	return tenants, nil
+}
+
+// confirmFileStable runs the delayed second stability probe for one candidate.
+//
+// A non-positive FileStabilityCheckDelay disables the probe. A candidate at
+// least SkipStabilityCheckAfterAge old (one minute when that field is zero) is
+// not re-probed: it can only be complete, so it relies on the existing
+// accessibility check. A negative SkipStabilityCheckAfterAge always probes.
+//
+// The wait holds no lock, so concurrent imports are never blocked, and it
+// observes the scan context: a cancelled scan reports the cancellation instead
+// of importing. A candidate whose size or modification time changed during the
+// wait is reported as unstable; a candidate that disappeared is unstable as
+// well, because no stable file can be read from that path.
+func (w *fileWatcher) confirmFileStable(ctx context.Context, filePath string, config *core.FileWatcherConfiguration) (bool, error) {
+	delay := config.FileStabilityCheckDelay
+	if delay <= 0 {
+		return true, nil
+	}
+
+	before, err := os.Stat(filePath)
+	if err != nil {
+		// Leave the failure to the import path, which reports it with its own
+		// accessibility error instead of silently skipping an unreadable file.
+		return true, nil
+	}
+
+	skipAge := config.SkipStabilityCheckAfterAge
+	if skipAge == 0 {
+		skipAge = defaultSkipStabilityCheckAfterAge
+	}
+
+	if skipAge > 0 && w.now().Sub(before.ModTime()) >= skipAge {
+		return true, nil
+	}
+
+	if err := w.stabilityWait(ctx, delay); err != nil {
+		return false, err
+	}
+
+	after, err := os.Stat(filePath)
+	if err != nil {
+		return false, nil
+	}
+
+	return before.Size() == after.Size() && before.ModTime().Equal(after.ModTime()), nil
+}
+
+// waitForStabilityDelay waits for the stability delay and returns ctx.Err() when
+// the scan is cancelled first. It holds no lock while waiting.
+func waitForStabilityDelay(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // normalizeFilePatterns trims patterns, drops blanks and duplicates, validates
@@ -1343,8 +1553,12 @@ func nextReservationSequence() uint64 {
 }
 
 // storeImportedRecord writes an entry, replacing any previous revision, and
-// persists the history.
-func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, importedAt time.Time) {
+// schedules the history persistence its configuration asks for.
+//
+// The in-memory entry is published before persistence is scheduled, so a
+// deferred (debounced) write never widens the de-duplication window: a second
+// scan already sees the record.
+func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, importedAt time.Time, config *core.FileWatcherConfiguration) {
 	if importedAt.IsZero() {
 		importedAt = time.Now()
 	}
@@ -1359,18 +1573,19 @@ func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, imported
 	})
 	w.importedFilesMu.Unlock()
 
-	w.persistHistoryAsync()
+	w.persistHistory(config)
 }
 
-// removeImportedRecord drops an entry and persists the history.
-func (w *fileWatcher) removeImportedRecord(filePath string) {
+// removeImportedRecord drops an entry and schedules the history persistence its
+// configuration asks for.
+func (w *fileWatcher) removeImportedRecord(filePath string, config *core.FileWatcherConfiguration) {
 	w.importedFilesMu.Lock()
 	if _, loaded := w.importedFiles.LoadAndDelete(filePath); loaded {
 		w.importedCount--
 	}
 	w.importedFilesMu.Unlock()
 
-	w.persistHistoryAsync()
+	w.persistHistory(config)
 }
 
 // incrementImportedCount tracks history size without scanning the sync.Map.
@@ -1388,14 +1603,193 @@ func (w *fileWatcher) importedEntryCount() int {
 	return w.importedCount
 }
 
+// pruneStaleImportedRecords drops history entries whose source path no longer
+// exists and persists the history when something was dropped.
+//
+// A watcher that enables EnableImportedFilesPruneThrottle prunes at most once
+// per ImportedFilesPruneInterval (default five minutes); the throttled prune
+// always runs on the first opportunity after the interval elapsed, so it is
+// never skipped forever. A watcher without the throttle keeps the un-throttled
+// baseline the switch exists to bound: it prunes on every scan.
+//
+// In-flight claims are never evicted: reserveImportSlot publishes a claim before
+// its source file is imported, so dropping one would let a concurrent scan
+// import the same revision twice.
+func (w *fileWatcher) pruneStaleImportedRecords(ctx context.Context, config *core.FileWatcherConfiguration) int {
+	if !w.pruneDue(config) {
+		return 0
+	}
+
+	pruned := 0
+
+	w.importedFiles.Range(func(key, value interface{}) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+
+		filePath, ok := key.(string)
+		if !ok {
+			return true
+		}
+
+		record, ok := value.(importedFileRecord)
+		if !ok || record.InFlightToken != "" {
+			return true
+		}
+
+		if _, err := os.Stat(filePath); err == nil {
+			return true
+		}
+
+		if w.importedFiles.CompareAndDelete(key, value) {
+			pruned++
+		}
+
+		return true
+	})
+
+	if pruned == 0 {
+		return 0
+	}
+
+	w.importedFilesMu.Lock()
+	w.importedCount -= pruned
+	w.importedFilesMu.Unlock()
+
+	w.persistHistory(config)
+
+	return pruned
+}
+
+// pruneDue reports whether the history prune may run now, recording the run so
+// the next throttled prune waits for the full interval.
+func (w *fileWatcher) pruneDue(config *core.FileWatcherConfiguration) bool {
+	if config == nil || !config.EnableImportedFilesPruneThrottle {
+		return true
+	}
+
+	interval := config.ImportedFilesPruneInterval
+	if interval <= 0 {
+		interval = defaultImportedFilesPruneInterval
+	}
+
+	now := w.now()
+
+	w.pruneMu.Lock()
+	defer w.pruneMu.Unlock()
+
+	if w.prunedOnce && now.Sub(w.lastPrunedAt) < interval {
+		return false
+	}
+
+	w.prunedOnce = true
+	w.lastPrunedAt = now
+
+	return true
+}
+
+// persistHistory schedules the history persistence a configuration asks for: a
+// debounced write when the watcher enables the debounce, an immediate one
+// otherwise.
+func (w *fileWatcher) persistHistory(config *core.FileWatcherConfiguration) {
+	if config != nil && config.EnableImportedFilesHistoryFlushDebounce {
+		w.scheduleDebouncedHistoryFlush(config)
+
+		return
+	}
+
+	w.persistHistoryAsync()
+}
+
+// historyFlushInterval returns the effective debounce window. A non-positive
+// value means "unset" and selects defaultImportedFilesHistoryFlushInterval.
+func historyFlushInterval(config *core.FileWatcherConfiguration) time.Duration {
+	if config.ImportedFilesHistoryFlushInterval <= 0 {
+		return defaultImportedFilesHistoryFlushInterval
+	}
+
+	return config.ImportedFilesHistoryFlushInterval
+}
+
+// scheduleDebouncedHistoryFlush marks the history dirty and guarantees that
+// exactly one debounced write is scheduled.
+//
+// Writes are spaced by at least ImportedFilesHistoryFlushInterval: the first
+// pending change is written as soon as possible, and a change recorded while a
+// write is in flight schedules the next one one full interval after that write
+// started. A change is therefore always persisted within one interval of being
+// recorded, and Close forces a final synchronous write.
+//
+// The scheduled function must not run inline; time.AfterFunc does not, and the
+// injectable test scheduler is expected to record the callback instead.
+func (w *fileWatcher) scheduleDebouncedHistoryFlush(config *core.FileWatcherConfiguration) {
+	interval := historyFlushInterval(config)
+
+	w.importedFilesMu.Lock()
+	if w.closed {
+		w.importedFilesMu.Unlock()
+
+		return
+	}
+
+	w.historyFlushDirty = true
+	if w.historyFlushTimer != nil {
+		// A write is already scheduled and will pick up this change.
+		w.importedFilesMu.Unlock()
+
+		return
+	}
+
+	var delay time.Duration
+
+	if !w.lastHistoryFlushAt.IsZero() {
+		if remaining := interval - w.now().Sub(w.lastHistoryFlushAt); remaining > 0 {
+			delay = remaining
+		}
+	}
+
+	w.historyFlushTimer = w.scheduleHistoryFlush(delay, w.flushDebouncedHistory)
+	w.importedFilesMu.Unlock()
+}
+
+// flushDebouncedHistory runs one scheduled debounced history write.
+func (w *fileWatcher) flushDebouncedHistory() {
+	w.importedFilesMu.Lock()
+
+	// Close already flushed everything in memory, so a callback that fires while
+	// Close is in progress must not write a second, redundant document.
+	if w.closed {
+		w.historyFlushTimer = nil
+		w.historyFlushDirty = false
+		w.importedFilesMu.Unlock()
+
+		return
+	}
+
+	w.historyFlushTimer = nil
+	dirty := w.historyFlushDirty
+	w.historyFlushDirty = false
+	w.lastHistoryFlushAt = w.now()
+	w.importedFilesMu.Unlock()
+
+	if !dirty {
+		return
+	}
+
+	w.persistHistoryAsync()
+}
+
 // persistHistoryAsync writes the history off the import hot path.
 //
 // Exactly one flusher goroutine is active at a time; callers that arrive during
-// a flush are coalesced instead of racing on the temp file. The caller can
+// a flush are coalesced instead of racing on the temp file. A caller whose
+// change arrived after the running flusher snapshotted the history requests one
+// more pass, so a change is never dropped by the coalescing. The caller can
 // observe completion through flushDone.
 func (w *fileWatcher) persistHistoryAsync() {
 	w.importedFilesMu.Lock()
 	if w.flushDone != nil {
+		w.flushAgain = true
 		w.importedFilesMu.Unlock()
 
 		return
@@ -1403,18 +1797,32 @@ func (w *fileWatcher) persistHistoryAsync() {
 
 	done := make(chan struct{})
 	w.flushDone = done
+	w.flushAgain = false
 	w.importedFilesMu.Unlock()
 
 	go func() {
 		defer close(done)
 
-		if err := w.saveImportedFilesHistory(); err != nil {
-			w.emit(context.Background(), slog.LevelError, "history_save_failed", "Failed to save imported files history", errorTypeAttr(err))
-		}
+		for {
+			if err := w.saveImportedFilesHistory(); err != nil {
+				w.emit(context.Background(), slog.LevelError, "history_save_failed", "Failed to save imported files history", errorTypeAttr(err))
+			}
 
-		w.importedFilesMu.Lock()
-		w.flushDone = nil
-		w.importedFilesMu.Unlock()
+			w.importedFilesMu.Lock()
+			again := w.flushAgain
+			w.flushAgain = false
+
+			if again {
+				w.importedFilesMu.Unlock()
+
+				continue
+			}
+
+			w.flushDone = nil
+			w.importedFilesMu.Unlock()
+
+			return
+		}
 	}()
 }
 

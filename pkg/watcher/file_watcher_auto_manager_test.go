@@ -62,6 +62,24 @@ func tenantDirPath(rootPath string, name string) string {
 	return filepath.Join(rootPath, name)
 }
 
+// advancedKnobsRootTemplate returns a root template whose advanced watcher knobs
+// all differ from the runtime defaults, so a generated watcher proves each one
+// was propagated instead of silently falling back.
+func advancedKnobsRootTemplate(rootPath string) core.FileWatcherRootConfiguration {
+	return core.FileWatcherRootConfiguration{
+		RootPath:                                rootPath,
+		MultiTenantMode:                         true,
+		Enabled:                                 true,
+		AutoCreateTenantDirectoriesCacheTTL:     17 * time.Second,
+		FileStabilityCheckDelay:                 23 * time.Millisecond,
+		SkipStabilityCheckAfterAge:              42 * time.Second,
+		EnableImportedFilesPruneThrottle:        true,
+		ImportedFilesPruneInterval:              3 * time.Minute,
+		EnableImportedFilesHistoryFlushDebounce: true,
+		ImportedFilesHistoryFlushInterval:       7 * time.Second,
+	}
+}
+
 // --- ApplyRootConfiguration -------------------------------------------------
 
 func TestFileWatcherAutoManager_ApplyMultiTenantRootCreatesOneWatcherPerDirectory(t *testing.T) {
@@ -161,6 +179,58 @@ func TestFileWatcherAutoManager_ApplyMultiTenantRootCreatesOneWatcherPerDirector
 		if len(config.FilePatterns) != 1 || config.FilePatterns[0] != "*.csv" {
 			t.Fatalf("FilePatterns = %v, want [*.csv]", config.FilePatterns)
 		}
+	}
+}
+
+// TestFileWatcherAutoManager_PropagatesAdvancedKnobs proves a root template's
+// stability, cache, prune and debounce settings reach every generated watcher,
+// which is the only place a multi-tenant deployment configures them.
+func TestFileWatcherAutoManager_PropagatesAdvancedKnobs(t *testing.T) {
+	rootPath := t.TempDir()
+	if err := os.Mkdir(tenantDirPath(rootPath, "tenant-a"), 0o755); err != nil {
+		t.Fatalf("mkdir tenant-a: %v", err)
+	}
+
+	manager, watcher := newTestAutoManager(t, filepath.Join(t.TempDir(), "state"), nil)
+
+	root := advancedKnobsRootTemplate(rootPath)
+
+	if _, err := manager.ApplyRootConfiguration(context.Background(), &root); err != nil {
+		t.Fatalf("ApplyRootConfiguration() error = %v", err)
+	}
+
+	config, err := watcher.GetWatcher(context.Background(), "auto-"+filepath.Base(rootPath)+"-tenant-a")
+	if err != nil {
+		t.Fatalf("GetWatcher() error = %v", err)
+	}
+
+	if config.AutoCreateTenantDirectoriesCacheTTL != root.AutoCreateTenantDirectoriesCacheTTL {
+		t.Fatalf("AutoCreateTenantDirectoriesCacheTTL = %v, want the template %v",
+			config.AutoCreateTenantDirectoriesCacheTTL, root.AutoCreateTenantDirectoriesCacheTTL)
+	}
+	if config.FileStabilityCheckDelay != root.FileStabilityCheckDelay {
+		t.Fatalf("FileStabilityCheckDelay = %v, want the template %v",
+			config.FileStabilityCheckDelay, root.FileStabilityCheckDelay)
+	}
+	if config.SkipStabilityCheckAfterAge != root.SkipStabilityCheckAfterAge {
+		t.Fatalf("SkipStabilityCheckAfterAge = %v, want the template %v",
+			config.SkipStabilityCheckAfterAge, root.SkipStabilityCheckAfterAge)
+	}
+	if config.EnableImportedFilesPruneThrottle != root.EnableImportedFilesPruneThrottle {
+		t.Fatalf("EnableImportedFilesPruneThrottle = %v, want the template %v",
+			config.EnableImportedFilesPruneThrottle, root.EnableImportedFilesPruneThrottle)
+	}
+	if config.ImportedFilesPruneInterval != root.ImportedFilesPruneInterval {
+		t.Fatalf("ImportedFilesPruneInterval = %v, want the template %v",
+			config.ImportedFilesPruneInterval, root.ImportedFilesPruneInterval)
+	}
+	if config.EnableImportedFilesHistoryFlushDebounce != root.EnableImportedFilesHistoryFlushDebounce {
+		t.Fatalf("EnableImportedFilesHistoryFlushDebounce = %v, want the template %v",
+			config.EnableImportedFilesHistoryFlushDebounce, root.EnableImportedFilesHistoryFlushDebounce)
+	}
+	if config.ImportedFilesHistoryFlushInterval != root.ImportedFilesHistoryFlushInterval {
+		t.Fatalf("ImportedFilesHistoryFlushInterval = %v, want the template %v",
+			config.ImportedFilesHistoryFlushInterval, root.ImportedFilesHistoryFlushInterval)
 	}
 }
 

@@ -257,21 +257,33 @@ func (m *fileWatcherAutoManager) applyTenantDirectory(ctx context.Context, root 
 
 // generatedWatcherConfiguration builds the watcher configuration for one tenant
 // directory of a multi-tenant root.
+//
+// Every import setting of the root template is carried over, including the
+// advanced stability, cache, prune and debounce knobs: a root is the only place
+// a multi-tenant deployment configures them, so dropping one here would leave it
+// with no runtime consumer for generated watchers.
 func (m *fileWatcherAutoManager) generatedWatcherConfiguration(root *core.FileWatcherRootConfiguration, tenantID string) *core.FileWatcherConfiguration {
 	return &core.FileWatcherConfiguration{
-		WatcherID:             generatedWatcherID(root.RootPath, tenantID),
-		TenantID:              tenantID,
-		WatchPath:             filepath.Join(root.RootPath, tenantID),
-		MultiTenantMode:       false,
-		IncludeSubdirectories: root.IncludeSubdirectories,
-		PollingInterval:       root.PollingInterval,
-		MinFileAge:            root.MinFileAge,
-		FilePatterns:          append([]string(nil), root.FilePatterns...),
-		MaxFileSizeBytes:      root.MaxFileSizeBytes,
-		MaxConcurrentImports:  root.MaxConcurrentImports,
-		PostImportAction:      root.PostImportAction,
-		MoveToDirectory:       root.MoveToDirectory,
-		Enabled:               root.Enabled,
+		WatcherID:                               generatedWatcherID(root.RootPath, tenantID),
+		TenantID:                                tenantID,
+		WatchPath:                               filepath.Join(root.RootPath, tenantID),
+		MultiTenantMode:                         false,
+		IncludeSubdirectories:                   root.IncludeSubdirectories,
+		PollingInterval:                         root.PollingInterval,
+		MinFileAge:                              root.MinFileAge,
+		FilePatterns:                            append([]string(nil), root.FilePatterns...),
+		MaxFileSizeBytes:                        root.MaxFileSizeBytes,
+		MaxConcurrentImports:                    root.MaxConcurrentImports,
+		PostImportAction:                        root.PostImportAction,
+		MoveToDirectory:                         root.MoveToDirectory,
+		Enabled:                                 root.Enabled,
+		AutoCreateTenantDirectoriesCacheTTL:     root.AutoCreateTenantDirectoriesCacheTTL,
+		FileStabilityCheckDelay:                 root.FileStabilityCheckDelay,
+		SkipStabilityCheckAfterAge:              root.SkipStabilityCheckAfterAge,
+		EnableImportedFilesPruneThrottle:        root.EnableImportedFilesPruneThrottle,
+		ImportedFilesPruneInterval:              root.ImportedFilesPruneInterval,
+		EnableImportedFilesHistoryFlushDebounce: root.EnableImportedFilesHistoryFlushDebounce,
+		ImportedFilesHistoryFlushInterval:       root.ImportedFilesHistoryFlushInterval,
 	}
 }
 

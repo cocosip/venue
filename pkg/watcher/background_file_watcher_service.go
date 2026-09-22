@@ -107,8 +107,23 @@ type BackgroundFileWatcherServiceOptions struct {
 	// Like ServiceEnabled, a zero value is default-safe: it never disables the
 	// service on its own. An explicitly persisted disabled state (written by
 	// SetEnabled(false) or UpdateOptions) always wins, so a restart keeps an
-	// operator's decision.
+	// operator's decision. A construction-time disable must go through
+	// InitialEnabled, because a bool cannot distinguish "unset" from an explicit
+	// false.
 	Enabled bool
+
+	// InitialEnabled overrides the construction-time enabled state when non-nil:
+	// the service starts disabled when it points at false and enabled when it
+	// points at true. nil keeps the default-safe behaviour (a caller that never
+	// mentions the flag still gets scanning). A pointer is used because a bool
+	// cannot distinguish "unset" from an explicit false.
+	//
+	// The override is a construction-time default, not a decision of record: it
+	// is never persisted, and a persisted options document written by
+	// SetEnabled or UpdateOptions outranks it. An InitialEnabled=false start
+	// therefore lasts only until an operator decision exists; SetEnabled and
+	// UpdateOptions keep their existing semantics.
+	InitialEnabled *bool
 
 	// ConfigurationRootDir is where the options state file lives.
 	//
@@ -198,11 +213,17 @@ type BackgroundFileWatcherService struct {
 //  3. otherwise the deprecated direct interval fields,
 //  4. otherwise the documented defaults.
 //
-// Construction is default-safe: Enabled=false and a zero or negative
-// MaxParallelWatcherScans are "unset" markers here, so the service starts enabled
-// with the documented parallel bound. Use SetEnabled(false) or UpdateOptions to
-// turn scanning off. A persisted document is validated; one that cannot describe
-// a runnable schedule is ignored with a safe warning and the defaults apply.
+// Construction is default-safe: a zero or negative MaxParallelWatcherScans is an
+// "unset" marker here, so the documented parallel bound applies. The enabled
+// state is resolved separately: it starts enabled and only InitialEnabled can
+// override that at construction — ServiceEnabled, Enabled, and
+// ServiceOptions.Enabled can confirm but never disable it — and a persisted
+// document still outranks both. Construction-time input is never persisted: only
+// SetEnabled and UpdateOptions write the document, so an InitialEnabled=false
+// start keeps the service disabled for this process lifetime without becoming an
+// operator decision of record. A persisted document is validated; one that cannot
+// describe a runnable schedule is ignored with a safe warning and the defaults
+// apply.
 func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) (*BackgroundFileWatcherService, error) {
 	if opts == nil {
 		return nil, fmt.Errorf("options cannot be nil: %w", core.ErrInvalidArgument)
@@ -245,12 +266,17 @@ func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) 
 		options.DisabledCheckInterval = opts.DisabledCheckInterval
 	}
 
-	// Default-safe: only an explicitly persisted disable turns the service off,
-	// so a caller that leaves every enabled flag at its zero value still gets
-	// scanning. The legacy ServiceEnabled and Enabled flags can only confirm the
-	// enabled state, never disable it silently; use SetEnabled(false) or
-	// UpdateOptions to disable.
+	// Default-safe: a caller that leaves every enabled flag at its zero value
+	// still gets scanning, and only an explicitly persisted disable turns the
+	// service off. The legacy ServiceEnabled and Enabled flags can only confirm
+	// the enabled state, never disable it silently. InitialEnabled is the
+	// explicit construction-time override; SetEnabled(false) and UpdateOptions
+	// remain the way to disable the service at runtime, and their persisted
+	// document still outranks this input.
 	options.Enabled = true
+	if opts.InitialEnabled != nil {
+		options.Enabled = *opts.InitialEnabled
+	}
 
 	// A non-positive parallel-scan bound is not usable as a concurrency limit, so
 	// a construction-time value that is zero or negative (Go's "unset" marker)

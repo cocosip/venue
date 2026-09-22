@@ -21,6 +21,10 @@ import (
 type fakeTenantManager struct {
 	mu      sync.Mutex
 	tenants map[string]core.TenantContext
+
+	// enumerateCalls counts GetAllTenants calls so the tenant-directory cache is
+	// observable without touching production state.
+	enumerateCalls int
 }
 
 func newFakeTenantManager() *fakeTenantManager {
@@ -61,12 +65,34 @@ func (f *fakeTenantManager) GetAllTenants(context.Context) ([]core.TenantContext
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.enumerateCalls++
+
 	out := make([]core.TenantContext, 0, len(f.tenants))
 	for _, tenant := range f.tenants {
 		out = append(out, tenant)
 	}
 
 	return out, nil
+}
+
+// enumerationCount returns how many times the tenant store was enumerated.
+func (f *fakeTenantManager) enumerationCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.enumerateCalls
+}
+
+// addTenant materializes a tenant without going through GetTenant, so a test can
+// simulate a tenant created in the store after a scan.
+func (f *fakeTenantManager) addTenant(tenantID string) core.TenantContext {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	tenant := core.TenantContext{ID: tenantID, Status: core.TenantStatusEnabled, CreatedAt: time.Now()}
+	f.tenants[tenantID] = tenant
+
+	return tenant
 }
 
 type writeCall struct {
