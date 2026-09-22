@@ -23,6 +23,9 @@ vendor/
 logs/
 *.log
 
+# Repository-local Go caches and work directories
+.gotmp/
+
 Locus-Code/
 .claude/
 
@@ -43,6 +46,11 @@ Thumbs.db
 tmp/
 temp/
 .cache/
+
+# Example runtime output (never commit generated databases or config dumps)
+examples/*/venue-data/
+examples/*/data/
+examples/*/venue-saved.*
 
 # CI/CD artifacts
 coverage.txt
