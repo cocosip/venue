@@ -347,9 +347,9 @@ func TestBackupAndRestoreMetadataThroughVenue(t *testing.T) {
 	root := t.TempDir()
 
 	cfg := newLifecycleConfig(t)
-	cfg.BadgerDB.BackupDirectory = filepath.Join(root, "backups")
-	cfg.BadgerDB.BackupInterval = time.Hour
-	cfg.BadgerDB.BackupRetention = 7 * 24 * time.Hour
+	cfg.Sqlite.BackupDirectory = filepath.Join(root, "backups")
+	cfg.Sqlite.BackupInterval = time.Hour
+	cfg.Sqlite.BackupRetention = 7 * 24 * time.Hour
 
 	runtime, err := venue.NewVenue(cfg)
 	if err != nil {
@@ -367,20 +367,23 @@ func TestBackupAndRestoreMetadataThroughVenue(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	// The direct stream API must work while the runtime serves traffic.
+	// The direct stream API must work while the runtime serves traffic. The SQLite
+	// engine has no incremental cursor, so the sequence number is documented as
+	// opaque and always zero.
 	var stream bytes.Buffer
 	since, err := runtime.BackupMetadata(ctx, &stream)
 	if err != nil {
 		t.Fatalf("BackupMetadata() error = %v", err)
 	}
-	if since == 0 {
-		t.Error("BackupMetadata() since = 0, want the engine sequence number of the snapshot")
+	if since != 0 {
+		t.Errorf("BackupMetadata() since = %d, want the documented opaque zero", since)
 	}
 	if stream.Len() == 0 {
 		t.Fatal("BackupMetadata() wrote an empty stream")
 	}
 
-	// The configured runner must write a backup file the status accessor sees.
+	// The configured runner must write a per-tenant backup file the status
+	// accessor sees.
 	backupService := runtime.MetadataBackupService()
 	if backupService == nil {
 		t.Fatal("MetadataBackupService() = nil, want a runner when BackupDirectory and BackupInterval are set")
@@ -396,24 +399,24 @@ func TestBackupAndRestoreMetadataThroughVenue(t *testing.T) {
 	if info.BackupCount != 1 || info.LatestBackupPath == "" || info.TotalBytes == 0 {
 		t.Fatalf("MetadataBackupInfo() = %#v, want one readable backup with bytes", info)
 	}
-
-	backupBytes, err := os.ReadFile(info.LatestBackupPath)
-	if err != nil {
-		t.Fatalf("reading the backup file returned error = %v", err)
+	if wantDir := filepath.Join(cfg.Sqlite.BackupDirectory, "backup-tenant"); filepath.Dir(info.LatestBackupPath) != wantDir {
+		t.Errorf("backup path = %q, want it below %q", info.LatestBackupPath, wantDir)
 	}
 
+	// Restoring uses the zip stream produced above: it is the container that
+	// carries the per-tenant databases.
 	restoredRoot := t.TempDir()
 	restoredCfg := newLifecycleConfig(t)
 	restoredCfg.MetadataDirectory = filepath.Join(restoredRoot, "metadata")
 	restoredCfg.QuotaDirectory = filepath.Join(restoredRoot, "quota")
 
-	if err := venue.RestoreMetadata(ctx, restoredCfg, bytes.NewReader(backupBytes)); err != nil {
+	if err := venue.RestoreMetadata(ctx, restoredCfg, bytes.NewReader(stream.Bytes())); err != nil {
 		t.Fatalf("RestoreMetadata() error = %v", err)
 	}
 
 	// Restoring into the same directory must be refused: that is the guard that
 	// keeps a mistyped path from overwriting live data.
-	if err := venue.RestoreMetadata(ctx, restoredCfg, bytes.NewReader(backupBytes)); !errors.Is(err, core.ErrInvalidArgument) {
+	if err := venue.RestoreMetadata(ctx, restoredCfg, bytes.NewReader(stream.Bytes())); !errors.Is(err, core.ErrInvalidArgument) {
 		t.Fatalf("RestoreMetadata() into a non-empty directory error = %v, want core.ErrInvalidArgument", err)
 	}
 

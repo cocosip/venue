@@ -14,7 +14,6 @@ import (
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/logging"
-	"github.com/cocosip/venue/pkg/metadata"
 )
 
 // capturedRecord is one structured record a logging.Runtime emitted.
@@ -282,7 +281,6 @@ func TestSuccessfulClaimRunsBackgroundTimedOutReclaim(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -336,7 +334,6 @@ func TestGetNextBatchForProcessingRunsBackgroundTimedOutReclaim(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -380,7 +377,6 @@ func TestBackgroundTimedOutReclaimHonoursBatchSize(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -454,7 +450,6 @@ func TestBackgroundTimedOutReclaimDoesNotSuppressEmptyQueueReclaim(t *testing.T)
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -506,7 +501,6 @@ func TestBackgroundTimedOutReclaimDoesNotSuppressEmptyQueueReclaim(t *testing.T)
 func TestReclaimPathsKeepIndependentCooldownState(t *testing.T) {
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -566,7 +560,6 @@ func TestBackgroundTimedOutReclaimCooldownSuppressesSecondPass(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -637,7 +630,6 @@ func TestBackgroundTimedOutReclaimDisabledPerformsNoWork(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			baseRepo, tmpDir := createTestRepository(t)
 			defer func() { _ = os.RemoveAll(tmpDir) }()
-			defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 			volumes := createTestVolumes(t)
 			defer cleanupVolumes(volumes)
@@ -672,7 +664,6 @@ func TestBackgroundTimedOutReclaimPreservesReplacementLease(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -732,7 +723,6 @@ func TestBackgroundTimedOutReclaimConcurrentClaimsStartOnePass(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -817,7 +807,6 @@ func TestCloseWaitsForInFlightBackgroundReclaim(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)

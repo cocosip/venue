@@ -47,42 +47,52 @@ venue:
     # Maximum number of entries in the metadata cache (0 = default 10000)
     maxCacheEntries: 10000
 
-  # BadgerDB database configuration (applies to all BadgerDB databases)
-  badgerDBOptions:
-    # Garbage collection interval
-    gcInterval: 10m
-    # Garbage collection discard ratio (0.0 - 1.0)
-    gcDiscardRatio: 0.5
-    # MemTable size in MB (0 = default 32MB for metadata, 16MB for quota)
-    memTableSize: 32
-    # Value log file size in MB (0 = default 64MB)
-    valueLogFileSize: 64
-    # Block cache size in MB (0 = default 64MB for metadata, 32MB for quota)
-    blockCacheSize: 64
-    # Enable synchronous writes (true = durable but slower, false = faster)
-    syncWrites: false
-    # Quarantine a database that cannot be opened and recreate it instead of
-    # failing startup. Destructive: the quarantined directory is kept but not
-    # re-imported, so enable it only if you can restore from the backup.
+  # SQLite metadata / directory-quota storage configuration (one database file per tenant)
+  sqliteOptions:
+    # Journal mode: DELETE | TRUNCATE | PERSIST | MEMORY | WAL | OFF
+    # WAL supports concurrent readers during a write and provides crash recovery.
+    journalMode: WAL
+    # Synchronous mode: OFF | NORMAL | FULL | EXTRA | 0 | 1 | 2 | 3
+    # NORMAL is safe against process crashes; a power failure can lose recent commits.
+    # FULL fsyncs on every commit.
+    synchronousMode: NORMAL
+    # Per-connection page cache. Negative values are KB, positive values are pages (4KB).
+    cacheSizeKb: -4000
+    # Milliseconds a statement waits for a lock before failing with "database is locked".
+    busyTimeoutMs: 5000
+    # Run PRAGMA wal_checkpoint(PASSIVE) after every committed batch. Bounds WAL growth
+    # at the cost of extra I/O.
+    checkpointAfterBatch: false
+    # Connection limit of each tenant's *sql.DB. Keep it at 1: every statement runs
+    # serially on the same connection.
+    maxOpenConns: 1
+    # Upper bound on simultaneously open tenant database handles. 0 = unlimited
+    # (the default: handles live until Close).
+    maxOpenDatabases: 0
+    # Close a tenant database handle after this much idle time. 0 = never reclaim.
+    openDatabaseIdleTimeout: 0s
+    # Quarantine a database file that cannot be opened and recreate an empty one
+    # instead of failing startup. Destructive: the quarantined copy is never
+    # re-imported automatically. Lock/permission failures are never treated as corruption.
     recoverCorruptedDatabase: false
-    # How long a quarantined database directory is kept before startup removes it
+    # Retention of quarantined copies; 0 selects the 72h default, a negative value never prunes.
     corruptedDatabaseRetention: 72h
-    # Directory for periodic consistent metadata backups. Empty disables the
-    # backup runner, so leaving it empty keeps the runtime from writing any
-    # backup file at all. When set, the runner starts and stops with the runtime
-    # and writes metadata.<yyyyMMddTHHmmssZ>.bak files into it.
+    # Backup root. Each tenant writes {backupDirectory}/{tenantId}/metadata.<stamp>.bak.
+    # An empty value disables both periodic backups and automatic restore.
     backupDirectory: ""
-    # Delay between periodic metadata backups
+    # Backup interval.
     backupInterval: 1h
-    # How long backup files are kept. A backup older than this is removed by the
-    # next backup cycle; 0 disables pruning and keeps every backup forever.
-    backupRetention: 168h  # 7 days
-    # Restore the newest valid backup into a metadata database that had to be
-    # quarantined, instead of leaving it empty. It requires
-    # recoverCorruptedDatabase: true and a non-empty backupDirectory. The
-    # restored state is only as new as the newest backup, so this is a recovery
-    # aid and not a substitute for an operator.
+    # Backup retention, computed independently inside each tenant directory.
+    # A non-positive value disables pruning.
+    backupRetention: 168h
+    # After a database file is quarantined, try to restore from that tenant's newest
+    # readable backup.
     autoRestoreFromBackup: false
+    # Skip PRAGMA integrity_check(1) on backup files. Not recommended.
+    skipBackupVerification: false
+    # Let the maintenance cycle also VACUUM tenants that currently have no open handle
+    # (multiplies handle churn).
+    optimizeIdleTenantDatabases: false
 
   # Storage volumes configuration
   volumes:

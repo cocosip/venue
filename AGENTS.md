@@ -36,7 +36,7 @@ Repository ownership:
 - `viperconfig/`: optional Viper-to-`config.Config` adapter.
 - `pkg/core/`: public interfaces, shared models, statuses, and domain errors.
 - `pkg/tenant/`: tenant lifecycle and metadata cache.
-- `pkg/metadata/`: BadgerDB metadata projection, indexes, migration, and active-data cache.
+- `pkg/metadata/`: SQLite metadata repositories (one database file per tenant), indexes, migration, and active-data cache.
 - `pkg/pool/`: storage and queue facade.
 - `pkg/scheduler/`: atomic queue transitions and retry scheduling.
 - `pkg/quota/`: tenant and directory quotas.
@@ -91,7 +91,7 @@ When adding a configuration field, update defaults, cloning, validation where re
 ## Queue And Concurrency
 
 - File allocation must be atomic; one pending file can be claimed by only one worker.
-- Metadata transitions belong in BadgerDB transactions.
+- Metadata transitions belong in SQLite transactions.
 - Preserve FIFO ordering among files that are available for processing.
 - Retry uses exponential backoff capped by the configured maximum.
 - Processing timeout recovery must not permit a stale worker to mutate a newer claim.
@@ -108,9 +108,10 @@ When adding a configuration field, update defaults, cloning, validation where re
 - Close every `io.ReadCloser` and database handle on all paths.
 - Preserve original file extensions only for diagnostics; never use caller names as physical paths.
 - Sanitize all relative paths and keep resolved paths under their configured volume root.
-- BadgerDB deletion requires periodic value-log GC to reclaim disk space.
-- Treat `badger.ErrNoRewrite` as a normal no-work GC outcome.
-- Keep durability trade-offs such as `SyncWrites` and file `fsync` explicit in configuration.
+- One SQLite database file per tenant belongs below the metadata and quota roots; never share a database file across tenants.
+- Metadata and quota deletion reclaims space through WAL checkpointing and `VACUUM` on the maintenance cycle, not through an ad-hoc sweep.
+- The SQLite driver is pure Go: the runtime must keep building with `CGO_ENABLED=0`.
+- Keep durability trade-offs such as `Sqlite.SynchronousMode` and file `fsync` explicit in configuration.
 
 ## Error Handling
 
@@ -136,6 +137,7 @@ Use test-first development for behavioral changes. A regression test must fail f
 Required commands:
 
 ```powershell
+$env:CGO_ENABLED='0'; go build ./...
 go build ./...
 go test ./...
 go test -race ./...

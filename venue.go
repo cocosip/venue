@@ -57,7 +57,7 @@ type Venue struct {
 	fileWatcherService *watcher.BackgroundFileWatcherService
 	healthCheckService *health.DatabaseHealthCheckService
 	orphanRecovery     *recovery.OrphanRecoveryService
-	metadataBackupCore *metadata.BackupService
+	metadataBackupCore *MetadataBackupService
 
 	// statisticsRecorder is the runtime's recorder: statistics.Noop when
 	// statistics are disabled, so every instrumented call site can forward
@@ -71,11 +71,6 @@ type Venue struct {
 	recoveryMu           sync.Mutex
 	incompleteRecoveries []string
 }
-
-// sharedMetadataTenantID is the logical tenant segment of the shared metadata
-// database directory. Metadata records are keyed by their real tenant, so this
-// segment only names the database, not the data.
-const sharedMetadataTenantID = "shared"
 
 // NewVenue creates a new Venue instance with the given configuration.
 // This is the main entry point for initializing the entire system.
@@ -351,12 +346,12 @@ func (v *Venue) initialize() error {
 
 	// 2. Initialize metadata repository
 	v.emit(ctx, slog.LevelInfo, "metadata_repository_initializing", "Initializing metadata repository")
-	metadataOptions := badgerRepositoryOptions(v.config)
+	metadataOptions := sqliteRepositoryOptions(v.config)
 	metadataOptions.OnCorruptedDatabase = v.quarantineReporter()
 	metadataOptions.OnRecoveryIncomplete = v.recoveryIncompleteReporter()
 	metadataOptions.Logging = v.logger
 	metadataOptions.StatisticsRecorder = v.statisticsRecorder
-	metaRepo, err := metadata.NewBadgerMetadataRepository(metadataOptions)
+	metaRepo, err := metadata.NewSQLiteMetadataRepository(metadataOptions)
 	if err != nil {
 		return fmt.Errorf("failed to create metadata repository: %w", err)
 	}
@@ -364,20 +359,20 @@ func (v *Venue) initialize() error {
 
 	// 2b. Initialize the periodic metadata backup runner (disabled unless a
 	// backup directory and a positive interval are configured).
-	if v.config.BadgerDB.BackupDirectory != "" && v.config.BadgerDB.BackupInterval > 0 {
-		backupService, err := metadata.NewBackupService(&metadata.BackupServiceOptions{
-			Repository: metaRepo,
-			Directory:  v.config.BadgerDB.BackupDirectory,
-			Interval:   v.config.BadgerDB.BackupInterval,
-			Retention:  v.config.BadgerDB.BackupRetention,
-			Logging:    v.logger,
-		})
+	if v.config.Sqlite.BackupDirectory != "" && v.config.Sqlite.BackupInterval > 0 {
+		backupService, err := newMetadataBackupService(
+			metaRepo,
+			v.config.Sqlite.BackupDirectory,
+			v.config.Sqlite.BackupInterval,
+			v.config.Sqlite.BackupRetention,
+			v.logger,
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create metadata backup service: %w", err)
 		}
 		v.metadataBackupCore = backupService
 		v.emit(ctx, slog.LevelInfo, "metadata_backup_configured", "Periodic metadata backups configured",
-			slog.Duration("interval", v.config.BadgerDB.BackupInterval))
+			slog.Duration("interval", v.config.Sqlite.BackupInterval))
 	}
 
 	// 3. Initialize quota managers
@@ -405,16 +400,14 @@ func (v *Venue) initialize() error {
 		return fmt.Errorf("failed to reconcile tenant quotas: %w", err)
 	}
 
-	dirQuotaRepo, err := quota.NewBadgerDirectoryQuotaRepository(&quota.BadgerDirectoryQuotaRepositoryOptions{
+	dirQuotaRepo, err := quota.NewSQLiteDirectoryQuotaRepository(&quota.SQLiteDirectoryQuotaRepositoryOptions{
 		DataPath:                   v.config.QuotaDirectory,
-		GCInterval:                 v.config.BadgerDB.GCInterval,
-		GCDiscardRatio:             v.config.BadgerDB.GCDiscardRatio,
-		MemTableSize:               int64(v.config.BadgerDB.MemTableSize/2) << 20, // Half size for quota
-		ValueLogFileSize:           int64(v.config.BadgerDB.ValueLogFileSize/2) << 20,
-		BlockCacheSize:             int64(v.config.BadgerDB.BlockCacheSize/2) << 20,
-		SyncWrites:                 v.config.BadgerDB.SyncWrites,
-		RecoverCorruptedDatabase:   v.config.BadgerDB.RecoverCorruptedDatabase,
-		CorruptedDatabaseRetention: v.config.BadgerDB.CorruptedDatabaseRetention,
+		Sqlite:                     sqliteOptions(v.config.Sqlite),
+		MaxOpenDatabases:           v.config.Sqlite.MaxOpenDatabases,
+		OpenDatabaseIdleTimeout:    v.config.Sqlite.OpenDatabaseIdleTimeout,
+		RecoverCorruptedDatabase:   v.config.Sqlite.RecoverCorruptedDatabase,
+		CorruptedDatabaseRetention: v.config.Sqlite.CorruptedDatabaseRetention,
+		Logging:                    v.logger,
 		OnCorruptedDatabase:        v.quarantineReporter(),
 	})
 	if err != nil {
@@ -435,6 +428,9 @@ func (v *Venue) initialize() error {
 	// directory quota counts are derived from metadata and are reconciled just
 	// above, so a quarantined quota database is a healthy degraded state rather
 	// than a startup failure.
+	if err := v.validateTenantDatabases(ctx); err != nil {
+		return err
+	}
 	if err := v.checkStartupRecovery(); err != nil {
 		return err
 	}
@@ -556,7 +552,7 @@ func (v *Venue) initialize() error {
 		RetiredVolumes:             retiredVolumes,
 		MetadataDirectory:          v.config.MetadataDirectory,
 		QuotaDirectory:             v.config.QuotaDirectory,
-		CorruptedDatabaseRetention: v.config.BadgerDB.CorruptedDatabaseRetention,
+		CorruptedDatabaseRetention: v.config.Sqlite.CorruptedDatabaseRetention,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create cleanup service: %w", err)
@@ -750,12 +746,13 @@ func (v *Venue) initialize() error {
 		}
 
 		healthChecker, err := health.NewDatabaseHealthChecker(&health.DatabaseHealthCheckerOptions{
-			MetadataDataPath:           v.config.MetadataDirectory,
-			DirectoryQuotaDataPath:     v.config.QuotaDirectory,
-			MetadataDatabasePath:       filepath.Join(v.config.MetadataDirectory, sharedMetadataTenantID, "metadata"),
-			DirectoryQuotaDatabasePath: filepath.Join(v.config.QuotaDirectory, "quota"),
-			VolumePaths:                volumePaths,
-			Logging:                    v.logger,
+			// The SQLite engine keeps one database per tenant file below these
+			// roots, so the checker inspects the roots and ignores the legacy
+			// single-database path fields.
+			MetadataDataPath:       v.config.MetadataDirectory,
+			DirectoryQuotaDataPath: v.config.QuotaDirectory,
+			VolumePaths:            volumePaths,
+			Logging:                v.logger,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create database health checker: %w", err)
@@ -1128,6 +1125,46 @@ func (v *Venue) recoveryIncompleteReporter() func(string) {
 			slog.String("quarantine_directory", filepath.Base(quarantinedPath)),
 			slog.Int("incomplete_recoveries", count))
 	}
+}
+
+// validateTenantDatabases opens every known tenant database once, but only when
+// corruption recovery is enabled.
+//
+// SQLite databases are opened lazily, so without this pass a corrupt database
+// would only be discovered on the first request for its tenant. Validating at
+// startup keeps the recovery flag's semantics ("recover during startup") and lets
+// FailFastOnStartupRecoveryFailure decide the outcome before the runtime serves
+// traffic. The pass is skipped when recovery is disabled, because then a corrupt
+// database must fail the request that touches it rather than be quarantined.
+func (v *Venue) validateTenantDatabases(ctx context.Context) error {
+	if !v.config.Sqlite.RecoverCorruptedDatabase {
+		return nil
+	}
+
+	lister, ok := v.metadataRepo.(interface {
+		KnownTenantIDs(context.Context) ([]string, error)
+	})
+	if !ok {
+		return nil
+	}
+
+	tenantIDs, err := lister.KnownTenantIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to enumerate tenants for startup validation: %w", err)
+	}
+
+	for _, tenantID := range tenantIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Any read opens the tenant's database, which is where corruption is
+		// detected and quarantined. An empty result is a healthy database.
+		if _, err := v.metadataRepo.GetByStatus(ctx, tenantID, core.FileStatusPending, 1); err != nil {
+			return fmt.Errorf("failed to validate the metadata database of tenant %s: %w", tenantID, err)
+		}
+	}
+
+	return nil
 }
 
 // checkStartupRecovery reports the degraded state recorded during repository

@@ -30,7 +30,7 @@ runtime, err := venue.NewVenue(cfg)
 ```
 
 `Config` and the nested types `VolumeConfig`, `TenantConfig`,
-`RetryPolicyConfig`, `TenantManagerConfig`, `MetadataConfig`, `BadgerDBConfig`,
+`RetryPolicyConfig`, `TenantManagerConfig`, `MetadataConfig`, `SqliteConfig`,
 `FileWatcherConfig`, `FileWatcherRootConfig`, `FileWatcherServiceConfig`,
 `CleanupConfig`, `DeadLetterConfig`, `RetiredVolumeConfig`,
 `OrphanRecoveryConfig`, `DatabaseHealthCheckConfig`, and `StatisticsConfig`
@@ -74,8 +74,9 @@ injected by the application after decoding.
 ## Configuration Files
 
 - [`../venue-config-example.yaml`](../venue-config-example.yaml): the complete
-  example with a `venue` root node, including the statistics, metadata-backup,
-  per-volume startup, advanced watcher, and timed-out reclaim options.
+  example with a `venue` root node, including the `sqliteOptions` engine
+  settings, statistics, per-tenant metadata-backup, per-volume startup, advanced
+  watcher, and timed-out reclaim options.
 - [`viper-config/venue-config.yaml`](viper-config/venue-config.yaml): a
   root-level configuration example.
 - [`viper-config/venue-config.json`](viper-config/venue-config.json): a JSON

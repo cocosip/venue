@@ -54,7 +54,6 @@ type Config struct {
 	RetryPolicy                      RetryPolicyConfig         `json:"retryPolicy" yaml:"retryPolicy" mapstructure:"retryPolicy"`
 	TenantManager                    TenantManagerConfig       `json:"tenantManagerOptions" yaml:"tenantManagerOptions" mapstructure:"tenantManagerOptions"`
 	Metadata                         MetadataConfig            `json:"metadataOptions" yaml:"metadataOptions" mapstructure:"metadataOptions"`
-	BadgerDB                         BadgerDBConfig            `json:"badgerDBOptions" yaml:"badgerDBOptions" mapstructure:"badgerDBOptions"`
 	Sqlite                           SqliteConfig              `json:"sqliteOptions" yaml:"sqliteOptions" mapstructure:"sqliteOptions"`
 	Volumes                          []VolumeConfig            `json:"volumes" yaml:"volumes" mapstructure:"volumes"`
 	Tenants                          []TenantConfig            `json:"tenants" yaml:"tenants" mapstructure:"tenants"`
@@ -79,48 +78,6 @@ type TenantManagerConfig struct {
 type MetadataConfig struct {
 	CacheTTL        time.Duration `json:"cacheTTL" yaml:"cacheTTL" mapstructure:"cacheTTL"`
 	MaxCacheEntries int           `json:"maxCacheEntries" yaml:"maxCacheEntries" mapstructure:"maxCacheEntries"`
-}
-
-// BadgerDBConfig configures BadgerDB repositories.
-type BadgerDBConfig struct {
-	GCInterval       time.Duration `json:"gcInterval" yaml:"gcInterval" mapstructure:"gcInterval"`
-	GCDiscardRatio   float64       `json:"gcDiscardRatio" yaml:"gcDiscardRatio" mapstructure:"gcDiscardRatio"`
-	MemTableSize     int           `json:"memTableSize" yaml:"memTableSize" mapstructure:"memTableSize"`
-	ValueLogFileSize int           `json:"valueLogFileSize" yaml:"valueLogFileSize" mapstructure:"valueLogFileSize"`
-	BlockCacheSize   int           `json:"blockCacheSize" yaml:"blockCacheSize" mapstructure:"blockCacheSize"`
-	SyncWrites       bool          `json:"syncWrites" yaml:"syncWrites" mapstructure:"syncWrites"`
-
-	// RecoverCorruptedDatabase quarantines a database directory that cannot be
-	// opened and recreates an empty one, instead of failing startup. The
-	// quarantine directory is kept for CorruptedDatabaseRetention.
-	//
-	// This is a destructive repair: the quarantined data is not automatically
-	// re-imported. Enable it only when an operator can restore from it or when
-	// the alternative (a runtime that cannot start) is worse.
-	RecoverCorruptedDatabase bool `json:"recoverCorruptedDatabase" yaml:"recoverCorruptedDatabase" mapstructure:"recoverCorruptedDatabase"`
-
-	// CorruptedDatabaseRetention is how long a quarantined database directory is
-	// kept before it is removed during startup.
-	CorruptedDatabaseRetention time.Duration `json:"corruptedDatabaseRetention" yaml:"corruptedDatabaseRetention" mapstructure:"corruptedDatabaseRetention"`
-
-	// BackupDirectory is where periodic consistent backups of the metadata
-	// database are written. An empty value disables periodic backups.
-	BackupDirectory string `json:"backupDirectory" yaml:"backupDirectory" mapstructure:"backupDirectory"`
-
-	// BackupInterval is the delay between periodic metadata backups.
-	BackupInterval time.Duration `json:"backupInterval" yaml:"backupInterval" mapstructure:"backupInterval"`
-
-	// BackupRetention is how long backup files are kept. A backup older than
-	// this is removed by the next backup cycle. Zero disables pruning.
-	BackupRetention time.Duration `json:"backupRetention" yaml:"backupRetention" mapstructure:"backupRetention"`
-
-	// AutoRestoreFromBackup loads the newest valid backup into a database that
-	// had to be quarantined, instead of leaving it empty. It only applies when
-	// RecoverCorruptedDatabase is enabled and BackupDirectory is set.
-	//
-	// This is a recovery aid, not a substitute for an operator: the restored
-	// state is only as new as the newest backup.
-	AutoRestoreFromBackup bool `json:"autoRestoreFromBackup" yaml:"autoRestoreFromBackup" mapstructure:"autoRestoreFromBackup"`
 }
 
 // SqliteConfig configures the SQLite metadata and directory-quota repositories.
@@ -589,22 +546,6 @@ func DefaultConfig() *Config {
 			CacheTTL:        5 * time.Minute,
 			MaxCacheEntries: 10000,
 		},
-		BadgerDB: BadgerDBConfig{
-			GCInterval:       10 * time.Minute,
-			GCDiscardRatio:   0.5,
-			MemTableSize:     32,
-			ValueLogFileSize: 64,
-			BlockCacheSize:   64,
-			// Destructive repair stays off unless an operator opts in.
-			RecoverCorruptedDatabase:   false,
-			CorruptedDatabaseRetention: 72 * time.Hour,
-			// Consistent metadata backups are opt-in: they require a directory
-			// the operator owns.
-			BackupDirectory:       "",
-			BackupInterval:        time.Hour,
-			BackupRetention:       7 * 24 * time.Hour,
-			AutoRestoreFromBackup: false,
-		},
 		Sqlite: SqliteConfig{
 			// The defaults mirror the Locus SQLite options so an engine swap does
 			// not silently change durability or cache behaviour.
@@ -749,21 +690,6 @@ func (c *Config) ApplyDefaults() {
 	if c.Metadata.MaxCacheEntries == 0 {
 		c.Metadata.MaxCacheEntries = d.Metadata.MaxCacheEntries
 	}
-	if c.BadgerDB.GCInterval == 0 {
-		c.BadgerDB.GCInterval = d.BadgerDB.GCInterval
-	}
-	if c.BadgerDB.GCDiscardRatio == 0 {
-		c.BadgerDB.GCDiscardRatio = d.BadgerDB.GCDiscardRatio
-	}
-	if c.BadgerDB.MemTableSize == 0 {
-		c.BadgerDB.MemTableSize = d.BadgerDB.MemTableSize
-	}
-	if c.BadgerDB.ValueLogFileSize == 0 {
-		c.BadgerDB.ValueLogFileSize = d.BadgerDB.ValueLogFileSize
-	}
-	if c.BadgerDB.BlockCacheSize == 0 {
-		c.BadgerDB.BlockCacheSize = d.BadgerDB.BlockCacheSize
-	}
 	if c.Cleanup.CleanupInterval == 0 {
 		c.Cleanup.CleanupInterval = d.Cleanup.CleanupInterval
 	}
@@ -799,15 +725,6 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Cleanup.DeadLetter.ShardingDepth == 0 {
 		c.Cleanup.DeadLetter.ShardingDepth = d.Cleanup.DeadLetter.ShardingDepth
-	}
-	if c.BadgerDB.CorruptedDatabaseRetention == 0 {
-		c.BadgerDB.CorruptedDatabaseRetention = d.BadgerDB.CorruptedDatabaseRetention
-	}
-	if c.BadgerDB.BackupInterval == 0 {
-		c.BadgerDB.BackupInterval = d.BadgerDB.BackupInterval
-	}
-	if c.BadgerDB.BackupRetention == 0 {
-		c.BadgerDB.BackupRetention = d.BadgerDB.BackupRetention
 	}
 	if c.Sqlite.JournalMode == "" {
 		c.Sqlite.JournalMode = d.Sqlite.JournalMode
@@ -993,9 +910,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("DefaultTenantQuota cannot be negative")
 	}
 	if err := validateRetryPolicy(&c.RetryPolicy); err != nil {
-		return err
-	}
-	if err := validateBadgerDB(&c.BadgerDB); err != nil {
 		return err
 	}
 	if err := validateSqlite(&c.Sqlite); err != nil {
@@ -1194,37 +1108,6 @@ func validateRetryPolicy(policy *RetryPolicyConfig) error {
 	}
 	if policy.MaxRetryDelay < 0 {
 		return fmt.Errorf("RetryPolicy.MaxRetryDelay cannot be negative")
-	}
-	return nil
-}
-
-func validateBadgerDB(badger *BadgerDBConfig) error {
-	if badger.GCInterval < 0 {
-		return fmt.Errorf("BadgerDB.GCInterval cannot be negative")
-	}
-	if badger.GCDiscardRatio < 0 || badger.GCDiscardRatio >= 1 {
-		return fmt.Errorf("BadgerDB.GCDiscardRatio must be greater than or equal to 0 and less than 1")
-	}
-	if badger.MemTableSize < 0 {
-		return fmt.Errorf("BadgerDB.MemTableSize cannot be negative")
-	}
-	if badger.ValueLogFileSize < 0 {
-		return fmt.Errorf("BadgerDB.ValueLogFileSize cannot be negative")
-	}
-	if badger.BlockCacheSize < 0 {
-		return fmt.Errorf("BadgerDB.BlockCacheSize cannot be negative")
-	}
-	if badger.CorruptedDatabaseRetention < 0 {
-		return fmt.Errorf("BadgerDB.CorruptedDatabaseRetention cannot be negative")
-	}
-	if badger.BackupInterval < 0 {
-		return fmt.Errorf("BadgerDB.BackupInterval cannot be negative")
-	}
-	if badger.BackupRetention < 0 {
-		return fmt.Errorf("BadgerDB.BackupRetention cannot be negative")
-	}
-	if badger.AutoRestoreFromBackup && badger.BackupDirectory == "" {
-		return fmt.Errorf("BadgerDB.AutoRestoreFromBackup requires BadgerDB.BackupDirectory")
 	}
 	return nil
 }

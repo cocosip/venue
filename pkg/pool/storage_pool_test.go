@@ -11,6 +11,7 @@ import (
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/metadata"
 	"github.com/cocosip/venue/pkg/scheduler"
+	"github.com/cocosip/venue/pkg/sqlite"
 	"github.com/cocosip/venue/pkg/volume"
 )
 
@@ -18,8 +19,7 @@ import (
 func TestNewStoragePool(t *testing.T) {
 	t.Run("Valid configuration", func(t *testing.T) {
 		tenantMgr := &mockTenantManager{}
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -51,8 +51,7 @@ func TestNewStoragePool(t *testing.T) {
 	})
 
 	t.Run("Nil tenant manager", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -96,8 +95,7 @@ func TestWriteFile(t *testing.T) {
 	ctx := context.Background()
 
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -184,8 +182,7 @@ func TestReadFile(t *testing.T) {
 	ctx := context.Background()
 
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -264,8 +261,7 @@ func TestGetFileInfo(t *testing.T) {
 	ctx := context.Background()
 
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -313,8 +309,7 @@ func TestGetFileLocation(t *testing.T) {
 	ctx := context.Background()
 
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -366,8 +361,7 @@ func TestCapacity(t *testing.T) {
 	ctx := context.Background()
 
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -446,25 +440,33 @@ func (m *mockTenantManager) GetAllTenants(ctx context.Context) ([]core.TenantCon
 	return []core.TenantContext{}, nil
 }
 
+// createTestRepository builds a SQLite metadata repository rooted in a
+// temporary directory this test owns. Both the repository shutdown and the
+// directory removal are registered here, in that order, so the repository is
+// closed before testing deletes the database files.
 func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 	tmpDir, err := os.MkdirTemp("", "pool-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	opts := &metadata.BadgerRepositoryOptions{
-		TenantID:       "test-tenant",
-		DataPath:       tmpDir,
-		CacheTTL:       5 * time.Minute,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
-	}
-
-	repo, err := metadata.NewBadgerMetadataRepository(opts)
+	repo, err := metadata.NewSQLiteMetadataRepository(&metadata.SQLiteRepositoryOptions{
+		DataPath:        tmpDir,
+		CacheTTL:        5 * time.Minute,
+		MaxCacheEntries: 10000,
+		Sqlite:          sqlite.DefaultOptions(),
+	})
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create repository: %v", err)
 	}
+
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("close repository: %v", err)
+		}
+	})
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 
 	return repo, tmpDir
 }

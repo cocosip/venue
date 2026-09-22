@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,17 +28,15 @@ func writeAgedFile(t *testing.T, path string, size int, modified time.Time) {
 	}
 }
 
-// writeAgedQuarantine creates a quarantined database directory holding the given
-// file sizes and forces the directory modification time.
-func writeAgedQuarantine(t *testing.T, path string, fileSizes []int, modified time.Time) {
+// writeAgedQuarantine creates a quarantined database file of the given size and
+// forces its modification time. The SQLite quarantine object is the per-tenant
+// database file moved aside as "<dbFile>.corrupted.<stamp>", so the fixture
+// mirrors the file the sweep has to recognize rather than the Badger directory
+// it used to be.
+func writeAgedQuarantine(t *testing.T, path string, size int, modified time.Time) {
 	t.Helper()
 
-	for index, size := range fileSizes {
-		writeAgedFile(t, filepath.Join(path, fmt.Sprintf("%06d.vlog", index+1)), size, modified)
-	}
-	if err := os.Chtimes(path, modified, modified); err != nil {
-		t.Fatalf("Chtimes(%s) error = %v", path, err)
-	}
+	writeAgedFile(t, path, size, modified)
 }
 
 // newQuarantineSweepService builds a cleanup service whose quarantine sweep
@@ -61,7 +58,7 @@ func newQuarantineSweepService(t *testing.T, retention time.Duration) (core.Clea
 
 // TestCleanupInvalidDatabaseBackups_RemovesOnlyExpiredQuarantineDirectories is
 // the regression test for the Locus corruption-backup sweep: entries named
-// "<dbDir>.corrupted.<stamp>" older than the retention are removed from both
+// "<dbFile>.corrupted.<stamp>" older than the retention are removed from both
 // database trees, while fresh quarantines and live databases are untouched.
 func TestCleanupInvalidDatabaseBackups_RemovesOnlyExpiredQuarantineDirectories(t *testing.T) {
 	ctx := context.Background()
@@ -71,15 +68,15 @@ func TestCleanupInvalidDatabaseBackups_RemovesOnlyExpiredQuarantineDirectories(t
 	stale := time.Now().Add(-100 * time.Hour)
 	fresh := time.Now().Add(-1 * time.Hour)
 
-	staleMetadata := filepath.Join(metadataRoot, "shared", "metadata.corrupted.20200101T000000Z")
-	staleQuota := filepath.Join(quotaRoot, "quota.corrupted.20200101T000000Z")
-	freshMetadata := filepath.Join(metadataRoot, "shared", "metadata.corrupted.29990101T000000Z")
-	liveDatabase := filepath.Join(metadataRoot, "shared", "metadata")
+	staleMetadata := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200101T000000Z")
+	staleQuota := filepath.Join(quotaRoot, "shared", "quotas.db.corrupted.20200101T000000Z")
+	freshMetadata := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.29990101T000000Z")
+	liveDatabase := filepath.Join(metadataRoot, "shared", "metadata.db")
 
-	writeAgedQuarantine(t, staleMetadata, []int{1000, 24}, stale)
-	writeAgedQuarantine(t, staleQuota, []int{500}, stale)
-	writeAgedQuarantine(t, freshMetadata, []int{2000}, fresh)
-	writeAgedQuarantine(t, liveDatabase, []int{4096}, stale)
+	writeAgedQuarantine(t, staleMetadata, 1000, stale)
+	writeAgedQuarantine(t, staleQuota, 500, stale)
+	writeAgedQuarantine(t, freshMetadata, 2000, fresh)
+	writeAgedQuarantine(t, liveDatabase, 4096, stale)
 
 	stats, err := service.CleanupInvalidDatabaseBackups(ctx)
 	if err != nil {
@@ -89,7 +86,7 @@ func TestCleanupInvalidDatabaseBackups_RemovesOnlyExpiredQuarantineDirectories(t
 	if stats.InvalidDatabaseBackupsRemoved != 2 {
 		t.Errorf("InvalidDatabaseBackupsRemoved = %d, want 2", stats.InvalidDatabaseBackupsRemoved)
 	}
-	if wantFreed := int64(1000 + 24 + 500); stats.SpaceFreed != wantFreed {
+	if wantFreed := int64(1000 + 500); stats.SpaceFreed != wantFreed {
 		t.Errorf("SpaceFreed = %d, want %d", stats.SpaceFreed, wantFreed)
 	}
 
@@ -112,10 +109,10 @@ func TestCleanupInvalidDatabaseBackups_ZeroRetentionSelectsDefaultRetention(t *t
 
 	service, metadataRoot, _ := newQuarantineSweepService(t, 0)
 
-	olderThanDefault := filepath.Join(metadataRoot, "shared", "metadata.corrupted.20200101T000000Z")
-	newerThanDefault := filepath.Join(metadataRoot, "shared", "metadata.corrupted.20200102T000000Z")
-	writeAgedQuarantine(t, olderThanDefault, []int{10}, time.Now().Add(-100*time.Hour))
-	writeAgedQuarantine(t, newerThanDefault, []int{10}, time.Now().Add(-1*time.Hour))
+	olderThanDefault := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200101T000000Z")
+	newerThanDefault := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200102T000000Z")
+	writeAgedQuarantine(t, olderThanDefault, 10, time.Now().Add(-100*time.Hour))
+	writeAgedQuarantine(t, newerThanDefault, 10, time.Now().Add(-1*time.Hour))
 
 	stats, err := service.CleanupInvalidDatabaseBackups(ctx)
 	if err != nil {
@@ -139,8 +136,8 @@ func TestCleanupInvalidDatabaseBackups_NegativeRetentionDisablesSweep(t *testing
 
 	service, metadataRoot, _ := newQuarantineSweepService(t, -time.Hour)
 
-	stale := filepath.Join(metadataRoot, "shared", "metadata.corrupted.20200101T000000Z")
-	writeAgedQuarantine(t, stale, []int{10}, time.Now().Add(-100*time.Hour))
+	stale := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200101T000000Z")
+	writeAgedQuarantine(t, stale, 10, time.Now().Add(-100*time.Hour))
 
 	stats, err := service.CleanupInvalidDatabaseBackups(ctx)
 	if err != nil {
@@ -168,8 +165,8 @@ func TestCleanupInvalidDatabaseBackups_MissingRootIsBestEffort(t *testing.T) {
 		opts.CorruptedDatabaseRetention = time.Hour
 	})
 
-	stale := filepath.Join(metadataRoot, "shared", "metadata.corrupted.20200101T000000Z")
-	writeAgedQuarantine(t, stale, []int{10}, time.Now().Add(-100*time.Hour))
+	stale := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200101T000000Z")
+	writeAgedQuarantine(t, stale, 10, time.Now().Add(-100*time.Hour))
 
 	stats, err := service.CleanupInvalidDatabaseBackups(ctx)
 	if err != nil {
@@ -185,8 +182,8 @@ func TestCleanupInvalidDatabaseBackups_MissingRootIsBestEffort(t *testing.T) {
 func TestCleanupInvalidDatabaseBackups_HonoursContextCancellation(t *testing.T) {
 	service, metadataRoot, _ := newQuarantineSweepService(t, time.Hour)
 
-	stale := filepath.Join(metadataRoot, "shared", "metadata.corrupted.20200101T000000Z")
-	writeAgedQuarantine(t, stale, []int{10}, time.Now().Add(-100*time.Hour))
+	stale := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200101T000000Z")
+	writeAgedQuarantine(t, stale, 10, time.Now().Add(-100*time.Hour))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

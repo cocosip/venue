@@ -34,10 +34,13 @@ func newDetailedOptimizationService(
 }
 
 // TestOptimizeDatabasesDetailed_ReportsMeasuredSizes runs the detailed pass
-// against real BadgerDB-backed metadata and quota repositories. The sizes may be
-// unchanged by an optimization of a nearly empty database, so the test asserts
-// the invariants that always hold: the counts, a measured post-pass size, a
-// non-negative reclaim, and the reclaim/measurement relationship.
+// against real SQLite-backed metadata and quota repositories. Both stores create
+// a tenant database file lazily on first write, so each repository is seeded
+// before the pass: that is what makes the pre- and post-optimization sizes
+// measured rather than zero. The sizes may be unchanged by an optimization of a
+// nearly empty database, so the test asserts the invariants that always hold:
+// the counts, a measured post-pass size, a non-negative reclaim, and the
+// reclaim/measurement relationship.
 func TestOptimizeDatabasesDetailed_ReportsMeasuredSizes(t *testing.T) {
 	ctx := context.Background()
 
@@ -48,6 +51,13 @@ func TestOptimizeDatabasesDetailed_ReportsMeasuredSizes(t *testing.T) {
 	quotaRepo, quotaDir := createTestDirQuotaRepository(t)
 	defer func() { _ = quotaRepo.Close() }()
 	defer func() { _ = os.RemoveAll(quotaDir) }()
+
+	if err := metaRepo.AddOrUpdate(ctx, createTestFileMetadata("optimization-seed", core.FileStatusPending)); err != nil {
+		t.Fatalf("AddOrUpdate() error = %v", err)
+	}
+	if _, err := quotaRepo.GetOrCreate(ctx, "test-tenant", "seed-directory"); err != nil {
+		t.Fatalf("GetOrCreate() error = %v", err)
+	}
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)

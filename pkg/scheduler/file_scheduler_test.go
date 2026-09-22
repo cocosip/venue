@@ -10,6 +10,7 @@ import (
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/metadata"
+	"github.com/cocosip/venue/pkg/sqlite"
 	"github.com/cocosip/venue/pkg/volume"
 )
 
@@ -20,7 +21,6 @@ func TestNewFileScheduler(t *testing.T) {
 	t.Run("Valid configuration", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
 		defer func() { _ = os.RemoveAll(tmpDir) }()
-		defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -48,7 +48,6 @@ func TestNewFileScheduler(t *testing.T) {
 	t.Run("Nil volumes", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
 		defer func() { _ = os.RemoveAll(tmpDir) }()
-		defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		_, err := NewFileScheduler(repo, nil, nil)
 		if err == nil {
@@ -59,7 +58,6 @@ func TestNewFileScheduler(t *testing.T) {
 	t.Run("Empty volumes", func(t *testing.T) {
 		repo, tmpDir := createTestRepository(t)
 		defer func() { _ = os.RemoveAll(tmpDir) }()
-		defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		_, err := NewFileScheduler(repo, map[string]core.StorageVolume{}, nil)
 		if err == nil {
@@ -76,7 +74,6 @@ func TestGetNextFileForProcessing(t *testing.T) {
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -235,7 +232,6 @@ func TestMarkAsCompleted(t *testing.T) {
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -295,7 +291,6 @@ func TestMarkAsCompletedRejectsStaleLeaseBeforeDeletingFile(t *testing.T) {
 	ctx := context.Background()
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
 
@@ -345,7 +340,6 @@ func TestMarkAsFailed(t *testing.T) {
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -448,7 +442,6 @@ func TestMarkAsFailedRejectsStaleLeaseWithoutChangingRetryState(t *testing.T) {
 	ctx := context.Background()
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
 
@@ -491,7 +484,6 @@ func TestGetFileStatus(t *testing.T) {
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -533,7 +525,6 @@ func TestResetTimedOutFiles(t *testing.T) {
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -596,7 +587,6 @@ func TestResetTimedOutFilesDoesNotOverwriteReplacementLease(t *testing.T) {
 	ctx := context.Background()
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
 
@@ -637,25 +627,38 @@ func TestResetTimedOutFilesDoesNotOverwriteReplacementLease(t *testing.T) {
 
 // Helper functions
 
+// createTestRepository opens the SQLite metadata repository the scheduler tests
+// drive, below a fresh temporary directory, and registers its shutdown together
+// with that directory's removal.
+//
+// A test that wants the directory removed has to reach it through t.Cleanup
+// rather than deferring os.RemoveAll itself: t.Cleanup runs in LIFO order, so the
+// repository is closed before the directory holding its database files is
+// deleted.
 func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 	tmpDir, err := os.MkdirTemp("", "scheduler-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	opts := &metadata.BadgerRepositoryOptions{
-		TenantID:       "test-tenant",
-		DataPath:       tmpDir,
-		CacheTTL:       5 * time.Minute,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
-	}
-
-	repo, err := metadata.NewBadgerMetadataRepository(opts)
+	repo, err := metadata.NewSQLiteMetadataRepository(&metadata.SQLiteRepositoryOptions{
+		DataPath:        tmpDir,
+		CacheTTL:        5 * time.Minute,
+		MaxCacheEntries: 10000,
+		Sqlite:          sqlite.DefaultOptions(),
+	})
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create repository: %v", err)
 	}
+
+	// Registered last, so it runs first: the repository releases every file
+	// handle before the temporary directory is deleted.
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("close repository: %v", err)
+		}
+	})
 
 	return repo, tmpDir
 }

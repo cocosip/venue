@@ -11,6 +11,7 @@ import (
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/metadata"
 	"github.com/cocosip/venue/pkg/scheduler"
+	"github.com/cocosip/venue/pkg/sqlite"
 	"github.com/cocosip/venue/pkg/volume"
 )
 
@@ -295,21 +296,20 @@ func assertRecorderCall(t *testing.T, index int, got, want poolRecorderCall) {
 	}
 }
 
-// newStatisticsTestRepository builds a Badger metadata repository rooted in the
+// newStatisticsTestRepository builds a SQLite metadata repository rooted in the
 // test's own temporary directory, which testing removes after the repository is
 // closed.
 func newStatisticsTestRepository(t *testing.T) core.MetadataRepository {
 	t.Helper()
 
-	repo, err := metadata.NewBadgerMetadataRepository(&metadata.BadgerRepositoryOptions{
-		TenantID:       "test-tenant",
-		DataPath:       t.TempDir(),
-		CacheTTL:       5 * time.Minute,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
+	repo, err := metadata.NewSQLiteMetadataRepository(&metadata.SQLiteRepositoryOptions{
+		DataPath:        t.TempDir(),
+		CacheTTL:        5 * time.Minute,
+		MaxCacheEntries: 10000,
+		Sqlite:          sqlite.DefaultOptions(),
 	})
 	if err != nil {
-		t.Fatalf("NewBadgerMetadataRepository() error = %v", err)
+		t.Fatalf("NewSQLiteMetadataRepository() error = %v", err)
 	}
 
 	t.Cleanup(func() {

@@ -60,14 +60,6 @@ func (c *Config) WithMetadata(value *MetadataConfig) *Config {
 	return c
 }
 
-// WithBadgerDB sets BadgerDB configuration.
-func (c *Config) WithBadgerDB(value *BadgerDBConfig) *Config {
-	if value != nil {
-		c.BadgerDB = *value
-	}
-	return c
-}
-
 // WithSqlite sets the SQLite engine configuration.
 func (c *Config) WithSqlite(value *SqliteConfig) *Config {
 	if value != nil {
@@ -545,12 +537,6 @@ func (c *MetadataConfig) WithMaxCacheEntries(value int) *MetadataConfig {
 	return c
 }
 
-// NewBadgerDBConfig returns default BadgerDB configuration.
-func NewBadgerDBConfig() *BadgerDBConfig {
-	value := DefaultConfig().BadgerDB
-	return &value
-}
-
 // NewSqliteConfig returns the default SQLite engine configuration.
 func NewSqliteConfig() *SqliteConfig {
 	value := DefaultConfig().Sqlite
@@ -646,72 +632,6 @@ func (c *SqliteConfig) WithBackupVerificationSkipped(skip bool) *SqliteConfig {
 // currently have no open handle.
 func (c *SqliteConfig) WithOptimizeIdleTenantDatabases(enabled bool) *SqliteConfig {
 	c.OptimizeIdleTenantDatabases = enabled
-	return c
-}
-
-// WithGCInterval sets the BadgerDB garbage-collection interval.
-func (c *BadgerDBConfig) WithGCInterval(value time.Duration) *BadgerDBConfig {
-	c.GCInterval = value
-	return c
-}
-
-// WithGCDiscardRatio sets the BadgerDB garbage-collection discard ratio.
-func (c *BadgerDBConfig) WithGCDiscardRatio(value float64) *BadgerDBConfig {
-	c.GCDiscardRatio = value
-	return c
-}
-
-// WithMemTableSize sets the BadgerDB memtable size in MB.
-func (c *BadgerDBConfig) WithMemTableSize(value int) *BadgerDBConfig {
-	c.MemTableSize = value
-	return c
-}
-
-// WithValueLogFileSize sets the BadgerDB value-log file size in MB.
-func (c *BadgerDBConfig) WithValueLogFileSize(value int) *BadgerDBConfig {
-	c.ValueLogFileSize = value
-	return c
-}
-
-// WithBlockCacheSize sets the BadgerDB block cache size in MB.
-func (c *BadgerDBConfig) WithBlockCacheSize(value int) *BadgerDBConfig {
-	c.BlockCacheSize = value
-	return c
-}
-
-// WithSyncWrites enables or disables synchronous BadgerDB writes.
-func (c *BadgerDBConfig) WithSyncWrites(enabled bool) *BadgerDBConfig {
-	c.SyncWrites = enabled
-	return c
-}
-
-// WithCorruptedDatabaseRecovery enables or disables quarantining a database
-// that cannot be opened and recreating it.
-func (c *BadgerDBConfig) WithCorruptedDatabaseRecovery(enabled bool) *BadgerDBConfig {
-	c.RecoverCorruptedDatabase = enabled
-	return c
-}
-
-// WithCorruptedDatabaseRetention sets how long a quarantined database
-// directory is kept before startup removes it.
-func (c *BadgerDBConfig) WithCorruptedDatabaseRetention(value time.Duration) *BadgerDBConfig {
-	c.CorruptedDatabaseRetention = value
-	return c
-}
-
-// WithBackup configures periodic consistent metadata backups. An empty
-// directory disables them.
-func (c *BadgerDBConfig) WithBackup(directory string, interval time.Duration, retention time.Duration) *BadgerDBConfig {
-	c.BackupDirectory = directory
-	c.BackupInterval = interval
-	c.BackupRetention = retention
-	return c
-}
-
-// WithAutoRestoreFromBackup enables or disables restoring the newest backup
-// into a database that had to be quarantined.
-func (c *BadgerDBConfig) WithAutoRestoreFromBackup(enabled bool) *BadgerDBConfig {
-	c.AutoRestoreFromBackup = enabled
 	return c
 }
 

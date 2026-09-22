@@ -420,8 +420,10 @@ func TestReconcileQuotaCountsRepairsDrift(t *testing.T) {
 }
 
 // TestCorruptedDatabaseRecoveryIsOptIn covers the destructive repair path end to
-// end: a database that cannot be opened fails construction by default, and with
-// the option enabled it is quarantined, recreated, and usable.
+// end for the per-tenant SQLite layout: a tenant database that cannot be opened
+// fails the request that touches it by default, and with the option enabled it is
+// quarantined during startup validation and recreated, so the runtime keeps
+// serving that tenant.
 func TestCorruptedDatabaseRecoveryIsOptIn(t *testing.T) {
 	root := t.TempDir()
 	baseConfig := func() *config.Config {
@@ -436,52 +438,57 @@ func TestCorruptedDatabaseRecoveryIsOptIn(t *testing.T) {
 				WithShardingDepth(2))
 	}
 
-	// Create a healthy instance, then close it and damage its metadata database.
+	ctx := context.Background()
+
+	// Materialize the tenant database through the public API, then damage it.
 	first, err := venue.NewVenue(baseConfig())
 	if err != nil {
 		t.Fatalf("NewVenue() error = %v", err)
+	}
+	tenant := mustTenant(t, first, "tenant-1")
+	if _, err := first.StoragePool().WriteFile(ctx, tenant, strings.NewReader("payload"), nil); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
 	}
 	if err := first.Stop(); err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
 
-	metadataDatabaseDir := filepath.Join(root, "metadata", "shared", "metadata")
-	if _, err := os.Stat(metadataDatabaseDir); err != nil {
-		t.Fatalf("expected a metadata database at %s: %v", metadataDatabaseDir, err)
+	// SQLite keeps one database per tenant, so the damaged file is the tenant's
+	// own database rather than a shared store.
+	tenantDatabase := filepath.Join(root, "metadata", "tenant-1", "metadata.db")
+	if _, err := os.Stat(tenantDatabase); err != nil {
+		t.Fatalf("expected a tenant metadata database at %s: %v", tenantDatabase, err)
 	}
-	if err := os.WriteFile(filepath.Join(metadataDatabaseDir, "MANIFEST"), []byte("not a manifest"), 0o600); err != nil {
-		t.Fatalf("corrupt MANIFEST: %v", err)
+	if err := os.WriteFile(tenantDatabase, []byte("this is not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt the tenant database: %v", err)
 	}
 
-	// Default: recovery is off, so construction must fail loudly.
+	// Default: recovery is off, so startup fails loudly. Startup reconciliation
+	// reads every tenant's metadata, which opens the damaged database.
 	if _, err := venue.NewVenue(baseConfig()); err == nil {
 		t.Fatal("NewVenue() error = nil for a corrupted database with recovery disabled")
 	}
 
-	// Opt in: the database is quarantined and recreated.
+	// Opt in: startup validation quarantines the damaged file and recreates an
+	// empty database, and the tenant stays usable.
 	recoveryConfig := baseConfig()
-	recoveryConfig.BadgerDB.RecoverCorruptedDatabase = true
+	recoveryConfig.Sqlite.RecoverCorruptedDatabase = true
 	runtime, err := venue.NewVenue(recoveryConfig)
 	if err != nil {
 		t.Fatalf("NewVenue() with recovery enabled error = %v", err)
 	}
 	t.Cleanup(func() { _ = runtime.Stop() })
 
-	quarantined, err := filepath.Glob(metadataDatabaseDir + ".corrupted.*")
+	quarantined, err := filepath.Glob(tenantDatabase + ".corrupted.*")
 	if err != nil {
-		t.Fatalf("glob quarantine directories: %v", err)
+		t.Fatalf("glob quarantine files: %v", err)
 	}
 	if len(quarantined) == 0 {
-		t.Fatal("no quarantined database directory was created")
+		t.Fatal("no quarantined database file was created")
 	}
 
-	// The recreated database must be fully usable.
-	ctx := context.Background()
-	if err := runtime.TenantManager().CreateTenant(ctx, "tenant-1"); err != nil {
-		t.Fatalf("CreateTenant() error = %v", err)
-	}
-	tenant := mustTenant(t, runtime, "tenant-1")
-	if _, err := runtime.StoragePool().WriteFile(ctx, tenant, strings.NewReader("payload"), nil); err != nil {
+	recoveredTenant := mustTenant(t, runtime, "tenant-1")
+	if _, err := runtime.StoragePool().WriteFile(ctx, recoveredTenant, strings.NewReader("payload"), nil); err != nil {
 		t.Fatalf("WriteFile() after recovery error = %v", err)
 	}
 }

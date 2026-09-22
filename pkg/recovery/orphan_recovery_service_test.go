@@ -13,6 +13,7 @@ import (
 
 	"github.com/cocosip/venue/pkg/core"
 	"github.com/cocosip/venue/pkg/metadata"
+	"github.com/cocosip/venue/pkg/sqlite"
 )
 
 const testFileKey = "0123456789abcdef0123456789abcdef"
@@ -499,14 +500,26 @@ func (failingRepository) GetTimedOutProcessingFiles(context.Context, string, tim
 func (failingRepository) Optimize(context.Context) error { return nil }
 func (failingRepository) Close() error                   { return nil }
 
-func newTestRepository(t *testing.T, root string) core.MetadataRepository {
+// newTestRepository builds a SQLite metadata repository inside a temporary
+// directory of its own, so its tenant database
+// ({DataPath}/{tenantId}/metadata.db) never falls inside the volume tree a test
+// scans. The caller's root is deliberately unused: that tree is the only thing
+// the orphan scan walks, and a database left inside it would be recovered as an
+// orphaned file.
+func newTestRepository(t *testing.T, _ string) core.MetadataRepository {
 	t.Helper()
-	repo, err := metadata.NewBadgerMetadataRepository(&metadata.BadgerRepositoryOptions{
-		TenantID: "shared",
-		DataPath: filepath.Join(root, "metadata"),
+
+	// Declared first so it is registered first: t.Cleanup runs in reverse
+	// registration order, which closes the repository before the directory is
+	// removed.
+	metadataRoot := t.TempDir()
+
+	repo, err := metadata.NewSQLiteMetadataRepository(&metadata.SQLiteRepositoryOptions{
+		DataPath: metadataRoot,
+		Sqlite:   sqlite.DefaultOptions(),
 	})
 	if err != nil {
-		t.Fatalf("NewBadgerMetadataRepository() error = %v", err)
+		t.Fatalf("NewSQLiteMetadataRepository() error = %v", err)
 	}
 	t.Cleanup(func() {
 		if err := repo.Close(); err != nil {

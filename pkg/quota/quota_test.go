@@ -3,149 +3,39 @@ package quota
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/sqlite"
 )
 
-// TestDirectoryQuotaRepository tests the directory quota repository.
-func TestDirectoryQuotaRepository(t *testing.T) {
-	ctx := context.Background()
-	const tenantID = "tenant1"
+// newQuotaManagerRepository opens the SQLite directory-quota repository the
+// manager tests drive, in a temporary directory that outlives the repository.
+//
+// t.Cleanup runs in LIFO order, so t.TempDir() is called first and the
+// repository is closed before the directory it owns is removed.
+func newQuotaManagerRepository(t *testing.T) core.DirectoryQuotaRepository {
+	t.Helper()
 
-	tmpDir, err := os.MkdirTemp("", "quota-test-*")
+	repository, err := NewSQLiteDirectoryQuotaRepository(&SQLiteDirectoryQuotaRepositoryOptions{
+		DataPath: t.TempDir(),
+		Sqlite:   sqlite.DefaultOptions(),
+	})
 	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
+		t.Fatalf("NewSQLiteDirectoryQuotaRepository() error = %v", err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	t.Cleanup(func() { _ = repository.Close() })
 
-	opts := &BadgerDirectoryQuotaRepositoryOptions{
-		DataPath:       tmpDir,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
-	}
-
-	repo, err := NewBadgerDirectoryQuotaRepository(opts)
-	if err != nil {
-		t.Fatalf("Failed to create repository: %v", err)
-	}
-
-	t.Run("GetOrCreate creates default quota", func(t *testing.T) {
-		quota, err := repo.GetOrCreate(ctx, tenantID, "/path/to/dir")
-		if err != nil {
-			t.Fatalf("Expected no error, got %v", err)
-		}
-
-		if quota.DirectoryPath != "/path/to/dir" {
-			t.Errorf("Expected path '/path/to/dir', got %s", quota.DirectoryPath)
-		}
-
-		if quota.CurrentCount != 0 {
-			t.Errorf("Expected count 0, got %d", quota.CurrentCount)
-		}
-
-		if quota.MaxCount != 0 {
-			t.Errorf("Expected max count 0 (unlimited), got %d", quota.MaxCount)
-		}
-
-		if quota.Enabled {
-			t.Error("Expected quota to be disabled by default")
-		}
-	})
-
-	t.Run("GetOrCreate retrieves existing quota", func(t *testing.T) {
-		// Get same quota again
-		quota2, err := repo.GetOrCreate(ctx, tenantID, "/path/to/dir")
-		if err != nil {
-			t.Fatalf("Expected no error, got %v", err)
-		}
-
-		if quota2.DirectoryPath != "/path/to/dir" {
-			t.Errorf("Expected same path, got %s", quota2.DirectoryPath)
-		}
-	})
-
-	t.Run("Update quota", func(t *testing.T) {
-		quota, _ := repo.GetOrCreate(ctx, tenantID, "/path/to/update")
-		quota.MaxCount = 100
-		quota.Enabled = true
-
-		err := repo.Update(ctx, tenantID, quota)
-		if err != nil {
-			t.Fatalf("Expected no error, got %v", err)
-		}
-
-		// Verify update
-		updated, _ := repo.GetOrCreate(ctx, tenantID, "/path/to/update")
-		if updated.MaxCount != 100 {
-			t.Errorf("Expected max count 100, got %d", updated.MaxCount)
-		}
-
-		if !updated.Enabled {
-			t.Error("Expected quota to be enabled")
-		}
-	})
-
-	t.Run("IncrementCount", func(t *testing.T) {
-		// Get initial quota
-		quota, _ := repo.GetOrCreate(ctx, tenantID, "/path/to/increment")
-		initialCount := quota.CurrentCount
-
-		// Increment
-		err := repo.IncrementCount(ctx, tenantID, "/path/to/increment")
-		if err != nil {
-			t.Fatalf("Expected no error, got %v", err)
-		}
-
-		// Verify increment
-		updated, _ := repo.GetOrCreate(ctx, tenantID, "/path/to/increment")
-		if updated.CurrentCount != initialCount+1 {
-			t.Errorf("Expected count %d, got %d", initialCount+1, updated.CurrentCount)
-		}
-	})
-
-	t.Run("DecrementCount", func(t *testing.T) {
-		// Setup: increment first
-		_ = repo.IncrementCount(ctx, tenantID, "/path/to/decrement")
-		_ = repo.IncrementCount(ctx, tenantID, "/path/to/decrement")
-
-		quota, _ := repo.GetOrCreate(ctx, tenantID, "/path/to/decrement")
-		initialCount := quota.CurrentCount
-
-		// Decrement
-		err := repo.DecrementCount(ctx, tenantID, "/path/to/decrement")
-		if err != nil {
-			t.Fatalf("Expected no error, got %v", err)
-		}
-
-		// Verify decrement
-		updated, _ := repo.GetOrCreate(ctx, tenantID, "/path/to/decrement")
-		if updated.CurrentCount != initialCount-1 {
-			t.Errorf("Expected count %d, got %d", initialCount-1, updated.CurrentCount)
-		}
-	})
+	return repository
 }
 
-// TestDirectoryQuotaManager tests the directory quota manager.
+// TestDirectoryQuotaManager tests the directory quota manager against the SQLite
+// directory-quota repository it backs at runtime.
 func TestDirectoryQuotaManager(t *testing.T) {
 	ctx := context.Background()
 
-	tmpDir, err := os.MkdirTemp("", "quota-mgr-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	opts := &BadgerDirectoryQuotaRepositoryOptions{
-		DataPath:       tmpDir,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
-	}
-
-	repo, _ := NewBadgerDirectoryQuotaRepository(opts)
+	repo := newQuotaManagerRepository(t)
 	manager, err := NewDirectoryQuotaManager(repo)
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)

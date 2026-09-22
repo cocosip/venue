@@ -13,6 +13,7 @@ import (
 	"github.com/cocosip/venue/pkg/pool"
 	"github.com/cocosip/venue/pkg/quota"
 	"github.com/cocosip/venue/pkg/scheduler"
+	"github.com/cocosip/venue/pkg/sqlite"
 	"github.com/cocosip/venue/pkg/tenant"
 	"github.com/cocosip/venue/pkg/volume"
 )
@@ -484,15 +485,14 @@ func setupFullSystem(t *testing.T) *System {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	metaOpts := &metadata.BadgerRepositoryOptions{
-		TenantID:       "test-tenant",
-		DataPath:       tmpDir1,
-		CacheTTL:       5 * time.Minute,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
+	metaOpts := &metadata.SQLiteRepositoryOptions{
+		DataPath:        tmpDir1,
+		CacheTTL:        5 * time.Minute,
+		MaxCacheEntries: 10000,
+		Sqlite:          sqlite.DefaultOptions(),
 	}
 
-	metadataRepo, err := metadata.NewBadgerMetadataRepository(metaOpts)
+	metadataRepo, err := metadata.NewSQLiteMetadataRepository(metaOpts)
 	if err != nil {
 		_ = os.RemoveAll(tmpDir1)
 		t.Fatalf("Failed to create metadata repository: %v", err)
@@ -531,13 +531,13 @@ func setupFullSystem(t *testing.T) *System {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	dirQuotaOpts := &quota.BadgerDirectoryQuotaRepositoryOptions{
-		DataPath:       tmpDir3,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
+	dirQuotaOpts := &quota.SQLiteDirectoryQuotaRepositoryOptions{
+		DataPath:         tmpDir3,
+		Sqlite:           sqlite.DefaultOptions(),
+		MaxOpenDatabases: 0,
 	}
 
-	dirQuotaRepo, err := quota.NewBadgerDirectoryQuotaRepository(dirQuotaOpts)
+	dirQuotaRepo, err := quota.NewSQLiteDirectoryQuotaRepository(dirQuotaOpts)
 	if err != nil {
 		_ = os.RemoveAll(tmpDir1)
 		_ = os.RemoveAll(tmpDir2)

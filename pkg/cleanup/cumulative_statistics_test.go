@@ -34,11 +34,11 @@ func TestCumulativeStatistics_AccumulatesAcrossOperations(t *testing.T) {
 		t.Fatalf("CleanupJunkFiles() error = %v", err)
 	}
 
-	// Quarantine sweep: one 32-byte expired directory.
+	// Quarantine sweep: one 32-byte expired quarantined database file.
 	writeAgedQuarantine(
 		t,
-		filepath.Join(metadataRoot, "shared", "metadata.corrupted.20200101T000000Z"),
-		[]int{32},
+		filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200101T000000Z"),
+		32,
 		time.Now().Add(-10*time.Hour),
 	)
 	if _, err := service.CleanupInvalidDatabaseBackups(ctx); err != nil {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -19,8 +18,7 @@ func TestIntegration_CompleteWorkflow(t *testing.T) {
 
 	// Setup components
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -103,8 +101,7 @@ func TestIntegration_FailedFileRetry(t *testing.T) {
 
 	// Setup components with custom retry policy
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -180,8 +177,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 
 	// Setup components
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -236,8 +232,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 
 	// Setup components
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -321,8 +316,7 @@ func TestIntegration_MultiTenantIsolation(t *testing.T) {
 
 	// Setup components
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -384,8 +378,7 @@ func TestIntegration_PathGeneration(t *testing.T) {
 	ctx := context.Background()
 
 	tenantMgr := &mockTenantManager{}
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)

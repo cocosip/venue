@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
-	badger "github.com/dgraph-io/badger/v4"
 )
 
 // TestIntegration_FileLifecycle tests the complete lifecycle of a file.
@@ -169,7 +168,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 				location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
 				if err != nil {
 					if isTransientClaimError(err) {
-						// Another worker (or BadgerDB) won this round; retry.
+						// Another worker won this round; retry.
 						continue
 					}
 					t.Errorf("Worker %d: Unexpected error: %v", id, err)
@@ -431,11 +430,9 @@ func requireProcessingLease(t *testing.T, location *core.FileLocation) core.File
 }
 
 // isTransientClaimError reports whether err is contention that a worker should
-// retry: another worker won the claim race (core.ErrFileNotClaimable), the
-// candidate disappeared (core.ErrFileNotFound), or BadgerDB rejected an
-// optimistic transaction (badger.ErrConflict).
+// retry: another worker won the claim race (core.ErrFileNotClaimable) or the
+// candidate disappeared (core.ErrFileNotFound).
 func isTransientClaimError(err error) bool {
 	return errors.Is(err, core.ErrFileNotClaimable) ||
-		errors.Is(err, core.ErrFileNotFound) ||
-		errors.Is(err, badger.ErrConflict)
+		errors.Is(err, core.ErrFileNotFound)
 }

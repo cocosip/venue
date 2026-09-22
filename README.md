@@ -156,8 +156,8 @@ The configuration lifecycle is:
 
 | Go field | JSON/YAML/Viper key | Purpose |
 | --- | --- | --- |
-| `MetadataDirectory` | `metadataDirectory` | BadgerDB file metadata root |
-| `QuotaDirectory` | `quotaDirectory` | Directory-quota database root |
+| `MetadataDirectory` | `metadataDirectory` | Per-tenant SQLite metadata database root |
+| `QuotaDirectory` | `quotaDirectory` | Per-tenant SQLite directory-quota database root |
 | `FileWatcherConfigurationDirectory` | `fileWatcherConfigurationDirectory` | Watcher runtime state root: imported-file history and enable/disable state |
 | `AutoCreateTenants` | `autoCreateTenants` | Allow unknown tenants to be created on demand |
 | `DefaultTenantQuota` | `defaultTenantQuota` | Default maximum file count; `0` is unlimited |
@@ -166,7 +166,7 @@ The configuration lifecycle is:
 | `RetryPolicy` | `retryPolicy` | Retry count, delay, and backoff behavior |
 | `TenantManager` | `tenantManagerOptions` | Tenant metadata path and cache TTL |
 | `Metadata` | `metadataOptions` | Active metadata cache settings |
-| `BadgerDB` | `badgerDBOptions` | BadgerDB GC, cache, sizing, and sync-write settings |
+| `Sqlite` | `sqliteOptions` | SQLite journal, synchronous, cache, handle, recovery, and backup settings |
 | `Volumes` | `volumes` | Storage volumes available for writes |
 | `Tenants` | `tenants` | Statically configured tenants |
 | `FileWatchers` | `fileWatchers` | Directory import watchers |
@@ -198,7 +198,7 @@ Each configuration module has its own constructor and chainable methods:
 | `RetryPolicyConfig` | `config.NewRetryPolicyConfig()` | Retry count and backoff |
 | `TenantManagerConfig` | `config.NewTenantManagerConfig()` | Tenant metadata and cache |
 | `MetadataConfig` | `config.NewMetadataConfig()` | Active metadata cache |
-| `BadgerDBConfig` | `config.NewBadgerDBConfig()` | BadgerDB sizing, GC, and sync writes |
+| `SqliteConfig` | `config.NewSqliteConfig()` | SQLite journal, synchronous, cache, and backup settings |
 | `FileWatcherConfig` | `config.NewFileWatcherConfig()` | Watched-directory imports |
 | `FileWatcherRootConfig` | `config.NewFileWatcherRootConfig(path)` | Per-tenant watcher derivation from a root |
 | `FileWatcherServiceConfig` | `config.NewFileWatcherServiceConfig()` | Global watcher service options |
@@ -236,19 +236,23 @@ The important runtime defaults are:
 | Tenant cache TTL | `5m` |
 | Metadata cache TTL | `5m` |
 | Maximum metadata cache entries | `10,000` |
-| BadgerDB GC interval | `10m` |
-| BadgerDB GC discard ratio | `0.5` |
-| BadgerDB memtable size | `32 MiB` |
-| BadgerDB value-log file size | `64 MiB` |
-| BadgerDB block cache size | `64 MiB` |
-| BadgerDB synchronous writes | disabled |
+| SQLite journal mode | `WAL` |
+| SQLite synchronous mode | `NORMAL` |
+| SQLite page cache | `-4000` (4,000 KiB, one cache per tenant connection) |
+| SQLite busy timeout | `5000` (`5s`) |
+| SQLite WAL checkpoint after batch | disabled |
+| SQLite connections per tenant | `1` |
+| Simultaneously open tenant databases | unlimited (`0`); handles live until `Stop` |
+| Idle tenant database timeout | `0` (handles are never reclaimed) |
+| SQLite backup integrity verification | enabled (`skipBackupVerification: false`) |
+| VACUUM of idle tenant databases | disabled |
 | Default volume sharding depth | `2` |
 | Default volume fsync | enabled |
 | Background cleanup | enabled |
 | Cleanup interval | `1h` |
 | Processing timeout | `30m` |
 | Timed-out reclaim on empty queue | enabled (`30s` per-tenant cooldown) |
-| Corrupted database recovery | disabled (`72h` quarantine retention) |
+| Corrupted database recovery | disabled (quarantined tenant database files are kept `72h`) |
 | Volume health probe cache | `30s` |
 | Volume startup initial delay | `2s` (applied before the first retry only) |
 | Volume startup health-check delay | `500ms` between attempts |
@@ -264,8 +268,8 @@ The important runtime defaults are:
 | Orphan-file recovery | disabled (`6h` interval, `10s` initial delay when enabled) |
 | Empty-queue timed-out reclaim batch | `32` |
 | Background timed-out reclaim | enabled (`8` per pass) |
-| Metadata backup runner | disabled (empty `backupDirectory`); `1h` interval and `168h` retention when enabled |
-| Automatic restore from backup | disabled |
+| Metadata backup runner | disabled (empty `backupDirectory`); `1h` interval and `168h` retention per tenant when enabled |
+| Automatic restore from backup | disabled (per tenant; requires recovery and a backup directory) |
 | Fail-fast on unrecoverable startup recovery | disabled (degraded state is reported and startup continues) |
 | Runtime statistics | disabled (`5m` window, `1h` retention, `16,384` max series) |
 | Statistics dimensions | `volume_id`, `watcher_id`, `operation` retained; `tenant_id` dropped |
@@ -340,8 +344,8 @@ background services, and stop it during application shutdown:
 
 `NewVenue` opens the metadata and quota repositories, so `Stop` owns releasing
 them. `Stop` is idempotent and safe in a deferred shutdown path: calling it
-without `Start` still closes the repositories and releases the BadgerDB locks,
-and calling it repeatedly returns `nil`. After `Stop`, the synchronous
+without `Start` still closes the repositories and releases the per-tenant SQLite
+handles, and calling it repeatedly returns `nil`. After `Stop`, the synchronous
 accessors must not be used, and a stopped runtime cannot be restarted — create a
 new instance instead. The caller owns any logging handler and writer configured
 on the instance.
@@ -505,8 +509,8 @@ behaviour.
   default `Keep` disposition skips their records as before; `PurgeMetadataOnly`
   removes the metadata and quota rows without touching physical storage.
 - `Cleanup.CleanupInvalidDatabaseBackups` (default `true`) removes quarantined
-  database directories (`<db>.corrupted.<stamp>`) whose
-  `BadgerDB.CorruptedDatabaseRetention` has elapsed. `NewVenue` also prunes them
+  database files (`<db>.corrupted.<stamp>`) whose
+  `Sqlite.CorruptedDatabaseRetention` has elapsed. `NewVenue` also prunes them
   during startup.
 - `Venue.CleanupService().CumulativeStatistics()` reports process-lifetime
   cleanup totals (monotonic counters), in addition to the per-call statistics
@@ -793,7 +797,7 @@ Metadata backups are opt-in and need an operator-owned directory:
 
 ```yaml
 venue:
-  badgerDBOptions:
+  sqliteOptions:
     backupDirectory: ./venue-backups
     backupInterval: 1h
     backupRetention: 168h
@@ -801,14 +805,17 @@ venue:
 ```
 
 With `backupDirectory` set and a positive `backupInterval`, the runtime starts a
-backup runner with the other background services and writes consistent online
-backups named `metadata.<yyyyMMddTHHmmssZ>.bak`; the run does not stop the queue
-or block writers. `backupRetention` (default `168h`; `0` disables pruning)
-removes backups older than the window on the next cycle, and
-`autoRestoreFromBackup` restores the newest valid backup into a metadata database
-that had to be quarantined instead of leaving it empty. `autoRestoreFromBackup`
-requires `recoverCorruptedDatabase: true` and a non-empty `backupDirectory`, and
-the restored state is only as new as the newest backup.
+backup runner with the other background services and writes one consistent
+online backup per tenant into that tenant's own directory, named
+`{backupDirectory}/{tenantId}/metadata.<yyyyMMddTHHmmssZ>.bak`; the run does not
+stop the queue or block writers. `backupRetention` (default `168h`; `0` disables
+pruning) removes backups older than the window per tenant directory on the next
+cycle, and `autoRestoreFromBackup` restores the newest readable backup of a
+tenant whose database had to be quarantined instead of leaving it empty.
+`autoRestoreFromBackup` requires `recoverCorruptedDatabase: true` and a
+non-empty `backupDirectory`, and the restored state is only as new as the newest
+backup. Every produced backup is checked with `PRAGMA integrity_check(1)` before
+it is accepted unless `skipBackupVerification: true` turns that check off.
 
 - `Venue.BackupMetadata(ctx, w)` writes one ad-hoc backup stream to `w` and
   returns the engine sequence number it was taken at.
@@ -855,34 +862,36 @@ Both delays are validated as non-negative. They are `time.Duration` fields on
 `VolumeConfig`, so set them by direct assignment or in the configuration file
 (there is no fluent setter for them).
 
-`DatabaseHealthChecker` verifies the real metadata and quota database
-directories (`<metadataDirectory>/shared/metadata` and
-`<quotaDirectory>/quota`) with a cross-platform structural check — the directory
-must exist and contain a readable `MANIFEST` plus its value log/key registry.
-It never opens a live database read-only, which is unsupported on Windows and
-would conflict with Venue's own lock on other platforms. A missing directory is
-reported as "no database yet" for a fresh deployment, not as corruption.
+`DatabaseHealthChecker` verifies the real metadata and quota databases with a
+cross-platform structural check of each tenant's
+(`<metadataDirectory>/<tenantId>/metadata.db` and
+`<quotaDirectory>/<tenantId>/quotas.db`): the file must exist and start with the
+readable `SQLite format 3` header. It never opens a live database read-only,
+which is unsupported on Windows and would conflict with Venue's own lock on
+other platforms. A missing file is reported as "no database yet" for a fresh
+deployment, not as corruption.
 
 The health check is diagnostic only: it never repairs a database. For that,
-`BadgerDB.RecoverCorruptedDatabase` (default `false`) makes startup quarantine a
-database directory that cannot be opened, recreate an empty one, and continue;
-the quarantined directory is kept for `BadgerDB.CorruptedDatabaseRetention`
-(default `72h`) and then removed during startup. This is a **destructive repair**
-— the quarantined data is not re-imported, so enable it only when an operator can
-restore from the backup, or when failing to start is the worse outcome. A
-directory that is unreachable because another process holds its lock is never
-quarantined.
+`Sqlite.RecoverCorruptedDatabase` (default `false`) makes the repository
+quarantine a per-tenant database file that cannot be opened, recreate an empty
+one, and continue; the quarantined file is kept for
+`Sqlite.CorruptedDatabaseRetention` (default `72h`) and then removed during
+startup. This is a **destructive repair** — the quarantined data is not
+re-imported, so enable it only when an operator can restore from the backup, or
+when failing to start is the worse outcome. A file that is unreachable because
+another process holds its lock, or because of a permission failure, is never
+treated as corruption and is never quarantined.
 
 ## Locus Alignment and Intentional Divergences
 
 Venue is a Go implementation of the Locus file-queue behaviour. The queue
 contract, status values, retry arithmetic, quota-counting semantics, path
-safety, and lease handling follow Locus `v2.0.0`. The following differences are
+safety, lease handling, and the storage engine follow Locus `v2.0.0`: one
+SQLite database file per tenant below the metadata and quota roots
+(`{metadataDirectory}/{tenantId}/metadata.db` and
+`{quotaDirectory}/{tenantId}/quotas.db`). The following differences are
 deliberate and are part of the supported behaviour:
 
-- **Storage engine**: Venue uses one shared BadgerDB metadata store with
-  `(tenantID, fileKey)` keys instead of one SQLite database per tenant. All
-  keys, indexes, and caches stay tenant-scoped.
 - **Configuration model**: `config.Config` is public, source-independent, and
   has no configuration-file dependency; the optional Viper adapter lives in
   `viperconfig`. Locus binds `IConfiguration`.
@@ -913,8 +922,8 @@ deliberate and are part of the supported behaviour:
   requires two consecutive healthy probes. `volumes[].warmupOnStartup` performs
   one advisory throwaway write through the real write path.
 - **Metadata recoverability is backup-based.** Locus rebuilds from its per-event
-  queue journal; Venue writes opt-in consistent Badger backups
-  (`badgerDBOptions.backupDirectory`, `backupInterval` default `1h`,
+  queue journal; Venue writes opt-in consistent per-tenant SQLite backups
+  (`sqliteOptions.backupDirectory`, `backupInterval` default `1h`,
   `backupRetention` default `168h`) and restores them offline. A restore is
   therefore only as new as the newest backup, and
   `FailFastOnStartupRecoveryFailure` (default `false`) decides whether an
@@ -931,8 +940,8 @@ Not implemented (out of scope for this project, listed for completeness):
 
 - The durable per-tenant `queue.log` journal with projections, snapshots, and
   compaction, together with the queue-projection observability surface built on
-  it (lag, snapshot, gap, and corrupt-tail diagnostics). Venue's metadata is a
-  shared BadgerDB store with synchronous transactions, so queue state cannot be
+  it (lag, snapshot, gap, and corrupt-tail diagnostics). Venue's metadata is one
+  SQLite database per tenant with transactional writes, so queue state cannot be
   replayed event by event; `docs/locus-feature-gaps.md` records the recovery
   guarantee this affects and the mitigation that is in place.
 - The Locus quota projection/compensation managers. Venue rebuilds tenant and
@@ -952,7 +961,12 @@ capabilities. See `docs/locus-feature-gaps.md` for the tracked remainder.
 
 ## Build and Verification
 
+The SQLite driver is pure Go, so the runtime builds and runs without cgo. A
+`CGO_ENABLED=0` build is a required gate, not an optional matrix entry: a
+cgo-only dependency or build tag must fail here rather than at a deployment.
+
 ```powershell
+$env:CGO_ENABLED='0'; go build ./...
 go build ./...
 go test ./...
 go test -race ./...
@@ -1027,7 +1041,7 @@ implementation, not a cross-machine performance guarantee.
 config/              Public source-independent configuration model
 viperconfig/         Optional Viper adapter
 pkg/core/            Interfaces, models, statuses, and domain errors
-pkg/metadata/        BadgerDB metadata and active-data cache
+pkg/metadata/        SQLite metadata repositories and active-data cache
 pkg/pool/            Storage-pool facade
 pkg/scheduler/       Queue scheduling and retries
 pkg/tenant/          Tenant management

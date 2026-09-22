@@ -28,17 +28,17 @@ func newStartupTestConfig(root string) *config.Config {
 			WithShardingDepth(2))
 }
 
-// corruptMetadataDatabase damages the manifest of the shared metadata database so
-// the next open must quarantine it.
-func corruptMetadataDatabase(t *testing.T, root string) {
+// corruptTenantDatabase damages one tenant's SQLite metadata file so the next
+// open must quarantine it.
+func corruptTenantDatabase(t *testing.T, root string, tenantID string) {
 	t.Helper()
 
-	metadataDatabaseDir := filepath.Join(root, "metadata", "shared", "metadata")
-	if _, err := os.Stat(metadataDatabaseDir); err != nil {
-		t.Fatalf("expected a metadata database at %s: %v", metadataDatabaseDir, err)
+	tenantDatabase := filepath.Join(root, "metadata", tenantID, "metadata.db")
+	if _, err := os.Stat(tenantDatabase); err != nil {
+		t.Fatalf("expected a tenant metadata database at %s: %v", tenantDatabase, err)
 	}
-	if err := os.WriteFile(filepath.Join(metadataDatabaseDir, "MANIFEST"), []byte("not a manifest"), 0o600); err != nil {
-		t.Fatalf("corrupt MANIFEST: %v", err)
+	if err := os.WriteFile(tenantDatabase, []byte("this is not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt the tenant database: %v", err)
 	}
 }
 
@@ -47,18 +47,23 @@ func corruptMetadataDatabase(t *testing.T, root string) {
 // for fail-fast behaviour, and is otherwise reported as a degraded runtime.
 func TestFailFastOnStartupRecoveryFailureThroughVenue(t *testing.T) {
 	root := t.TempDir()
+	ctx := context.Background()
 
+	// Materialize the tenant database, then damage it.
 	first, err := venue.NewVenue(newStartupTestConfig(root))
 	if err != nil {
 		t.Fatalf("NewVenue() error = %v", err)
 	}
+	if _, err := first.StoragePool().WriteFile(ctx, mustTenant(t, first, "recovery-tenant"), strings.NewReader("payload"), nil); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
 	if err := first.Stop(); err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
-	corruptMetadataDatabase(t, root)
+	corruptTenantDatabase(t, root, "recovery-tenant")
 
 	degradedConfig := newStartupTestConfig(root)
-	degradedConfig.BadgerDB.RecoverCorruptedDatabase = true
+	degradedConfig.Sqlite.RecoverCorruptedDatabase = true
 	degradedConfig.FailFastOnStartupRecoveryFailure = false
 
 	degraded, err := venue.NewVenue(degradedConfig)
@@ -72,12 +77,12 @@ func TestFailFastOnStartupRecoveryFailureThroughVenue(t *testing.T) {
 		t.Error("IsRunning() = true after Stop")
 	}
 
-	// A second corruption is still present in the quarantined copy, so the
-	// fail-fast configuration must refuse to start on the same fixture.
-	corruptMetadataDatabase(t, root)
+	// The degraded start recreated an empty database; damage it again so the
+	// fail-fast configuration has to refuse to start.
+	corruptTenantDatabase(t, root, "recovery-tenant")
 
 	failFastConfig := newStartupTestConfig(root)
-	failFastConfig.BadgerDB.RecoverCorruptedDatabase = true
+	failFastConfig.Sqlite.RecoverCorruptedDatabase = true
 	failFastConfig.FailFastOnStartupRecoveryFailure = true
 
 	if _, err := venue.NewVenue(failFastConfig); !errors.Is(err, core.ErrDatabaseError) {
@@ -94,9 +99,9 @@ func TestFailFastDoesNotTriggerWhenABackupWasRestored(t *testing.T) {
 	backupDir := filepath.Join(root, "backups")
 
 	backupConfig := newStartupTestConfig(root)
-	backupConfig.BadgerDB.BackupDirectory = backupDir
-	backupConfig.BadgerDB.BackupInterval = time.Hour
-	backupConfig.BadgerDB.BackupRetention = 24 * time.Hour
+	backupConfig.Sqlite.BackupDirectory = backupDir
+	backupConfig.Sqlite.BackupInterval = time.Hour
+	backupConfig.Sqlite.BackupRetention = 24 * time.Hour
 
 	first, err := venue.NewVenue(backupConfig)
 	if err != nil {
@@ -118,14 +123,14 @@ func TestFailFastDoesNotTriggerWhenABackupWasRestored(t *testing.T) {
 		t.Fatalf("Stop() error = %v", err)
 	}
 
-	corruptMetadataDatabase(t, root)
+	corruptTenantDatabase(t, root, "recovery-tenant")
 
 	restoreConfig := newStartupTestConfig(root)
-	restoreConfig.BadgerDB.BackupDirectory = backupDir
-	restoreConfig.BadgerDB.BackupInterval = time.Hour
-	restoreConfig.BadgerDB.BackupRetention = 24 * time.Hour
-	restoreConfig.BadgerDB.RecoverCorruptedDatabase = true
-	restoreConfig.BadgerDB.AutoRestoreFromBackup = true
+	restoreConfig.Sqlite.BackupDirectory = backupDir
+	restoreConfig.Sqlite.BackupInterval = time.Hour
+	restoreConfig.Sqlite.BackupRetention = 24 * time.Hour
+	restoreConfig.Sqlite.RecoverCorruptedDatabase = true
+	restoreConfig.Sqlite.AutoRestoreFromBackup = true
 	restoreConfig.FailFastOnStartupRecoveryFailure = true
 
 	restored, err := venue.NewVenue(restoreConfig)

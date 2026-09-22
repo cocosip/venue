@@ -2,7 +2,9 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,40 +14,55 @@ import (
 	"github.com/cocosip/venue/pkg/logging"
 )
 
-// metadataSharedDirectoryName is the shared (tenant-independent) metadata
-// directory below the configured metadata root. The real BadgerDB lives one
-// level deeper, in metadataDatabaseDirectoryName.
-const metadataSharedDirectoryName = "shared"
+// metadataDatabaseFileName is the per-tenant SQLite metadata database file
+// below the metadata root: {metadataDirectory}/{tenantId}/metadata.db.
+const metadataDatabaseFileName = "metadata.db"
 
-// metadataDatabaseDirectoryName is the BadgerDB directory name used by the
-// metadata repository below its data path.
-const metadataDatabaseDirectoryName = "metadata"
+// directoryQuotaDatabaseFileName is the per-tenant SQLite directory quota
+// database file below the quota root: {quotaDirectory}/{tenantId}/quotas.db.
+const directoryQuotaDatabaseFileName = "quotas.db"
 
-// directoryQuotaDatabaseDirectoryName is the BadgerDB directory name used by
-// the directory quota repository below its data path.
-const directoryQuotaDatabaseDirectoryName = "quota"
+// sqliteHeader is the 16-byte magic string every SQLite database file starts
+// with ("SQLite format 3" followed by a NUL terminator).
+const sqliteHeader = "SQLite format 3\x00"
+
+// minimumSQLiteFileSize is the SQLite file size floor used by the structural
+// check: the 100-byte database header page, i.e. the header plus at least one
+// complete page of database content. A database can never be smaller.
+const minimumSQLiteFileSize = 100
 
 // DatabaseHealthCheckerOptions configures the database health checker.
 type DatabaseHealthCheckerOptions struct {
-	// MetadataDatabasePath is the real BadgerDB directory that stores the shared
-	// metadata projection, conventionally "<MetadataDirectory>/shared/metadata".
-	// When empty it is derived from MetadataDataPath as
-	// filepath.Join(MetadataDataPath, "shared", "metadata").
+	// MetadataDatabasePath is accepted for backward compatibility and ignored.
+	//
+	// It used to name the single shared BadgerDB metadata directory
+	// ("<MetadataDirectory>/shared/metadata"). The SQLite layout has no shared
+	// metadata database: every tenant owns
+	// "{MetadataDataPath}/{tenantId}/metadata.db", and the caller has no way to
+	// know the tenant set up front, so a single database path cannot describe
+	// the layout. Setting the field is not an error; it has no effect.
 	MetadataDatabasePath string
 
-	// DirectoryQuotaDatabasePath is the real BadgerDB directory that stores the
-	// directory quota projection, conventionally "<QuotaDirectory>/quota".
-	// When empty it is derived from DirectoryQuotaDataPath as
-	// filepath.Join(DirectoryQuotaDataPath, "quota").
+	// DirectoryQuotaDatabasePath is accepted for backward compatibility and
+	// ignored.
+	//
+	// It used to name the directory quota BadgerDB directory
+	// ("<QuotaDirectory>/quota"). The SQLite layout stores one
+	// "{DirectoryQuotaDataPath}/{tenantId}/quotas.db" per tenant, so a single
+	// database path cannot describe the layout. Setting the field is not an
+	// error; it has no effect.
 	DirectoryQuotaDatabasePath string
 
-	// MetadataDataPath is the root path for metadata databases. It is the
-	// legacy fallback for MetadataDatabasePath and is also used to enumerate
-	// tenant IDs for orphan detection.
+	// MetadataDataPath is the metadata root that holds the per-tenant metadata
+	// databases, conventionally config.Config.MetadataDirectory. The checker
+	// derives "{MetadataDataPath}/{tenantId}/metadata.db" from it for every
+	// tenant that has physical metadata storage.
 	MetadataDataPath string
 
-	// DirectoryQuotaDataPath is the legacy root path for the directory quota
-	// database. It is the fallback for DirectoryQuotaDatabasePath.
+	// DirectoryQuotaDataPath is the directory quota root that holds the
+	// per-tenant quota databases, conventionally config.Config.QuotaDirectory.
+	// The checker derives "{DirectoryQuotaDataPath}/{tenantId}/quotas.db" from
+	// it. When empty, directory quota databases are not checked.
 	DirectoryQuotaDataPath string
 
 	// VolumePaths are the storage volume paths to check for orphaned files.
@@ -57,40 +74,32 @@ type DatabaseHealthCheckerOptions struct {
 
 // databaseHealthChecker implements the core.DatabaseHealthChecker interface.
 //
-// The checker is deliberately non-invasive: it never opens a BadgerDB handle,
-// so it can run while the process holds the live database locks. Corruption
-// detection is structural (see checkBadgerStructure).
+// The checker is deliberately non-invasive: it never opens a SQLite database,
+// so it can run while the process holds the live database handles and it never
+// touches WAL locks. Corruption detection is structural (see checkSQLiteFile).
 type databaseHealthChecker struct {
-	metadataDatabasePath       string
-	directoryQuotaDatabasePath string
-	metadataDataPath           string
-	directoryQuotaDataPath     string
-	volumePaths                []string
-	logger                     *logging.Runtime
+	metadataDataPath       string
+	directoryQuotaDataPath string
+	volumePaths            []string
+	logger                 *logging.Runtime
 }
 
 // NewDatabaseHealthChecker creates a new database health checker.
 //
-// Either the explicit badger database paths (MetadataDatabasePath /
-// DirectoryQuotaDatabasePath) or their legacy roots (MetadataDataPath /
-// DirectoryQuotaDataPath) must identify a metadata database; otherwise
-// core.ErrInvalidArgument is returned.
+// MetadataDataPath must name the metadata root (or, for compatibility, the
+// ignored MetadataDatabasePath must be non-empty); otherwise
+// core.ErrInvalidArgument is returned. DirectoryQuotaDataPath is optional and
+// disables directory quota checks when empty.
+//
+// MetadataDatabasePath and DirectoryQuotaDatabasePath are accepted and ignored;
+// see DatabaseHealthCheckerOptions.
 func NewDatabaseHealthChecker(opts *DatabaseHealthCheckerOptions) (core.DatabaseHealthChecker, error) {
 	if opts == nil {
 		return nil, fmt.Errorf("options cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
-	metadataDatabasePath := opts.MetadataDatabasePath
-	if metadataDatabasePath == "" {
-		metadataDatabasePath = deriveMetadataDatabasePath(opts.MetadataDataPath)
-	}
-	if metadataDatabasePath == "" {
-		return nil, fmt.Errorf("metadata database path cannot be empty: %w", core.ErrInvalidArgument)
-	}
-
-	directoryQuotaDatabasePath := opts.DirectoryQuotaDatabasePath
-	if directoryQuotaDatabasePath == "" {
-		directoryQuotaDatabasePath = deriveDirectoryQuotaDatabasePath(opts.DirectoryQuotaDataPath)
+	if opts.MetadataDataPath == "" && opts.MetadataDatabasePath == "" {
+		return nil, fmt.Errorf("metadata data path cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
 	logger := opts.Logging
@@ -99,39 +108,20 @@ func NewDatabaseHealthChecker(opts *DatabaseHealthCheckerOptions) (core.Database
 	}
 
 	return &databaseHealthChecker{
-		metadataDatabasePath:       metadataDatabasePath,
-		directoryQuotaDatabasePath: directoryQuotaDatabasePath,
-		metadataDataPath:           opts.MetadataDataPath,
-		directoryQuotaDataPath:     opts.DirectoryQuotaDataPath,
-		volumePaths:                opts.VolumePaths,
-		logger:                     logger,
+		metadataDataPath:       opts.MetadataDataPath,
+		directoryQuotaDataPath: opts.DirectoryQuotaDataPath,
+		volumePaths:            opts.VolumePaths,
+		logger:                 logger,
 	}, nil
-}
-
-// deriveMetadataDatabasePath returns the conventional badger directory below a
-// metadata root, or "" when the root is empty.
-func deriveMetadataDatabasePath(root string) string {
-	if root == "" {
-		return ""
-	}
-
-	return filepath.Join(root, metadataSharedDirectoryName, metadataDatabaseDirectoryName)
-}
-
-// deriveDirectoryQuotaDatabasePath returns the conventional badger directory
-// below a directory quota root, or "" when the root is empty.
-func deriveDirectoryQuotaDatabasePath(root string) string {
-	if root == "" {
-		return ""
-	}
-
-	return filepath.Join(root, directoryQuotaDatabaseDirectoryName)
 }
 
 // CheckAllDatabases checks the health of all databases.
 //
-// Orphan detection always runs when volume paths are configured, regardless of
-// how many databases were found or reported as corrupted.
+// The tenant set is enumerated once from the metadata root, then every
+// "{tenantId}/metadata.db" is inspected structurally; the same tenant set
+// selects the "{tenantId}/quotas.db" files. Orphan detection always runs when
+// volume paths are configured, regardless of how many databases were found or
+// reported as corrupted.
 func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.DatabaseHealthReport, error) {
 	report := &core.DatabaseHealthReport{
 		CorruptedDatabases: make([]*core.DatabaseHealthStatus, 0),
@@ -140,20 +130,36 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 		AllHealthy:         true,
 	}
 
-	if err := c.checkMetadataDatabases(ctx, report); err != nil {
-		c.emit(ctx, slog.LevelWarn, "metadata_check_failed", "Error checking metadata databases", errorTypeAttr(err))
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	if c.directoryQuotaDatabasePath != "" {
-		status, err := c.CheckDirectoryQuotaDatabase(ctx)
-		if err != nil {
-			c.emit(ctx, slog.LevelWarn, "quota_check_failed", "Error checking directory quota database", errorTypeAttr(err))
-		} else if status.IsHealthy {
-			report.HealthyDatabases++
-		} else if status.Error != "" {
-			report.CorruptedDatabases = append(report.CorruptedDatabases, status)
+	tenantIDs, err := GetTenantIDsFromMetadata(c.metadataDataPath)
+	if err != nil {
+		c.emit(ctx, slog.LevelWarn, "metadata_tenant_enumeration_failed", "Error enumerating tenants from the metadata root", errorTypeAttr(err))
+	}
+
+	metadataDatabases := tenantDatabasePaths(c.metadataDataPath, metadataDatabaseFileName, tenantIDs)
+
+	checkedDatabases := make([]string, 0, len(metadataDatabases))
+	checkedDatabases = append(checkedDatabases, c.checkMetadataDatabases(ctx, metadataDatabases, report)...)
+
+	if c.directoryQuotaDataPath != "" {
+		quotaDatabases := tenantDatabasePaths(c.directoryQuotaDataPath, directoryQuotaDatabaseFileName, tenantIDs)
+
+		healthy, corrupted, quotaErr := c.checkDirectoryQuotaDatabases(ctx, quotaDatabases)
+		if quotaErr != nil {
+			c.emit(ctx, slog.LevelWarn, "quota_check_failed", "Error checking directory quota databases", errorTypeAttr(quotaErr))
+			healthy, corrupted = 0, nil
+		}
+
+		report.HealthyDatabases += healthy
+		if len(corrupted) > 0 {
+			report.CorruptedDatabases = append(report.CorruptedDatabases, corrupted...)
 			report.AllHealthy = false
 		}
+
+		checkedDatabases = append(checkedDatabases, quotaDatabases...)
 	}
 
 	// Orphan detection is independent from the database counts: a deployment can
@@ -165,67 +171,87 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 		report.OrphanedTenants = orphaned
 	}
 
-	c.collectDatabaseSizes(ctx, report)
+	c.collectDatabaseSizes(ctx, report, checkedDatabases)
 
 	return report, nil
 }
 
-// checkMetadataDatabases checks the shared metadata database.
-func (c *databaseHealthChecker) checkMetadataDatabases(ctx context.Context, report *core.DatabaseHealthReport) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+// checkMetadataDatabases checks every tenant metadata database and returns the
+// database paths that were inspected (present or not), in enumeration order.
+func (c *databaseHealthChecker) checkMetadataDatabases(
+	ctx context.Context,
+	databases []string,
+	report *core.DatabaseHealthReport,
+) []string {
+	checked := make([]string, 0, len(databases))
 
-	status, err := c.CheckMetadataDatabase(ctx, "")
-	if err != nil {
-		return err
-	}
-
-	switch {
-	case status.IsHealthy:
-		report.HealthyDatabases++
-	case status.Error != "":
-		report.CorruptedDatabases = append(report.CorruptedDatabases, status)
-		report.AllHealthy = false
-	}
-
-	return nil
-}
-
-// CheckMetadataDatabase checks a database below the metadata root.
-//
-// tenantID is a legacy per-tenant selector. An empty tenantID checks the real
-// shared metadata database (MetadataDatabasePath). A non-empty tenantID must be
-// a plain directory name: separators, "." and ".." are rejected as invalid
-// arguments instead of being joined into an arbitrary path. The check is
-// structural, so the returned status is healthy as soon as the database
-// artifacts are present and readable; it does not prove that the database can
-// be opened or that its write lock is free.
-func (c *databaseHealthChecker) CheckMetadataDatabase(ctx context.Context, tenantID string) (*core.DatabaseHealthStatus, error) {
-	dbPath := c.metadataDatabasePath
-	if tenantID != "" {
-		if err := validateTenantIDSegment(tenantID); err != nil {
-			status := &core.DatabaseHealthStatus{
-				DatabaseType: core.DatabaseTypeMetadata,
-				TenantID:     tenantID,
-				DatabasePath: dbPath,
-				IsHealthy:    false,
-				Error:        fmt.Sprintf("invalid tenant ID: %v", err),
-			}
-
-			return status, fmt.Errorf("invalid tenant ID: %w", err)
+	for _, dbPath := range databases {
+		if err := ctx.Err(); err != nil {
+			return checked
 		}
 
-		tenantRoot := filepath.Join(c.metadataDataPath, tenantID)
-		dbPath = filepath.Join(tenantRoot, metadataDatabaseDirectoryName)
+		checked = append(checked, dbPath)
+
+		status := c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantIDFromDatabasePath(c.metadataDataPath, dbPath), dbPath)
+
+		switch {
+		case status.IsHealthy:
+			report.HealthyDatabases++
+		case status.Error != "":
+			report.CorruptedDatabases = append(report.CorruptedDatabases, status)
+			report.AllHealthy = false
+		}
 	}
+
+	return checked
+}
+
+// CheckMetadataDatabase checks one tenant's metadata database.
+//
+// tenantID selects "{MetadataDataPath}/{tenantId}/metadata.db": the SQLite
+// layout keys metadata by tenant. An empty tenantID reports the unconfigured
+// state, because the migration removed the single shared metadata database this
+// method used to check. A non-empty tenantID must be a plain directory name:
+// separators, "." and ".." are rejected as invalid arguments instead of being
+// joined into an arbitrary path. The check is structural, so the returned
+// status is healthy as soon as the database file is present with a valid SQLite
+// header and a plausible size; it does not prove that the database can be
+// opened or that its write lock is free.
+func (c *databaseHealthChecker) CheckMetadataDatabase(ctx context.Context, tenantID string) (*core.DatabaseHealthStatus, error) {
+	if tenantID == "" {
+		return &core.DatabaseHealthStatus{
+			DatabaseType: core.DatabaseTypeMetadata,
+			DatabasePath: "",
+			IsHealthy:    false,
+			Error:        "metadata database is per tenant and requires a tenant ID",
+		}, nil
+	}
+
+	if err := validateTenantIDSegment(tenantID); err != nil {
+		status := &core.DatabaseHealthStatus{
+			DatabaseType: core.DatabaseTypeMetadata,
+			TenantID:     tenantID,
+			DatabasePath: "",
+			IsHealthy:    false,
+			Error:        fmt.Sprintf("invalid tenant ID: %v", err),
+		}
+
+		return status, fmt.Errorf("invalid tenant ID: %w", err)
+	}
+
+	dbPath := filepath.Join(c.metadataDataPath, tenantID, metadataDatabaseFileName)
 
 	return c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantID, dbPath), nil
 }
 
-// CheckDirectoryQuotaDatabase checks the directory quota database.
+// CheckDirectoryQuotaDatabase checks every tenant directory quota database.
+//
+// Only the first defect is returned because the method returns a single status;
+// CheckAllDatabases reports all of them. A deployment without quota databases is
+// healthy with an empty Error: no database has been created yet is not
+// corruption.
 func (c *databaseHealthChecker) CheckDirectoryQuotaDatabase(ctx context.Context) (*core.DatabaseHealthStatus, error) {
-	if c.directoryQuotaDatabasePath == "" {
+	if c.directoryQuotaDataPath == "" {
 		status := &core.DatabaseHealthStatus{
 			DatabaseType: core.DatabaseTypeDirectoryQuota,
 			DatabasePath: "",
@@ -236,17 +262,68 @@ func (c *databaseHealthChecker) CheckDirectoryQuotaDatabase(ctx context.Context)
 		return status, nil
 	}
 
-	return c.checkDatabase(ctx, core.DatabaseTypeDirectoryQuota, "", c.directoryQuotaDatabasePath), nil
+	tenantIDs, err := GetTenantIDsFromMetadata(c.metadataDataPath)
+	if err != nil {
+		return nil, err
+	}
+
+	healthy, corrupted, err := c.checkDirectoryQuotaDatabases(ctx, tenantDatabasePaths(c.directoryQuotaDataPath, directoryQuotaDatabaseFileName, tenantIDs))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(corrupted) > 0 {
+		return corrupted[0], nil
+	}
+
+	if healthy > 0 {
+		return &core.DatabaseHealthStatus{
+			DatabaseType: core.DatabaseTypeDirectoryQuota,
+			IsHealthy:    true,
+		}, nil
+	}
+
+	return &core.DatabaseHealthStatus{
+		DatabaseType: core.DatabaseTypeDirectoryQuota,
+		IsHealthy:    false,
+	}, nil
 }
 
-// checkDatabase performs a cross-platform structural check of a BadgerDB
-// directory and never opens the database.
+// checkDirectoryQuotaDatabases inspects every quota database and returns the
+// healthy count plus every corrupted status.
+func (c *databaseHealthChecker) checkDirectoryQuotaDatabases(
+	ctx context.Context,
+	databases []string,
+) (healthy int, corrupted []*core.DatabaseHealthStatus, err error) {
+	corrupted = make([]*core.DatabaseHealthStatus, 0)
+
+	for _, dbPath := range databases {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return healthy, corrupted, ctxErr
+		}
+
+		status := c.checkDatabase(ctx, core.DatabaseTypeDirectoryQuota, tenantIDFromDatabasePath(c.directoryQuotaDataPath, dbPath), dbPath)
+
+		switch {
+		case status.IsHealthy:
+			healthy++
+		case status.Error != "":
+			corrupted = append(corrupted, status)
+		}
+	}
+
+	return healthy, corrupted, nil
+}
+
+// checkDatabase performs a cross-platform structural check of one SQLite
+// database file and never opens the database.
 //
-// Rationale: Badger v4 rejects read-only mode on Windows
-// (ErrWindowsNotSupported), so opening the live database is both impossible and
-// undesirable. A missing directory means "no database yet" and is reported as
-// healthy with an empty Error; only a directory that exists but lacks required
-// artifacts is reported as corrupted.
+// Rationale: a read-only SQLite open interacts with WAL "-shm" locking and its
+// cost scales with the number of tenant databases (docs/sqlite-storage-design.md
+// §18.3 Q6), so the health verdict stays file-level. A missing file means "no
+// database yet" and is reported as healthy with an empty Error; only a file that
+// exists but fails the SQLite structure rules is reported as corrupted, with a
+// path-free reason (DatabasePath already carries the location).
 func (c *databaseHealthChecker) checkDatabase(
 	ctx context.Context,
 	databaseType core.DatabaseType,
@@ -260,13 +337,14 @@ func (c *databaseHealthChecker) checkDatabase(
 		IsHealthy:    false,
 	}
 
-	_, healthy, err := checkBadgerStructure(ctx, dbPath)
+	healthy, err := inspectSQLiteFile(ctx, dbPath)
 	switch {
 	case err == nil && healthy:
 		status.IsHealthy = true
 	case err == nil:
-		// Directory is absent: no database has been created yet. This is a
-		// normal state for a new deployment and is not corruption.
+		// The file is absent: no database has been created yet. This is a
+		// normal state for a new deployment or a tenant without data, and is
+		// not corruption.
 	default:
 		status.Error = err.Error()
 	}
@@ -274,17 +352,13 @@ func (c *databaseHealthChecker) checkDatabase(
 	return status
 }
 
-// collectDatabaseSizes records the on-disk size of each configured database
-// directory so the report carries an operational signal without extra I/O for
-// healthy-only layouts.
-func (c *databaseHealthChecker) collectDatabaseSizes(ctx context.Context, report *core.DatabaseHealthReport) {
-	for _, dbPath := range []string{c.metadataDatabasePath, c.directoryQuotaDatabasePath} {
-		if dbPath == "" {
-			continue
-		}
-
-		if _, err := os.Stat(dbPath); err != nil {
-			continue
+// collectDatabaseSizes records the on-disk size of every inspected database
+// file so the report carries an operational signal without extra I/O for
+// missing files. Databases that do not exist are omitted.
+func (c *databaseHealthChecker) collectDatabaseSizes(ctx context.Context, report *core.DatabaseHealthReport, databases []string) {
+	for _, dbPath := range databases {
+		if err := ctx.Err(); err != nil {
+			return
 		}
 
 		size, err := contextualDatabaseSize(ctx, dbPath)
@@ -384,8 +458,8 @@ func hasFiles(dirPath string) bool {
 	return hasAnyFile
 }
 
-// GetDatabaseSize returns the size of a database directory in bytes.
-// A missing directory yields 0.
+// GetDatabaseSize returns the size in bytes of one SQLite database file.
+// A missing or non-regular path yields 0.
 func GetDatabaseSize(dbPath string) (int64, error) {
 	return contextualDatabaseSize(context.Background(), dbPath)
 }
@@ -396,44 +470,53 @@ func contextualDatabaseSize(ctx context.Context, dbPath string) (int64, error) {
 		return 0, nil
 	}
 
-	var size int64
-
-	err := filepath.Walk(dbPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-
-		if !info.IsDir() {
-			size += info.Size()
-		}
-
-		return nil
-	})
-	if err != nil {
-		return size, fmt.Errorf("failed to measure database directory: %w", err)
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 
-	return size, nil
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+
+		return 0, fmt.Errorf("failed to measure database file: %w", err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return 0, nil
+	}
+
+	return info.Size(), nil
 }
 
-// IsDatabaseCorrupted reports whether dbPath looks like a corrupted BadgerDB
-// directory.
+// IsDatabaseCorrupted reports whether dbPath is an existing path that fails the
+// structural SQLite database rules (wrong header, too short, or not a regular
+// file).
 //
-// The check is structural: it never opens the database, so it works on Windows
-// (where Badger rejects read-only mode) and while the database is locked by the
-// running process. A path that does not exist, or that exists but is not a
-// database directory at all, is NOT reported as corrupted.
+// The check is structural: it never opens the database, so it works while the
+// database is locked by the running process and never touches WAL locks. A path
+// that does not exist is not reported as corrupted: no database yet is a normal
+// state.
 func IsDatabaseCorrupted(dbPath string) bool {
-	_, healthy, err := checkBadgerStructure(context.Background(), dbPath)
+	healthy, err := inspectSQLiteFile(context.Background(), dbPath)
 
 	return err != nil && !healthy
 }
 
-// GetTenantIDsFromMetadata returns all tenant IDs that have metadata databases.
+// GetTenantIDsFromMetadata returns the tenant IDs that have physical metadata
+// storage below metadataDataPath, in directory order.
+//
+// Tenant enumeration source: the first-level directories of the metadata root,
+// which is the tenant metadata layout this checker already derives paths from
+// ({metadataDirectory}/{tenantId}/metadata.db, docs/sqlite-storage-design.md
+// §3.1). Directory entries are read once and never opened, so a tenant with
+// many databases does not multiply file handles. Entries are skipped when their
+// name is not a valid tenant identifier (core.ValidateTenantID), which also
+// excludes internal dot-directories such as ".locus"; those directories hold the
+// tenant registry JSON files, not databases, and are handled by pkg/tenant.
+// Underscore-prefixed directory names stay reserved for system state, as they
+// were before the storage migration.
 func GetTenantIDsFromMetadata(metadataDataPath string) ([]string, error) {
 	tenantIDs := make([]string, 0)
 
@@ -451,125 +534,126 @@ func GetTenantIDsFromMetadata(metadataDataPath string) ([]string, error) {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() {
-			// Exclude system directories
-			name := entry.Name()
-			if !strings.HasPrefix(name, ".") && !strings.HasPrefix(name, "_") {
-				tenantIDs = append(tenantIDs, name)
-			}
+		if !entry.IsDir() {
+			continue
 		}
+
+		name := entry.Name()
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+		if core.ValidateTenantID(name) != nil {
+			continue
+		}
+
+		tenantIDs = append(tenantIDs, name)
 	}
 
 	return tenantIDs, nil
 }
 
-// badgerManifestPrefix is the file name prefix BadgerDB uses for its MANIFEST.
-const badgerManifestPrefix = "MANIFEST"
-
-// badgerValueLogExtension is the file extension of a BadgerDB value log file.
-const badgerValueLogExtension = ".vlog"
-
-// badgerKeyRegistryName is the BadgerDB key registry file name.
-const badgerKeyRegistryName = "KEYREGISTRY"
-
-// checkBadgerStructure classifies dbPath structurally and never opens the
-// database.
-//
-// It returns:
-//   - (false, false, nil) when dbPath does not exist: no database yet.
-//   - (false, false, nil) when dbPath exists but contains no BadgerDB artifacts:
-//     the directory is not a database (for example a tenant JSON store, a shared
-//     parent directory, or a storage volume root), which is not corruption.
-//   - (true,  true,  nil) when a readable non-empty MANIFEST plus a value log or
-//     key registry are present.
-//   - (true,  false, err) when the directory looks like a database but a required
-//     artifact is missing or unreadable; err names the precise defect.
-func checkBadgerStructure(ctx context.Context, dbPath string) (isDatabase bool, healthy bool, err error) {
-	if dbPath == "" {
-		return false, false, nil
+// tenantDatabasePaths returns the per-tenant database path of every tenant in
+// "{root}/{tenantId}/{fileName}" form. A tenant without a database is included:
+// a missing file means "no database yet", and the caller needs the path to
+// report that state.
+func tenantDatabasePaths(root, fileName string, tenantIDs []string) []string {
+	if root == "" || len(tenantIDs) == 0 {
+		return nil
 	}
 
-	if err := ctx.Err(); err != nil {
-		return false, false, err
+	paths := make([]string, 0, len(tenantIDs))
+	for _, tenantID := range tenantIDs {
+		paths = append(paths, filepath.Join(root, tenantID, fileName))
+	}
+
+	return paths
+}
+
+// tenantIDFromDatabasePath recovers the tenant ID of a
+// "{root}/{tenantId}/{fileName}" path so a status never needs a second lookup.
+func tenantIDFromDatabasePath(root, dbPath string) string {
+	if root == "" || dbPath == "" {
+		return ""
+	}
+
+	relative, err := filepath.Rel(root, dbPath)
+	if err != nil {
+		return ""
+	}
+
+	tenantID := filepath.Dir(relative)
+	if tenantID == "." || strings.HasPrefix(tenantID, "..") {
+		return ""
+	}
+
+	return tenantID
+}
+
+// inspectSQLiteFile classifies one database file structurally and never opens
+// the database through a driver.
+//
+// It returns:
+//   - (false, nil) when dbPath is absent: there is no database file yet.
+//   - (true, nil) when the file is regular, at least minimumSQLiteFileSize
+//     bytes long and starts with the 16-byte SQLite header.
+//   - (false, err) when the path exists but fails one of those rules, including
+//     a non-regular entry such as a directory. err is a safe, path-free reason
+//     that names the precise defect.
+func inspectSQLiteFile(ctx context.Context, dbPath string) (healthy bool, err error) {
+	if dbPath == "" {
+		return false, nil
+	}
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
 	}
 
 	info, statErr := os.Stat(dbPath)
 	switch {
-	case os.IsNotExist(statErr):
-		return false, false, nil
+	case errors.Is(statErr, os.ErrNotExist):
+		return false, nil
 	case statErr != nil:
-		return false, false, fmt.Errorf("failed to stat database directory: %w", statErr)
-	case !info.IsDir():
-		return false, false, nil
+		return false, fmt.Errorf("failed to stat database file: %w", statErr)
+	case !info.Mode().IsRegular():
+		return false, fmt.Errorf("database path is not a regular file, so it cannot hold a SQLite database")
 	}
 
-	entries, readErr := os.ReadDir(dbPath)
+	if info.Size() < minimumSQLiteFileSize {
+		return false, fmt.Errorf(
+			"database file is %d bytes; a SQLite database needs at least %d bytes for its header page",
+			info.Size(), minimumSQLiteFileSize)
+	}
+
+	header, readErr := readSQLiteHeader(dbPath)
 	if readErr != nil {
-		return false, false, fmt.Errorf("failed to read database directory: %w", readErr)
+		return false, readErr
 	}
 
-	hasManifest := false
-	hasValueLog := false
-	hasKeyRegistry := false
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-
-		switch {
-		case strings.HasPrefix(name, badgerManifestPrefix):
-			hasManifest = true
-		case strings.EqualFold(filepath.Ext(name), badgerValueLogExtension):
-			hasValueLog = true
-		case strings.EqualFold(name, badgerKeyRegistryName):
-			hasKeyRegistry = true
-		}
+	if string(header) != sqliteHeader {
+		return false, fmt.Errorf("file does not start with the %d-byte SQLite format 3 header", len(sqliteHeader))
 	}
 
-	if !hasManifest && !hasValueLog && !hasKeyRegistry {
-		// Not a BadgerDB directory at all.
-		return false, false, nil
-	}
-
-	if !hasManifest {
-		return true, false, fmt.Errorf("required BadgerDB artifact %s is missing from the database directory", badgerManifestPrefix)
-	}
-
-	if !hasValueLog && !hasKeyRegistry {
-		return true, false, fmt.Errorf("required BadgerDB artifact %s or %s is missing from the database directory", badgerValueLogExtension, badgerKeyRegistryName)
-	}
-
-	manifestInfo, manifestErr := readManifestInfo(dbPath, entries)
-	if manifestErr != nil {
-		return true, false, manifestErr
-	}
-
-	if manifestInfo.Size() == 0 {
-		return true, false, fmt.Errorf("BadgerDB artifact %s is empty at %s", badgerManifestPrefix, manifestInfo.Name())
-	}
-
-	return true, true, nil
+	return true, nil
 }
 
-// readManifestInfo returns the file info of the first MANIFEST entry.
-func readManifestInfo(dbPath string, entries []os.DirEntry) (os.FileInfo, error) {
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), badgerManifestPrefix) {
-			continue
-		}
+// readSQLiteHeader reads the leading SQLite magic bytes without using a
+// database driver. The file is closed before returning on every path.
+func readSQLiteHeader(dbPath string) ([]byte, error) {
+	file, err := os.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database file for a header read: %w", err)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
 
-		info, err := entry.Info()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read BadgerDB artifact %s: %w", badgerManifestPrefix, err)
-		}
+	header := make([]byte, len(sqliteHeader))
 
-		return info, nil
+	if _, err := io.ReadFull(file, header); err != nil {
+		return nil, fmt.Errorf("failed to read the SQLite header: %w", err)
 	}
 
-	return nil, fmt.Errorf("required BadgerDB artifact %s is missing from the database directory %s", badgerManifestPrefix, dbPath)
+	return header, nil
 }
 
 // validateTenantIDSegment rejects tenant IDs that must never be joined into a

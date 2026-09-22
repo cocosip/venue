@@ -149,34 +149,3 @@ func (c *metadataCache) evictLRU() {
 func buildCacheKey(tenantID, fileKey string) string {
 	return tenantID + "\x00" + fileKey
 }
-
-// getStats returns cache statistics for monitoring.
-func (c *metadataCache) getStats() map[string]interface{} {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	stats := make(map[string]interface{})
-	stats["total_entries"] = len(c.entries)
-	stats["max_size"] = c.maxSize
-	stats["usage_percent"] = float64(len(c.entries)) * 100.0 / float64(c.maxSize)
-
-	// Count by status
-	statusCounts := make(map[core.FileProcessingStatus]int)
-	expiredCount := 0
-	now := time.Now()
-
-	for _, entry := range c.entries {
-		if entry.expiresAt.Before(now) {
-			expiredCount++
-		} else {
-			statusCounts[entry.metadata.Status]++
-		}
-	}
-
-	stats["expired_entries"] = expiredCount
-	stats["pending_count"] = statusCounts[core.FileStatusPending]
-	stats["processing_count"] = statusCounts[core.FileStatusProcessing]
-	stats["failed_count"] = statusCounts[core.FileStatusFailed]
-
-	return stats
-}

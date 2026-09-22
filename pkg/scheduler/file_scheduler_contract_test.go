@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
-	"github.com/cocosip/venue/pkg/metadata"
 )
 
 // stubMetadataRepository overrides the few MetadataRepository operations the
@@ -469,7 +468,6 @@ func TestResetTimedOutFilesRefreshesAvailability(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			repo, tmpDir := createTestRepository(t)
 			defer func() { _ = os.RemoveAll(tmpDir) }()
-			defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 			longAgo := time.Now().Add(-2 * time.Hour)
 			file := createTestFileMetadata("stale-availability", core.FileStatusProcessing)
@@ -532,7 +530,6 @@ func TestGetFileStatusWrapsNotFound(t *testing.T) {
 	ctx := context.Background()
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	scheduler, err := NewFileScheduler(repo, createTestVolumes(t), nil)
 	if err != nil {

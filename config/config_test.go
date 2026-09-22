@@ -118,11 +118,11 @@ func TestValidateRejectsDuplicateAndIncompleteEntries(t *testing.T) {
 				MultiTenantMode: true, PostImportAction: "Delete",
 			}}
 		}},
-		{"badger discard ratio out of range", func(c *Config) { c.BadgerDB.GCDiscardRatio = 1.0 }},
-		{"negative badger sizing", func(c *Config) { c.BadgerDB.MemTableSize = -1 }},
+		{"sqlite journal mode outside the whitelist", func(c *Config) { c.Sqlite.JournalMode = "SIDEWAYS" }},
+		{"sqlite cache size zero", func(c *Config) { c.Sqlite.CacheSizeKb = 0 }},
 		{"negative cleanup interval", func(c *Config) { c.Cleanup.CleanupInterval = -time.Second }},
 		{"negative timed out reclaim cooldown", func(c *Config) { c.Cleanup.TimedOutReclaimCooldown = -time.Second }},
-		{"negative corrupted database retention", func(c *Config) { c.BadgerDB.CorruptedDatabaseRetention = -time.Second }},
+		{"negative corrupted database retention", func(c *Config) { c.Sqlite.CorruptedDatabaseRetention = -time.Second }},
 		{"negative failed retention", func(c *Config) { c.Cleanup.FailedFileRetentionPeriod = -time.Second }},
 		{"negative retry count", func(c *Config) { c.RetryPolicy.MaxRetryCount = -1 }},
 		{"negative orphan recovery interval", func(c *Config) { c.OrphanRecovery.RecoveryInterval = -time.Second }},
@@ -188,7 +188,7 @@ func TestEveryConfigModuleSupportsFluentConstruction(t *testing.T) {
 		WithRetryPolicy(NewRetryPolicyConfig().WithMaxRetryCount(5).WithInitialRetryDelay(time.Second)).
 		WithTenantManager(NewTenantManagerConfig().WithMetadataPath("tenants").WithCacheTTL(time.Minute)).
 		WithMetadata(NewMetadataConfig().WithCacheTTL(time.Minute).WithMaxCacheEntries(50)).
-		WithBadgerDB(NewBadgerDBConfig().WithGCInterval(time.Hour).WithSyncWrites(true)).
+		WithSqlite(NewSqliteConfig().WithJournalMode("DELETE").WithSynchronousMode("FULL")).
 		WithVolumes(volume).
 		WithTenants(tenant).
 		WithFileWatchers(watcher).
@@ -265,11 +265,11 @@ func TestFollowUpOptimizationDefaultsAndFluent(t *testing.T) {
 	if defaults.Cleanup.TimedOutReclaimCooldown != 30*time.Second {
 		t.Errorf("TimedOutReclaimCooldown = %v, want 30s", defaults.Cleanup.TimedOutReclaimCooldown)
 	}
-	if defaults.BadgerDB.RecoverCorruptedDatabase {
+	if defaults.Sqlite.RecoverCorruptedDatabase {
 		t.Error("RecoverCorruptedDatabase = true, want false (destructive repair is opt-in)")
 	}
-	if defaults.BadgerDB.CorruptedDatabaseRetention != 72*time.Hour {
-		t.Errorf("CorruptedDatabaseRetention = %v, want 72h", defaults.BadgerDB.CorruptedDatabaseRetention)
+	if defaults.Sqlite.CorruptedDatabaseRetention != 72*time.Hour {
+		t.Errorf("CorruptedDatabaseRetention = %v, want 72h", defaults.Sqlite.CorruptedDatabaseRetention)
 	}
 
 	// ApplyDefaults fills durations but never overrides an explicit boolean.
@@ -278,15 +278,15 @@ func TestFollowUpOptimizationDefaultsAndFluent(t *testing.T) {
 	if applied.Cleanup.TimedOutReclaimCooldown != 30*time.Second {
 		t.Errorf("ApplyDefaults TimedOutReclaimCooldown = %v, want 30s", applied.Cleanup.TimedOutReclaimCooldown)
 	}
-	if applied.BadgerDB.CorruptedDatabaseRetention != 72*time.Hour {
-		t.Errorf("ApplyDefaults CorruptedDatabaseRetention = %v, want 72h", applied.BadgerDB.CorruptedDatabaseRetention)
+	if applied.Sqlite.CorruptedDatabaseRetention != 72*time.Hour {
+		t.Errorf("ApplyDefaults CorruptedDatabaseRetention = %v, want 72h", applied.Sqlite.CorruptedDatabaseRetention)
 	}
 
 	cfg := New().
 		WithCleanup(NewCleanupConfig().
 			WithTimedOutReclaimOnEmptyQueue(false).
 			WithTimedOutReclaimCooldown(5 * time.Second)).
-		WithBadgerDB(NewBadgerDBConfig().
+		WithSqlite(NewSqliteConfig().
 			WithCorruptedDatabaseRecovery(true).
 			WithCorruptedDatabaseRetention(time.Hour)).
 		WithVolumes(NewVolumeConfig().
@@ -297,8 +297,8 @@ func TestFollowUpOptimizationDefaultsAndFluent(t *testing.T) {
 	if cfg.Cleanup.RecoverTimedOutOnEmptyQueue || cfg.Cleanup.TimedOutReclaimCooldown != 5*time.Second {
 		t.Errorf("cleanup reclaim options not retained: %#v", cfg.Cleanup)
 	}
-	if !cfg.BadgerDB.RecoverCorruptedDatabase || cfg.BadgerDB.CorruptedDatabaseRetention != time.Hour {
-		t.Errorf("badger recovery options not retained: %#v", cfg.BadgerDB)
+	if !cfg.Sqlite.RecoverCorruptedDatabase || cfg.Sqlite.CorruptedDatabaseRetention != time.Hour {
+		t.Errorf("sqlite recovery options not retained: %#v", cfg.Sqlite)
 	}
 	if cfg.Volumes[0].HealthCheckCacheTTL != -1 {
 		t.Errorf("HealthCheckCacheTTL = %v, want -1", cfg.Volumes[0].HealthCheckCacheTTL)

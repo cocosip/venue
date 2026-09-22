@@ -2,17 +2,14 @@ package metadata
 
 import (
 	"context"
-	"errors"
 	"time"
-
-	"github.com/dgraph-io/badger/v4"
 )
 
 const (
 	// defaultConflictRetryAttempts is the total number of attempts a repository
-	// write makes before it reports the conflict. BadgerDB conflicts come from a
-	// concurrent writer on the same key, so they usually clear after a very
-	// short wait.
+	// write makes before it reports the conflict. A SQLite conflict comes from a
+	// concurrent writer holding the write lock, so it usually clears after a
+	// very short wait.
 	defaultConflictRetryAttempts = 3
 
 	// conflictRetryBackoff is the base delay between conflict retries. It grows
@@ -25,11 +22,12 @@ const (
 // attempt budget is exhausted.
 //
 // attempts is the total number of attempts, not the number of retries; a
-// non-positive value selects defaultConflictRetryAttempts. Only
-// badger.ErrConflict (including a wrapped conflict) is retried: a domain error
-// such as ErrFileNotFound or ErrFileNotClaimable is returned immediately, so
-// contention classification stays in the caller. The wait between attempts
-// honours ctx, and a cancelled context is reported without further attempts.
+// non-positive value selects defaultConflictRetryAttempts. Only a transient
+// SQLite lock conflict (SQLITE_BUSY or SQLITE_LOCKED, see
+// isSQLiteConflictError) is retried: a domain error such as ErrFileNotFound or
+// ErrFileNotClaimable is returned immediately, so contention classification
+// stays in the caller. The wait between attempts honours ctx, and a cancelled
+// context is reported without further attempts.
 func retryOnConflict(ctx context.Context, attempts int, fn func() error) error {
 	if attempts < 1 {
 		attempts = defaultConflictRetryAttempts
@@ -45,7 +43,7 @@ func retryOnConflict(ctx context.Context, attempts int, fn func() error) error {
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, badger.ErrConflict) {
+		if !isSQLiteConflictError(err) {
 			return err
 		}
 		if attempt == attempts-1 {

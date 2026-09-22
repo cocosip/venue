@@ -13,6 +13,7 @@ import (
 	"github.com/cocosip/venue/pkg/metadata"
 	"github.com/cocosip/venue/pkg/quota"
 	"github.com/cocosip/venue/pkg/scheduler"
+	"github.com/cocosip/venue/pkg/sqlite"
 	"github.com/cocosip/venue/pkg/volume"
 )
 
@@ -556,21 +557,20 @@ func (r *stubDirectoryQuotaRepository) Close() error {
 	return nil
 }
 
+// createTestRepository builds a SQLite metadata repository rooted in a temporary
+// directory the caller removes after the repository is closed.
 func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 	tmpDir, err := os.MkdirTemp("", "cleanup-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	opts := &metadata.BadgerRepositoryOptions{
-		TenantID:       "test-tenant",
-		DataPath:       tmpDir,
-		CacheTTL:       5 * time.Minute,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
-	}
-
-	repo, err := metadata.NewBadgerMetadataRepository(opts)
+	repo, err := metadata.NewSQLiteMetadataRepository(&metadata.SQLiteRepositoryOptions{
+		DataPath:        tmpDir,
+		CacheTTL:        5 * time.Minute,
+		MaxCacheEntries: 10000,
+		Sqlite:          sqlite.DefaultOptions(),
+	})
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create repository: %v", err)
@@ -579,19 +579,20 @@ func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 	return repo, tmpDir
 }
 
+// createTestDirQuotaRepository builds a SQLite directory-quota repository
+// rooted in a temporary directory the caller removes after the repository is
+// closed.
 func createTestDirQuotaRepository(t *testing.T) (core.DirectoryQuotaRepository, string) {
 	tmpDir, err := os.MkdirTemp("", "dirquota-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	opts := &quota.BadgerDirectoryQuotaRepositoryOptions{
-		DataPath:       tmpDir,
-		GCInterval:     10 * time.Minute,
-		GCDiscardRatio: 0.5,
-	}
-
-	repo, err := quota.NewBadgerDirectoryQuotaRepository(opts)
+	repo, err := quota.NewSQLiteDirectoryQuotaRepository(&quota.SQLiteDirectoryQuotaRepositoryOptions{
+		DataPath:         tmpDir,
+		Sqlite:           sqlite.DefaultOptions(),
+		MaxOpenDatabases: 0,
+	})
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create directory quota repository: %v", err)

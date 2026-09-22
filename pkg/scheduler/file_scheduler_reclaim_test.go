@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
-	"github.com/cocosip/venue/pkg/metadata"
 )
 
 // reclaimCountingRepository counts timed-out scans so a test can pin how many
@@ -81,7 +80,6 @@ func TestGetNextFileForProcessingRecoversTimedOutFileOnEmptyQueue(t *testing.T) 
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -164,7 +162,6 @@ func TestGetNextFileForProcessingLeavesTimedOutFileWhenReclaimDisabled(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			repo, tmpDir := createTestRepository(t)
 			defer func() { _ = os.RemoveAll(tmpDir) }()
-			defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 			volumes := createTestVolumes(t)
 			defer cleanupVolumes(volumes)
@@ -212,7 +209,6 @@ func TestGetNextBatchForProcessingRecoversTimedOutFilesOnEmptyQueue(t *testing.T
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -263,7 +259,6 @@ func TestEmptyQueueReclaimHonoursCooldown(t *testing.T) {
 	t.Run("cooldown suppresses a second reclaim", func(t *testing.T) {
 		baseRepo, tmpDir := createTestRepository(t)
 		defer func() { _ = os.RemoveAll(tmpDir) }()
-		defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -315,7 +310,6 @@ func TestEmptyQueueReclaimHonoursCooldown(t *testing.T) {
 
 		baseRepo, tmpDir := createTestRepository(t)
 		defer func() { _ = os.RemoveAll(tmpDir) }()
-		defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -359,7 +353,6 @@ func TestEmptyQueueReclaimHonoursCooldown(t *testing.T) {
 	t.Run("non-positive cooldown disables the gate", func(t *testing.T) {
 		baseRepo, tmpDir := createTestRepository(t)
 		defer func() { _ = os.RemoveAll(tmpDir) }()
-		defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -388,7 +381,6 @@ func TestEmptyQueueReclaimBoundedByBatchSize(t *testing.T) {
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -460,7 +452,6 @@ func TestEmptyQueueReclaimIsExclusiveUnderConcurrency(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -562,7 +553,6 @@ func TestEmptyQueueReclaimPreservesReplacementLease(t *testing.T) {
 
 	baseRepo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = baseRepo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -688,7 +678,6 @@ func TestEmptyQueueReclaimBatchSizeZeroSelectsDefault(t *testing.T) {
 
 	repo, tmpDir := createTestRepository(t)
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
