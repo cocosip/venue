@@ -31,6 +31,10 @@ func (r *reclaimCountingRepository) GetTimedOutProcessingFiles(
 
 // reclaimTestScheduler builds a scheduler over a real repository with immediate
 // reclaim configured by mutate, which receives the defaults.
+//
+// The opportunistic background pass is switched off so these tests measure the
+// synchronous empty-queue path in isolation; the background pass has its own
+// suite in file_scheduler_background_reclaim_test.go.
 func reclaimTestScheduler(
 	t *testing.T,
 	repo core.MetadataRepository,
@@ -41,6 +45,7 @@ func reclaimTestScheduler(
 
 	opts := DefaultFileSchedulerOptions()
 	opts.ProcessingTimeout = time.Hour
+	opts.BackgroundTimedOutReclaimEnabled = false
 	if mutate != nil {
 		mutate(opts)
 	}
@@ -134,9 +139,9 @@ func TestGetNextFileForProcessingRecoversTimedOutFileOnEmptyQueue(t *testing.T) 
 	}
 }
 
-// TestGetNextFileForProcessingLeavesTimedOutFileWhenReclaimDisabled pins both
-// off switches: with recovery disabled or with a non-positive reclaim batch size
-// the empty queue stays empty and the crashed worker's lease is untouched.
+// TestGetNextFileForProcessingLeavesTimedOutFileWhenReclaimDisabled pins the off
+// switch: with recovery disabled or with a negative reclaim batch size the empty
+// queue stays empty and the crashed worker's lease is untouched.
 func TestGetNextFileForProcessingLeavesTimedOutFileWhenReclaimDisabled(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
@@ -148,10 +153,6 @@ func TestGetNextFileForProcessingLeavesTimedOutFileWhenReclaimDisabled(t *testin
 		{
 			name:   "recover timed out on empty queue disabled",
 			mutate: func(o *FileSchedulerOptions) { o.RecoverTimedOutOnEmptyQueue = false },
-		},
-		{
-			name:   "empty queue reclaim batch size zero",
-			mutate: func(o *FileSchedulerOptions) { o.EmptyQueueReclaimBatchSize = 0 },
 		},
 		{
 			name:   "empty queue reclaim batch size negative",
@@ -654,5 +655,73 @@ func TestDefaultFileSchedulerOptionsEnableEmptyQueueReclaim(t *testing.T) {
 	}
 	if opts.EmptyQueueReclaimBatchSize != 32 {
 		t.Errorf("EmptyQueueReclaimBatchSize = %d, want 32", opts.EmptyQueueReclaimBatchSize)
+	}
+}
+
+// TestDefaultFileSchedulerOptionsPinLocusReclaimDefaults pins the Locus v2.0.0
+// defaults (FileScheduler.cs:52-62,79-82) for the opportunistic background pass
+// that config.CleanupConfig mirrors.
+func TestDefaultFileSchedulerOptionsPinLocusReclaimDefaults(t *testing.T) {
+	opts := DefaultFileSchedulerOptions()
+
+	if !opts.BackgroundTimedOutReclaimEnabled {
+		t.Error("BackgroundTimedOutReclaimEnabled = false, want true")
+	}
+	if opts.BackgroundTimedOutReclaimBatchSize != 8 {
+		t.Errorf("BackgroundTimedOutReclaimBatchSize = %d, want 8", opts.BackgroundTimedOutReclaimBatchSize)
+	}
+	if DefaultBackgroundTimedOutReclaimBatchSize != 8 {
+		t.Errorf("DefaultBackgroundTimedOutReclaimBatchSize = %d, want 8",
+			DefaultBackgroundTimedOutReclaimBatchSize)
+	}
+}
+
+// TestEmptyQueueReclaimBatchSizeZeroSelectsDefault pins the configuration
+// semantics documented on FileSchedulerOptions.EmptyQueueReclaimBatchSize: a zero
+// value is "unset" and selects DefaultEmptyQueueReclaimBatchSize, so one
+// empty-queue reclaim resets every timed-out file the default ceiling covers.
+// Only a negative value disables the synchronous pass, which
+// TestGetNextFileForProcessingLeavesTimedOutFileWhenReclaimDisabled covers.
+func TestEmptyQueueReclaimBatchSizeZeroSelectsDefault(t *testing.T) {
+	ctx := context.Background()
+	tenant := createTestTenant()
+
+	repo, tmpDir := createTestRepository(t)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = repo.(*metadata.BadgerMetadataRepository).Close() }()
+
+	volumes := createTestVolumes(t)
+	defer cleanupVolumes(volumes)
+
+	files := []*core.FileMetadata{
+		addTimedOutProcessingFile(t, repo, "crashed-a"),
+		addTimedOutProcessingFile(t, repo, "crashed-b"),
+		addTimedOutProcessingFile(t, repo, "crashed-c"),
+	}
+
+	// The default ceiling (32) is far above the three files, so a single
+	// empty-queue reclaim must reset all of them. A disabled pass would leave all
+	// three leases stale; a ceiling of one would leave two.
+	scheduler := reclaimTestScheduler(t, repo, volumes, func(o *FileSchedulerOptions) {
+		o.EmptyQueueReclaimBatchSize = 0
+	})
+
+	location, err := scheduler.GetNextFileForProcessing(ctx, tenant)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if location == nil {
+		t.Fatal("empty queue returned no file, want the timed-out files recovered")
+	}
+
+	for _, file := range files {
+		current, err := repo.Get(ctx, tenant.ID, file.FileKey)
+		if err != nil {
+			t.Fatalf("get metadata %s: %v", file.FileKey, err)
+		}
+		if current.ProcessingStartTime != nil && current.ProcessingStartTime.Equal(*file.ProcessingStartTime) {
+			t.Errorf("%s still carries its stale lease %v, want the default ceiling to reset it",
+				file.FileKey, current.ProcessingStartTime)
+		}
 	}
 }
