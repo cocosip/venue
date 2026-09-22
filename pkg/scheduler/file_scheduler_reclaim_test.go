@@ -3,7 +3,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -78,8 +77,7 @@ func TestGetNextFileForProcessingRecoversTimedOutFileOnEmptyQueue(t *testing.T) 
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -160,8 +158,7 @@ func TestGetNextFileForProcessingLeavesTimedOutFileWhenReclaimDisabled(t *testin
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			repo, tmpDir := createTestRepository(t)
-			defer func() { _ = os.RemoveAll(tmpDir) }()
+			repo, _ := createTestRepository(t)
 
 			volumes := createTestVolumes(t)
 			defer cleanupVolumes(volumes)
@@ -207,8 +204,7 @@ func TestGetNextBatchForProcessingRecoversTimedOutFilesOnEmptyQueue(t *testing.T
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -257,8 +253,7 @@ func TestEmptyQueueReclaimHonoursCooldown(t *testing.T) {
 	tenant := createTestTenant()
 
 	t.Run("cooldown suppresses a second reclaim", func(t *testing.T) {
-		baseRepo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		baseRepo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -308,8 +303,7 @@ func TestEmptyQueueReclaimHonoursCooldown(t *testing.T) {
 	t.Run("reclaim resumes after the cooldown elapses", func(t *testing.T) {
 		const cooldown = 50 * time.Millisecond
 
-		baseRepo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		baseRepo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -351,8 +345,7 @@ func TestEmptyQueueReclaimHonoursCooldown(t *testing.T) {
 	})
 
 	t.Run("non-positive cooldown disables the gate", func(t *testing.T) {
-		baseRepo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		baseRepo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -379,8 +372,7 @@ func TestEmptyQueueReclaimBoundedByBatchSize(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -450,8 +442,7 @@ func TestEmptyQueueReclaimIsExclusiveUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -516,7 +507,7 @@ func TestEmptyQueueReclaimPropagatesRepositoryFailure(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	reclaimErr := errors.New("badger: value log truncate required")
+	reclaimErr := errors.New("sqlite: database disk image is malformed")
 	repo := &stubMetadataRepository{
 		timedOutFiles: func(context.Context, string, time.Duration) ([]*core.FileMetadata, error) {
 			return nil, reclaimErr
@@ -551,8 +542,7 @@ func TestEmptyQueueReclaimPreservesReplacementLease(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -676,8 +666,7 @@ func TestEmptyQueueReclaimBatchSizeZeroSelectsDefault(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)

@@ -19,8 +19,7 @@ func TestNewFileScheduler(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("Valid configuration", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -46,8 +45,7 @@ func TestNewFileScheduler(t *testing.T) {
 	})
 
 	t.Run("Nil volumes", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		_, err := NewFileScheduler(repo, nil, nil)
 		if err == nil {
@@ -56,8 +54,7 @@ func TestNewFileScheduler(t *testing.T) {
 	})
 
 	t.Run("Empty volumes", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		_, err := NewFileScheduler(repo, map[string]core.StorageVolume{}, nil)
 		if err == nil {
@@ -72,8 +69,7 @@ func TestNewFileScheduler(t *testing.T) {
 func TestGetNextFileForProcessing(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -156,8 +152,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("Get batch of files", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -190,8 +185,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 	})
 
 	t.Run("Empty result when no files", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -210,8 +204,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 	})
 
 	t.Run("Invalid batch size", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 
 		volumes := createTestVolumes(t)
 		defer cleanupVolumes(volumes)
@@ -230,8 +223,7 @@ func TestGetNextBatchForProcessing(t *testing.T) {
 func TestMarkAsCompleted(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -289,8 +281,7 @@ func TestMarkAsCompleted(t *testing.T) {
 
 func TestMarkAsCompletedRejectsStaleLeaseBeforeDeletingFile(t *testing.T) {
 	ctx := context.Background()
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
 
@@ -338,8 +329,7 @@ func TestMarkAsCompletedRejectsStaleLeaseBeforeDeletingFile(t *testing.T) {
 func TestMarkAsFailed(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -440,8 +430,7 @@ func TestMarkAsFailed(t *testing.T) {
 
 func TestMarkAsFailedRejectsStaleLeaseWithoutChangingRetryState(t *testing.T) {
 	ctx := context.Background()
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
 
@@ -482,8 +471,7 @@ func TestMarkAsFailedRejectsStaleLeaseWithoutChangingRetryState(t *testing.T) {
 func TestGetFileStatus(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -523,8 +511,7 @@ func TestGetFileStatus(t *testing.T) {
 func TestResetTimedOutFiles(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -585,8 +572,7 @@ func TestResetTimedOutFiles(t *testing.T) {
 
 func TestResetTimedOutFilesDoesNotOverwriteReplacementLease(t *testing.T) {
 	ctx := context.Background()
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
 
@@ -628,18 +614,13 @@ func TestResetTimedOutFilesDoesNotOverwriteReplacementLease(t *testing.T) {
 // Helper functions
 
 // createTestRepository opens the SQLite metadata repository the scheduler tests
-// drive, below a fresh temporary directory, and registers its shutdown together
-// with that directory's removal.
+// drive, below a temporary directory owned by the test itself.
 //
-// A test that wants the directory removed has to reach it through t.Cleanup
-// rather than deferring os.RemoveAll itself: t.Cleanup runs in LIFO order, so the
-// repository is closed before the directory holding its database files is
-// deleted.
+// t.TempDir removes the directory through its own cleanup, which was registered
+// before the repository's, so LIFO ordering closes the repository — and releases
+// every database file handle — before the directory is deleted.
 func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
-	tmpDir, err := os.MkdirTemp("", "scheduler-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
+	tmpDir := t.TempDir()
 
 	repo, err := metadata.NewSQLiteMetadataRepository(&metadata.SQLiteRepositoryOptions{
 		DataPath:        tmpDir,
@@ -648,12 +629,9 @@ func createTestRepository(t *testing.T) (core.MetadataRepository, string) {
 		Sqlite:          sqlite.DefaultOptions(),
 	})
 	if err != nil {
-		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create repository: %v", err)
 	}
 
-	// Registered last, so it runs first: the repository releases every file
-	// handle before the temporary directory is deleted.
 	t.Cleanup(func() {
 		if err := repo.Close(); err != nil {
 			t.Errorf("close repository: %v", err)

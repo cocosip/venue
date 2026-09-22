@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -93,8 +92,7 @@ func TestGetNextFileForProcessingEmptyQueueReturnsNil(t *testing.T) {
 	})
 
 	t.Run("real repository empty queue", func(t *testing.T) {
-		repo, tmpDir := createTestRepository(t)
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		repo, _ := createTestRepository(t)
 		defer func() { _ = repo.Close() }()
 
 		scheduler, err := NewFileScheduler(repo, createTestVolumes(t), nil)
@@ -168,7 +166,7 @@ func TestGetNextFileForProcessingPropagatesClaimFailures(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("enumeration failure is returned", func(t *testing.T) {
-		enumerationErr := errors.New("badger: value log truncate required")
+		enumerationErr := errors.New("sqlite: database disk image is malformed")
 		repo := &stubMetadataRepository{
 			pendingFiles: func(context.Context, string, int) ([]*core.FileMetadata, error) {
 				return nil, enumerationErr
@@ -466,8 +464,7 @@ func TestResetTimedOutFilesRefreshesAvailability(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			repo, tmpDir := createTestRepository(t)
-			defer func() { _ = os.RemoveAll(tmpDir) }()
+			repo, _ := createTestRepository(t)
 
 			longAgo := time.Now().Add(-2 * time.Hour)
 			file := createTestFileMetadata("stale-availability", core.FileStatusProcessing)
@@ -528,8 +525,7 @@ func TestResetTimedOutFilesRefreshesAvailability(t *testing.T) {
 // zero status instead of a misleading default.
 func TestGetFileStatusWrapsNotFound(t *testing.T) {
 	ctx := context.Background()
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	scheduler, err := NewFileScheduler(repo, createTestVolumes(t), nil)
 	if err != nil {

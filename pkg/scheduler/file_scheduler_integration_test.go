@@ -3,7 +3,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -15,8 +14,7 @@ import (
 func TestIntegration_FileLifecycle(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -63,8 +61,7 @@ func TestIntegration_FileLifecycle(t *testing.T) {
 func TestIntegration_RetryMechanism(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -139,8 +136,7 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 func TestIntegration_ConcurrentProcessing(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -214,8 +210,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 func TestIntegration_TimeoutRecovery(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -286,8 +281,7 @@ func TestIntegration_TimeoutRecovery(t *testing.T) {
 func TestIntegration_BatchProcessing(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -355,8 +349,7 @@ func TestIntegration_BatchProcessing(t *testing.T) {
 func TestIntegration_ExponentialBackoff(t *testing.T) {
 	ctx := context.Background()
 
-	repo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	repo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)

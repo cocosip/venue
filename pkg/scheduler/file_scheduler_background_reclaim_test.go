@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -279,8 +278,7 @@ func TestSuccessfulClaimRunsBackgroundTimedOutReclaim(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -332,8 +330,7 @@ func TestGetNextBatchForProcessingRunsBackgroundTimedOutReclaim(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -375,8 +372,7 @@ func TestBackgroundTimedOutReclaimHonoursBatchSize(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -448,8 +444,7 @@ func TestBackgroundTimedOutReclaimDoesNotSuppressEmptyQueueReclaim(t *testing.T)
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -499,8 +494,7 @@ func TestBackgroundTimedOutReclaimDoesNotSuppressEmptyQueueReclaim(t *testing.T)
 // per-tenant deadline map, so neither can suppress the other, while each still
 // honours its own window and a zero cooldown keeps both ungated.
 func TestReclaimPathsKeepIndependentCooldownState(t *testing.T) {
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -558,8 +552,7 @@ func TestReclaimPathsKeepIndependentCooldownState(t *testing.T) {
 func TestBackgroundTimedOutReclaimCooldownSuppressesSecondPass(t *testing.T) {
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -628,8 +621,7 @@ func TestBackgroundTimedOutReclaimDisabledPerformsNoWork(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			baseRepo, tmpDir := createTestRepository(t)
-			defer func() { _ = os.RemoveAll(tmpDir) }()
+			baseRepo, _ := createTestRepository(t)
 
 			volumes := createTestVolumes(t)
 			defer cleanupVolumes(volumes)
@@ -662,8 +654,7 @@ func TestBackgroundTimedOutReclaimPreservesReplacementLease(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -721,8 +712,7 @@ func TestBackgroundTimedOutReclaimConcurrentClaimsStartOnePass(t *testing.T) {
 	ctx := context.Background()
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -805,8 +795,7 @@ func TestBackgroundTimedOutReclaimConcurrentClaimsStartOnePass(t *testing.T) {
 func TestCloseWaitsForInFlightBackgroundReclaim(t *testing.T) {
 	tenant := createTestTenant()
 
-	baseRepo, tmpDir := createTestRepository(t)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	baseRepo, _ := createTestRepository(t)
 
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
@@ -881,7 +870,7 @@ func TestBackgroundTimedOutReclaimContainsAndLogsFailure(t *testing.T) {
 
 	// The message deliberately carries a physical path and a database suffix: the
 	// scheduler must log only the failure type.
-	scanFailure := errors.New(`badger: value log truncate required for C:\venue-data\tenant.db`)
+	scanFailure := errors.New(`sqlite: database disk image is malformed for C:\venue-data\tenant.db`)
 	repo := &stubMetadataRepository{
 		pendingFiles: func(context.Context, string, int) ([]*core.FileMetadata, error) {
 			return []*core.FileMetadata{createTestFileMetadata("fresh-work", core.FileStatusPending)}, nil
