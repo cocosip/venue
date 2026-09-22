@@ -942,8 +942,8 @@ Not implemented (out of scope for this project, listed for completeness):
   compaction, together with the queue-projection observability surface built on
   it (lag, snapshot, gap, and corrupt-tail diagnostics). Venue's metadata is one
   SQLite database per tenant with transactional writes, so queue state cannot be
-  replayed event by event; `docs/locus-feature-gaps.md` records the recovery
-  guarantee this affects and the mitigation that is in place.
+  replayed event by event; per-tenant SQLite backups are the recovery path, with
+  backup-interval granularity rather than per-event replay.
 - The Locus quota projection/compensation managers. Venue rebuilds tenant and
   directory counts from stored metadata at startup and on demand through
   `ReconcileQuotaCounts`, and compensates on the write path.
@@ -957,7 +957,7 @@ runtime statistics with optional periodic log output, metadata backup with
 offline restore, per-volume startup health retry and warmup, configurable
 timed-out reclaim bounds, tenant quota limit administration, per-tenant cleanup
 and orphan-recovery entry points, and the volume probe/warmup/diagnostics
-capabilities. See `docs/locus-feature-gaps.md` for the tracked remainder.
+capabilities.
 
 ## Build and Verification
 

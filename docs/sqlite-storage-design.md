@@ -4,7 +4,7 @@ This document is the **single design authority** for migrating Venue's metadata 
 DDL, SQL, PRAGMAs, directory/file naming, state transitions, and error mapping are all specified concretely enough to implement directly.
 
 - Language convention: English only. Identifiers, SQL, paths, and PRAGMA names stay in their original form.
-- Evidence convention: Venue paths are repository-relative (for example `pkg/metadata/backup.go:210`). Locus paths are written `locus/src/...` relative to the Locus reference checkout (for example `locus/src/Locus.Storage/Data/MetadataRepository.cs:678-687`). Locus v2.0.0, commit `292bd2cea7051ec277d97ca708443e668b40a2d4`, is the behavioral baseline.
+- Evidence convention: Venue paths are repository-relative (for example `pkg/metadata/sqlite_backup.go:32`). Locus paths are written `locus/src/...` relative to the Locus reference checkout (for example `locus/src/Locus.Storage/Data/MetadataRepository.cs:678-687`). Locus v2.0.0, commit `292bd2cea7051ec277d97ca708443e668b40a2d4`, is the behavioral baseline.
 - **The Locus v2.0.0 reference checkout is not part of this repository.** Every `locus/src/...` citation below is a read-only reference to that external checkout and is recorded here for provenance only.
 - No machine-specific paths appear anywhere in this document. Every path is either repository-relative or a configured root such as `{metadataDirectory}`.
 
@@ -60,7 +60,7 @@ BadgerDB → SQLite data migration is **not implemented** (§14.1). Old Badger d
 8. [Timestamp encoding](#8-timestamp-encoding)
 9. [Transactions and CAS](#9-transactions-and-cas)
 10. [Queue order and pagination](#10-queue-order-and-pagination)
-11. [Backup, restore, and corruption quarantine (W4 option B)](#11-backup-restore-and-corruption-quarantine-w4-option-b)
+11. [Backup, restore, and corruption quarantine](#11-backup-restore-and-corruption-quarantine)
 12. [Maintenance: Optimize / VACUUM / WAL](#12-maintenance-optimize--vacuum--wal)
 13. [Configuration surface](#13-configuration-surface)
 14. [Migration steps (no automatic data migration)](#14-migration-steps-no-automatic-data-migration)
@@ -82,7 +82,7 @@ BadgerDB → SQLite data migration is **not implemented** (§14.1). Old Badger d
 - `pkg/quota`: BadgerDB directory-quota repository → one SQLite database file per tenant (aligned with Locus's `quotas.db`).
 - `config` / `viperconfig` / `venue-config-example.yaml`: `BadgerDBConfig` → `SqliteConfig`.
 - `venue.go` wiring, startup and shutdown, health-check path derivation.
-- W4 (metadata recoverability, option B) on SQLite: `VACUUM INTO` online backups + file-level restore.
+- Metadata recoverability on SQLite: `VACUUM INTO` online backups + file-level restore.
 - Benchmarks and performance thresholds.
 
 **Explicitly out of scope**
@@ -104,8 +104,8 @@ BadgerDB → SQLite data migration is **not implemented** (§14.1). Old Badger d
 | D-05 | Connection strategy: one `*sql.DB` per tenant, `SetMaxOpenConns(1)`, PRAGMAs aligned with `SqliteOptions.BuildPragmaSql()` | Locus `locus/src/Locus.Core/Models/SqliteOptions.cs:60-70,88-105` |
 | D-06 | CAS: conditional `UPDATE` + `RowsAffected` decision, failures mapped to `core.ErrFileNotClaimable` / `core.ErrProcessingLeaseMismatch` | §9; corresponds to `core/interfaces.go:541-556` |
 | D-07 | Pagination: keyset pagination on `ORDER BY available_for_processing_at, created_at, file_key`; cursor is base64url of a fixed-width opaque binary payload | §10; `core/interfaces.go:474-502` |
-| D-08 | Backup: one `VACUUM INTO` backup file per tenant + `PRAGMA integrity_check`; restore = put the file back offline | §11; W4 option B (`docs/locus-feature-gaps.md:51-60`) |
-| D-09 | Backup directory expands one level per tenant: `{backupDirectory}/{tenantId}/metadata.<yyyyMMddTHHmmssZ>.bak` | §11.3; file naming follows `pkg/metadata/backup.go:22-35` |
+| D-08 | Backup: one `VACUUM INTO` backup file per tenant + `PRAGMA integrity_check`; restore = put the file back offline | §11 |
+| D-09 | Backup directory expands one level per tenant: `{backupDirectory}/{tenantId}/metadata.<yyyyMMddTHHmmssZ>.bak` | §11.3; file naming follows `venue_metadata_backup.go` |
 | D-10 | No automatic data migration; breaking change requiring downtime plus manual export/rebuild | §14 |
 | D-11 | `config.BadgerDBConfig` is replaced wholesale by `config.SqliteConfig` (key `sqliteOptions`), with no deprecated alias | §13.3; `AGENTS.md` forbids a second runtime configuration model |
 | D-12 | A single `core.MetadataRepository` facade holds `map[tenantId]*tenantDatabase`; tenant files are opened lazily on first access | §3.4; `venue.go:217` constructs exactly one repository instance |
@@ -143,8 +143,8 @@ BadgerDB → SQLite data migration is **not implemented** (§14.1). Old Badger d
 | Cursor encoding: base64url (RawURLEncoding) opaque token | `pkg/metadata/status_page.go:149-169` |
 | Cleanup/recovery read pages through the optional `StatusPageReader` capability | `venue.go:617-655`, `pkg/cleanup/cleanup_service.go:224-226` |
 | Backup capability: `core.MetadataBackupService.Backup(ctx, w) (since uint64, err error)` | `pkg/core/interfaces.go:355-369` |
-| Backup file naming and timestamp layout: `metadata.<yyyyMMddTHHmmssZ>.bak`, staging `.tmp` | `pkg/metadata/backup.go:21-47,339-409` |
-| Backup retention scans a directory: `PruneBackups(directory, retention, now)` | `pkg/metadata/backup.go:210-235` |
+| Backup file naming and timestamp layout: `metadata.<yyyyMMddTHHmmssZ>.bak`, staging `.tmp` | `venue_metadata_backup.go` (`metadataBackupFileName`, `freeBackupPath`) |
+| Backup retention scans the per-tenant backup tree | `venue_metadata_backup.go` (`MetadataBackupService.prune`) |
 | Quarantine semantics: rename to `<path>.corrupted.<UTC layout>` (no colons, for Windows) | `pkg/metadata/corrupted_database.go:20-30,192-217` |
 | Default quarantine retention is 72h; a negative value disables pruning | `pkg/metadata/corrupted_database.go:15-18,161-167` |
 | `RecoverCorruptedDatabase` / `CorruptedDatabaseRetention` / `BackupDirectory` / `BackupInterval` / `BackupRetention` / `AutoRestoreFromBackup` currently all live on `BadgerDBConfig` | `config/config.go:84-123`, `config/fluent.go:584-610` |
@@ -195,7 +195,7 @@ BadgerDB → SQLite data migration is **not implemented** (§14.1). Old Badger d
 | `PRAGMA integrity_check(1)` is used for the health verdict | `locus/src/Locus.Storage/Data/DatabaseRecoveryService.cs:88-100` |
 | Integrity checks use a separate `Mode=ReadOnly;Pooling=False` connection; the verdict is that the scalar result equals `"ok"`; a read-only connection must not join the shared cache (otherwise concurrent writes cause spurious `SQLITE_READONLY`(8)) | `DatabaseRecoveryService.cs:72-105` (especially `:79-85,92-102`) |
 | Corruption fingerprints: `SQLITE_CORRUPT`(11) / `SQLITE_NOTADB`(26) / `SQLITE_IOERR`(10); `SQLITE_BUSY`(5) / `SQLITE_LOCKED`(6) are only transient locks and do not count as corruption | `DatabaseRecoveryService.cs:106-124` |
-| Recovery prefers rebuilding from the journal and only scans physical files if that fails | `DatabaseRecoveryService.cs:185,533-563`; `docs/locus-feature-gaps.md:53` |
+| Recovery prefers rebuilding from the journal and only scans physical files if that fails | `DatabaseRecoveryService.cs:185,533-563` |
 | One database file per tenant means the repository must be able to enumerate "known tenants" | `MetadataRepository.cs:3763-3785` |
 
 ### 2.3 Dependency availability facts (read-only inspection and an offline probe)
@@ -390,6 +390,15 @@ $env:CGO_ENABLED='0'; go build ./...
 
 Note: `go.sum` currently has no `modernc` entry (§2.3), so `go mod tidy` must complete it. The offline path has been verified end to end (build, run, WAL database create/insert/read on SQLite 3.53.4), so R8 is closed as a risk rather than left as an assumption.
 
+### 4.5 Implementation status of `pkg/sqlite` (phase 0, complete)
+
+The foundational package exists and is tested (`gofmt` clean, `go vet` clean, `go test` and `-race` green, `golangci-lint` 0 issues, both with and without cgo). Three implementation facts differ from, or add detail to, the sketches above and are normative for the rest of the migration:
+
+1. **Windows drive-letter paths need a leading slash in the DSN.** `file:C:/dir/db` is parsed as a drive-relative URI, so `DSN` emits `file:/C:/dir/db?...`. This was verified empirically (file created, `journal_mode=wal`, `busy_timeout` and `cache_size` round-trip).
+2. **Pragma values travel in the data source name** (`_journal_mode=`, `_synchronous=`, `_busy_timeout=`, `_foreign_keys=`, `_pragma=cache_size(...)`, `_pragma=temp_store(MEMORY)`) so every pooled connection is configured identically, plus `_txlock=immediate` for the claim path. `CheckpointAfterBatch` is deliberately *not* part of the DSN: the caller owns it.
+3. **`Open` reports an empty path as `core.ErrInvalidArgument`** (an argument defect) and a missing/non-directory parent, an unusable path or a failed ping as `core.ErrDatabaseError`. Opening a corrupt file satisfies both `core.ErrDatabaseError` and `IsCorruptionError`.
+4. **`IsCorruptionError` combines error codes with a narrow text fallback.** The structural check reads the driver's error code (`SQLITE_CORRUPT`, `SQLITE_NOTADB`, `SQLITE_IOERR`), but `PRAGMA integrity_check` reports corruption as *result text* rather than an error code, so the classifier also recognises `database disk image is malformed`, `file is not a database`, `database corrupt`, `btreeInitPage() returns error code` and `error code 11`. `BUSY`, `LOCKED`, `READONLY` and `CANTOPEN` deliberately stay non-corruption so a lock or permission failure can never trigger a destructive quarantine.
+
 ---
 
 ## 5. Connection and concurrency strategy
@@ -493,7 +502,7 @@ Three notes:
 
 1. Venue's write path is itself "one short transaction per file", and Locus runs in production with a single connection under the same load (the comment at `SqliteOptions.cs:60-70` reaches exactly this conclusion).
 2. `maxOpenConns(1)` preserves Locus's intent in Go as well: "tenant-level maintenance (VACUUM/rebuild/delete) can genuinely release file handles".
-3. The read path currently has two well-defined long scans (cleanup paging and quota reconciliation); their goal is **bounded batches** (`docs/locus-feature-gaps.md:51-60`), not low-latency online queries.
+3. The read path currently has two well-defined long scans (cleanup paging and quota reconciliation); their goal is **bounded batches**, not low-latency online queries.
 
 **Later-optimization threshold (benchmark-driven)**: option B may only be introduced if **all** of the following hold (it adds a `SqliteConfig.ReadPoolSize` field and a read-only `*sql.DB` in `tenantDatabase`):
 
@@ -1260,7 +1269,7 @@ LIMIT @limit;
 
 ---
 
-## 11. Backup, restore, and corruption quarantine (W4 option B)
+## 11. Backup, restore, and corruption quarantine
 
 ### 11.1 Capability interface adjustments
 
@@ -1325,13 +1334,11 @@ func (h *tenantDatabase) backupInto(ctx context.Context, destPath string) error 
         return err
     }
 
-    // 2) Run it on a separate one-shot read-only connection so the tenant's main
-    //    connection (maxOpenConns=1) is not occupied.
-    db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(h.path)+"?mode=ro&_busy_timeout=5000")
-    if err != nil { return err }
-    defer db.Close()
-
-    if _, err := db.ExecContext(ctx, "VACUUM INTO ?", destPath); err != nil {
+    // 2) Run it on the caller's handle. The frozen pkg/sqlite.VacuumInto
+    //    signature receives the *sql.DB rather than a path, so it cannot open the
+    //    one-shot connection sketched above; with maxOpenConns=1 the statement
+    //    simply serializes behind other statements on that handle.
+    if _, err := sqlite.VacuumInto(ctx, h.db, destPath); err != nil {
         return fmt.Errorf("failed to write tenant backup: %w", err)
     }
     return nil
@@ -1340,9 +1347,10 @@ func (h *tenantDatabase) backupInto(ctx context.Context, destPath string) error 
 
 Key points:
 
-- **`VACUUM INTO` only reads the source database**, so a one-shot `mode=ro` connection can be used; it neither consumes the tenant's main connection slot (`maxOpenConns(1)`) nor contends with write transactions on the same connection.
-- The target file must not pre-exist; name collisions follow `pkg/metadata/backup.go:389-408`'s "append `.<n>` within the same second" strategy.
+- **`VACUUM INTO` only reads the source database**, so it is consistent for concurrent readers; it consumes the tenant's single connection slot for the duration of the copy, which is why the periodic runner runs tenant by tenant and off the request path (a read-only side connection remains the documented optimization once `ReadPoolSize` exists, §5.4).
+- The target file must not pre-exist; name collisions follow `venue_metadata_backup.go`'s "append `.<n>` within the same second" strategy.
 - The product is a **complete, directly openable SQLite file**, so restore needs no engine API at all (contrast `badger.DB.Load`, `backup.go:299`).
+- **Implementation status:** `pkg/sqlite.VacuumInto` (pure Go, `modernc.org/sqlite`) implements exactly this and is covered by tests for the copy, the existing-target refusal, a missing parent directory and a concurrent reader.
 
 **Verification**
 
@@ -1359,7 +1367,7 @@ PRAGMA integrity_check(1);
 
 **Staging and publication (existing semantics retained)**
 
-`writeBackupFile`'s three-stage "write staging → `fsync` → rename" flow (`pkg/metadata/backup.go:339-387`) is kept; only the "write" step changes from "run `repo.Backup(w)`" to "`VACUUM INTO dest.tmp` + `integrity_check` + rename":
+the three-stage "write staging → `fsync` → rename" flow is kept; only the "write" step changes from "run `repo.Backup(w)`" to "`VACUUM INTO dest.tmp` + `integrity_check` + rename":
 
 ```text
 {backupDirectory}/{tenantId}/metadata.<stamp>.bak.tmp   # VACUUM INTO target
@@ -1393,7 +1401,7 @@ Readers of the `*.bak` glob can never observe a half-written file (the intent be
 
 ### 11.4 Backup runner (`BackupService`) adjustments
 
-The existing `BackupService` (`pkg/metadata/backup.go:411-606`) is modeled as "one repository + one directory + one `RunOnce`". It becomes:
+The per-tenant backup runner is modeled as "one repository + one directory + one `RunOnce`". It becomes:
 
 ```go
 type BackupServiceOptions struct {
@@ -1497,7 +1505,7 @@ Trigger: opening `{metadataDirectory}/{tenantId}/metadata.db` fails and is class
 
 It must be stated in the `core.MetadataBackupService` godoc: the wording narrows from "as of the backup instant" to **"as of that tenant's backup instant"**, so the wording matches the actual per-tenant behavior instead of implying one global instant. This is registered as §16 D7 and as §11.1 item 3.
 
-**The README must state** (an existing requirement from `docs/locus-feature-gaps.md:60`): recoverability here is backup-interval granularity; Locus's is per-event.
+**The README must state**: recoverability here is backup-interval granularity; Locus's is per-event.
 
 ### 11.7 File semantics of corruption quarantine
 
@@ -1717,7 +1725,7 @@ func validateSqlite(s *SqliteConfig) error {
 
 Rules inherited from `validateBadgerDB`: non-negative retention, and auto-restore requires a backup directory (`config.go:1015-1026`).
 
-**`ApplyDefaults` changes** (corresponding to `config.go:687-695`): the zero-value fallback logic for `CorruptedDatabaseRetention` / `BackupInterval` / `BackupRetention` is retained; new entries cover the empty-string fallbacks for `JournalMode` / `SynchronousMode`, `MaxOpenConns == 0 → 1`, `CacheSizeKb == 0 → -4000`, and the **explicit handling problem** of the `VerifyBackup` boolean default: a boolean field cannot distinguish "not set" from "explicitly false" through zero-value fallback (a known existing issue, see `docs/locus-feature-gaps.md:101`). **Decision**: give `VerifyBackup` pointer semantics or invert it — this design inverts the semantics to `SkipBackupVerification bool` (default `false`, i.e. "verify by default") to escape the zero-value ambiguity entirely. The example YAML exposes `skipBackupVerification`. This is a deliberate correction of an existing configuration defect.
+**`ApplyDefaults` changes** (corresponding to `config.go:687-695`): the zero-value fallback logic for `CorruptedDatabaseRetention` / `BackupInterval` / `BackupRetention` is retained; new entries cover the empty-string fallbacks for `JournalMode` / `SynchronousMode`, `MaxOpenConns == 0 → 1`, `CacheSizeKb == 0 → -4000`, and the **explicit handling problem** of the `VerifyBackup` boolean default: a boolean field cannot distinguish "not set" from "explicitly false" through zero-value fallback (the same defect class `config.ApplyDefaults` already has for default-true booleans). **Decision**: give `VerifyBackup` pointer semantics or invert it — this design inverts the semantics to `SkipBackupVerification bool` (default `false`, i.e. "verify by default") to escape the zero-value ambiguity entirely. The example YAML exposes `skipBackupVerification`. This is a deliberate correction of an existing configuration defect.
 
 > By the same reasoning, `OptimizeIdleTenantDatabases` defaults to `false`, which coincides with its zero value and has no ambiguity, so it stays a plain `bool`.
 
@@ -1919,8 +1927,8 @@ The `CGO_ENABLED=0` build is part of **every** phase's gate list (hard constrain
 | **4. venue.go wiring and startup** | `badgerRepositoryOptions` → `sqliteRepositoryOptions`; construct the SQLite repository; inject tenant enumeration into the backup runner; `pkg/health` path derivation switched to per-tenant `metadata.db`/`quotas.db`; **in the same batch** delete `BadgerDBConfig`, the Badger construction call, and the badger dependency from `go.mod` | `venue.go`, `venue_metadata_backup.go`, `pkg/health/database_health_checker.go`, `config/config.go`, `config/fluent.go`, `viperconfig/viper.go` | Public-entry integration test (`venue.NewVenue` → `Start` → write/claim/complete → `Stop`); `t.TempDir()` cleanup must not fail (handles already closed) |
 | **5. Delete the Badger implementation** | Delete `pkg/metadata/badger_repository.go`, `migration.go`, `conflict_retry.go`, `status_page.go`, and the Badger-specific backup stream; delete `pkg/quota/directory_quota_repository.go`; remove the badger dependency; keep `corrupted_database.go`'s **naming/retention constants** (move them into `sqlite_corruption.go`) or convert the file wholesale | deletions + moves | Full gate set green; no dangling references in the working tree (`golangci-lint`'s unused rules catch them) |
 | **6. Docs/examples** | `README` engine section, configuration key comparison table, `docs/` updates, compilable `examples/` | `README.md`, `docs/*`, `examples/*` | README examples compile (`AGENTS.md` public API documentation clause) |
-| **7. W4 backup/restore** | Per-tenant backup runner, `RestoreTenantMetadata`, zip-container `Backup`/`RestoreMetadata`, `integrity_check` verification, automatic-restore wiring | `pkg/metadata/sqlite_backup.go`, `pkg/metadata/backup.go`, `venue_metadata_backup.go` | Writes are not blocked during backup; restore can list the original files; expired backups are pruned per tenant; a failed restore leaves no partial artifact |
-| **8. W5 remaining items + benchmarks** | Per-tenant `Optimize` VACUUM, idle handle reclamation (off by default), `PRAGMA optimize`, health-check SQLite finish; new benchmarks compared against the Badger baseline | `pkg/metadata/sqlite_repository_bench_test.go`, `pkg/health/*` | Benchmark results recorded (with Go version/OS/CPU/command/run count); performance threshold review (§5.4) |
+| **7. Backup and restore** | Per-tenant backup runner, `RestoreTenantMetadata`, zip-container `Backup`/`RestoreMetadata`, `integrity_check` verification, automatic-restore wiring | `pkg/metadata/sqlite_backup.go`, `venue_metadata_backup.go`, `venue_metadata_backup.go` | Writes are not blocked during backup; restore can list the original files; expired backups are pruned per tenant; a failed restore leaves no partial artifact |
+| **8. Remaining parity items and benchmarks** | Per-tenant `Optimize` VACUUM, idle handle reclamation (off by default), `PRAGMA optimize`, health-check SQLite finish; new benchmarks compared against the Badger baseline | `pkg/metadata/sqlite_backup.go`, `pkg/health/*` | Benchmark results recorded (with Go version/OS/CPU/command/run count); performance threshold review (§5.4) |
 
 **On `BadgerDBConfig` coexisting in phases 1 and 4**: at the end of phase 1, `SqliteConfig` is fully usable but not yet consumed by `venue.go`, and `BadgerDBConfig` is still on the running path. That is a **migration intermediate state** that must be eliminated in the same commit as phase 4; code review must explicitly confirm that no second engine configuration model exists in the repository after phase 4.
 
@@ -1993,7 +2001,7 @@ Every entry below is "logical semantics aligned with Locus, physical implementat
 | D1 | Timestamp physical encoding | TEXT ISO-8601 (`ToString("O")`, `MetadataRepository.cs:4706`) | `INTEGER` Unix nanoseconds UTC | §8.2 (variable fractional digits break lexicographic order + total order + index cost) | Logical time semantics are identical; cross-engine data files are **incompatible** (§14 is already a breaking change) |
 | D2 | Representation of "no value" for `available_for_processing_at` | NULL | `NOT NULL DEFAULT 0`, with `0` as the sentinel | §8.3 (keyset pagination needs a total order; the claim query upgrades from in-memory filtering to an index range scan). Decision D-15 | Domain semantics are identical (`nil` ↔ `0`); the read layer performs the two-way normalization |
 | D3 | `metadata_json` is not stored | Stores a `Dictionary<string,string>` as JSON (`FileMetadataRow.cs:34`) | No such column | §6.4 (Venue's model has no such field). Decision D-13 | No functional loss; can be added later with `ALTER TABLE ADD COLUMN` |
-| D4 | No write-behind queue / per-event journal | Present (the channel + background loop at `MetadataRepository.cs:496-556`) | Synchronous transactions (unchanged from Venue today) | Continues an existing Venue decision (`docs/locus-feature-gaps.md:84` M2); synchronous transactions have stronger durability | No queueing loss; no journal-rebuild capability (§11.6) |
+| D4 | No write-behind queue / per-event journal | Present (the channel + background loop at `MetadataRepository.cs:496-556`) | Synchronous transactions (unchanged from Venue today) | Continues an existing Venue decision (mechanism divergence M2); synchronous transactions have stronger durability | No queueing loss; no journal-rebuild capability (§11.6) |
 | D5 | Indexes drop the leading `tenant_id` | `idx_files_tenant_status_*` (`MetadataRepository.cs:585-588`) | `idx_files_status_*` | §6.5 (`tenant_id` always has selectivity 1 inside a single-tenant database) | Isolation is guaranteed by the file boundary + the write gate + the WHERE predicate |
 | D6 | `idx_files_tenant_physical_path` is not ported | Present (`:588`) | Absent | §6.5 (`core.MetadataRepository` has no query by physical path) | If such a query is added later, the index must be added with it |
 | D7 | Backup consistency scope | Per-event journal | Per-tenant files; tenants' recovery instants differ within one backup cycle | §11.6. Decision D-20 | `interfaces.go:355-369`'s "as of the backup instant" wording must narrow to "as of that tenant's backup instant" |

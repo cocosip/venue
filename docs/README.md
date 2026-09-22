@@ -9,10 +9,9 @@ differ from Locus".
 
 | Document | Contents | Read it before |
 | --- | --- | --- |
-| [`architecture.md`](architecture.md) | The design of the current implementation: layering and package responsibilities, public contracts and optional capabilities, lifecycle, key data flows (write, claim, complete, cleanup, recovery, import, reconciliation), configuration model, logging and errors, concurrency and durability invariants, testing conventions | changing any layer's implementation |
-| [`locus-alignment.md`](locus-alignment.md) | Per-capability alignment matrix against Locus `v2.0.0`, mechanism differences and guarantee comparison, deliberate divergences, outstanding gaps (G1–G9), unconfirmed items | deciding whether something is "aligned with Locus" and what to prioritize |
-| [`sqlite-storage-design.md`](sqlite-storage-design.md) | The storage-engine migration from BadgerDB to SQLite: directory and file layout, tables and indexes, PRAGMA and connection policy, CAS SQL, paging, backup and corruption recovery, configuration surface, migration phases and risks | changing storage or metadata behaviour, or working on the engine migration |
-| [`locus-feature-gaps.md`](locus-feature-gaps.md) | Work tracker: feature gaps and batch plan (W1–W5), mechanism divergences (M1–M6), documentation/behaviour mismatches (D1–D10) | planning work and checking completion status |
+| [`architecture.md`](architecture.md) | The design of the current implementation: layering and package responsibilities, public contracts and optional capabilities, lifecycle, key data flows (write, claim, complete, cleanup, recovery, import, reconciliation), configuration model, logging and errors, concurrency and durability invariants (including the per-tenant SQLite layout, transactions, backup and quarantine), testing conventions | changing any layer's implementation |
+| [`locus-alignment.md`](locus-alignment.md) | Per-capability alignment matrix against Locus `v2.0.0`, the resolved and outstanding alignment gaps (G1–G9), mechanism differences and guarantee comparison (M1–M7), deliberate divergences, and the unconfirmed items | deciding whether something is "aligned with Locus" and what to prioritize |
+| [`sqlite-storage-design.md`](sqlite-storage-design.md) | The storage engine: directory and file layout, tables and indexes, PRAGMA and connection policy, CAS SQL, paging, backup and corruption recovery, configuration surface, migration phases and risks | changing storage or metadata behaviour |
 
 ## Baseline and evidence conventions
 
@@ -36,10 +35,10 @@ differ from Locus".
   contract, status semantic, configuration field or persistence layout, update
   `architecture.md` in the same change; update `locus-alignment.md` when the
   alignment conclusion moves; update `sqlite-storage-design.md` when the engine,
-  schema or backup design changes; update `locus-feature-gaps.md` when a work
-  item is completed or added.
+  schema or backup design changes.
 - Do not write progress narration or temporary task notes in these documents.
-  Completion status belongs in the `locus-feature-gaps.md` status column.
+  A resolved or newly found gap belongs in the gap tables of
+  `locus-alignment.md`, together with its evidence.
 - Never document unverified behaviour as fact. Record what cannot be confirmed in
   the "unconfirmed" section of the relevant document and backfill it after
   verification.
