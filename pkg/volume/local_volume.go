@@ -20,14 +20,28 @@ import (
 // type-assert them, so an implementation drift must fail the build here rather
 // than silently degrade a caller to its fallback path.
 var (
-	_ core.FileMover             = (*LocalFileSystemVolume)(nil)
-	_ core.ShardingDepthProvider = (*LocalFileSystemVolume)(nil)
+	_ core.FileMover                         = (*LocalFileSystemVolume)(nil)
+	_ core.ShardingDepthProvider             = (*LocalFileSystemVolume)(nil)
+	_ core.StorageVolumeHealthProbe          = (*LocalFileSystemVolume)(nil)
+	_ core.StorageVolumeWritePathWarmup      = (*LocalFileSystemVolume)(nil)
+	_ core.StorageVolumeWritePathDiagnostics = (*LocalFileSystemVolume)(nil)
 )
 
 // DefaultHealthCheckCacheTTL is the default lifetime of a cached health probe
 // result. Health probes touch the filesystem, so the result is reused for this
 // window instead of writing and deleting a probe file on every call.
 const DefaultHealthCheckCacheTTL = 30 * time.Second
+
+// writeWarmupFilePrefix is the volume-internal name prefix of the throwaway file
+// WarmWritePathCache creates. The leading dot keeps it out of every tenant
+// namespace, and the prefix makes a file left behind by a crashed process
+// recognizable to cleanup and orphan scans as internal.
+const writeWarmupFilePrefix = ".venue-write-warmup-"
+
+// writeWarmupPayload is the content of the throwaway warmup file. It is
+// deliberately tiny: the warmup exists to exercise the write path, not to move
+// data.
+const writeWarmupPayload = "venue-write-path-warmup"
 
 // LocalFileSystemVolumeOptions configures a local file system volume.
 type LocalFileSystemVolumeOptions struct {
@@ -58,6 +72,9 @@ type LocalFileSystemVolumeOptions struct {
 }
 
 // LocalFileSystemVolume implements StorageVolume for local filesystem.
+//
+// A LocalFileSystemVolume must not be copied after first use: it carries the
+// atomic write-path counters reported by WritePathStatistics.
 type LocalFileSystemVolume struct {
 	volumeID    string
 	mountPath   string
@@ -73,12 +90,22 @@ type LocalFileSystemVolume struct {
 	now         func() time.Time
 	probeHealth func(context.Context) bool
 
+	// warmupName is a seam for deterministic tests. It defaults to a unique
+	// volume-internal name.
+	warmupName func() string
+
 	// healthMu makes the probe single-flight: callers that arrive while a probe
-	// is running wait for it and then reuse its cached result.
+	// is running wait for it and then reuse its cached result. It guards only the
+	// cached probe state; the write path never takes it.
 	healthMu        sync.Mutex
 	healthKnown     bool
 	healthValue     bool
 	healthExpiresAt time.Time
+
+	// writePath aggregates the write-path observations reported by
+	// WritePathStatistics. It is updated through atomics so it never serializes
+	// the write fast path.
+	writePath writePathCounters
 }
 
 // NewLocalFileSystemVolume creates a new local file system volume.
@@ -124,6 +151,9 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 		now:            time.Now,
 	}
 	volume.probeHealth = volume.performHealthProbe
+	volume.warmupName = func() string {
+		return writeWarmupFilePrefix + uuid.NewString()
+	}
 
 	return volume, nil
 }
@@ -175,8 +205,98 @@ func (v *LocalFileSystemVolume) IsHealthy(ctx context.Context) bool {
 	return healthy
 }
 
+// ProbeHealth performs an immediate health probe and refreshes the cached health
+// state that IsHealthy reads, so the forced outcome is the one later health
+// checks report for the rest of the cache window.
+//
+// The probe runs outside the cache mutex: WriteFile never takes healthMu, so a
+// forced probe can never block the write path, and the mutex is held only for the
+// short critical section that publishes the outcome. Concurrent ProbeHealth
+// calls therefore each run their own probe; a forced probe is an explicit caller
+// decision and is deliberately not de-duplicated (unlike the implicit probes
+// that IsHealthy shares through the single-flight lock path).
+//
+// A cancelled context is treated as an unsuccessful probe and is cached like any
+// other outcome; a probe never panics on an unusable context.
+func (v *LocalFileSystemVolume) ProbeHealth(ctx context.Context) bool {
+	healthy := v.probeHealth(ctx)
+
+	v.healthMu.Lock()
+	v.healthKnown = true
+	v.healthValue = healthy
+	v.healthExpiresAt = v.now().Add(v.healthCacheTTL)
+	v.healthMu.Unlock()
+
+	return healthy
+}
+
+// WarmWritePathCache performs one throwaway write through the real volume write
+// path, so the first production write does not pay for a cold path or cold
+// filesystem caches.
+//
+// The probe file is created through WriteFile under a volume-internal dotted name
+// in the volume root, which keeps it subject to the same path sanitization as any
+// payload, and it is deleted again on every outcome. The cleanup runs on a
+// cancellation-detached context, because a cancelled warmup must not leave the
+// probe file behind. Warmup is advisory for callers, but it still reports a write
+// or cleanup failure wrapped around its cause so the caller can decide whether to
+// retry.
+//
+// A context that is already unusable returns the context error without touching
+// the filesystem, and that skipped warmup is not counted by
+// WritePathStatistics.
+func (v *LocalFileSystemVolume) WarmWritePathCache(ctx context.Context) error {
+	if err := contextFailure(ctx); err != nil {
+		return fmt.Errorf("write path warmup skipped: %w", err)
+	}
+
+	// The cleanup is the part that must always run, so it is detached from caller
+	// cancellation while the write itself still observes the caller's context.
+	cleanupCtx := context.WithoutCancel(ctx)
+
+	relativePath := v.warmupName()
+	if _, err := v.WriteFile(ctx, relativePath, strings.NewReader(writeWarmupPayload)); err != nil {
+		if removeErr := v.DeleteFile(cleanupCtx, relativePath); removeErr != nil {
+			// Both halves failed: report both causes rather than hiding the
+			// cleanup failure behind the write failure.
+			return errors.Join(
+				fmt.Errorf("write path warmup write failed: %w", err),
+				fmt.Errorf("write path warmup cleanup failed: %w", removeErr),
+			)
+		}
+		return fmt.Errorf("write path warmup write failed: %w", err)
+	}
+
+	if err := v.DeleteFile(cleanupCtx, relativePath); err != nil {
+		return fmt.Errorf("write path warmup cleanup failed: %w", err)
+	}
+
+	return nil
+}
+
+// WritePathStatistics returns a point-in-time copy of this volume's aggregated
+// write-path observations.
+//
+// The counters are updated with atomics by WriteFile, so the snapshot takes no
+// lock and the write fast path is never serialized. The returned value is a copy:
+// later writes do not mutate it. Only work this volume actually performs is
+// counted: a successful write contributes TotalWrites and TotalBytes, a failed
+// write contributes FailedWrites, and the directory-preparation, payload-copy and
+// fsync phases are observed where WriteFile enters them (fsync only when
+// EnableFsync is on). WarmWritePathCache writes through WriteFile and is
+// therefore counted like any other write, while the private health probe is not,
+// because it does not use the volume write path.
+func (v *LocalFileSystemVolume) WritePathStatistics() core.StorageVolumeWritePathStatistics {
+	return v.writePath.snapshot()
+}
+
 // performHealthProbe runs the uncached health probe.
 func (v *LocalFileSystemVolume) performHealthProbe(ctx context.Context) bool {
+	// An unusable context cannot vouch for the volume and must not panic.
+	if contextFailure(ctx) != nil {
+		return false
+	}
+
 	// Check if mount path exists
 	if _, err := os.Stat(v.mountPath); err != nil {
 		return false
@@ -195,13 +315,43 @@ func (v *LocalFileSystemVolume) performHealthProbe(ctx context.Context) bool {
 	return true
 }
 
+// errNilContext is reported when a caller passes no context at all, which cannot
+// be honoured and must never panic a probe.
+var errNilContext = errors.New("nil context")
+
+// contextFailure returns the reason ctx cannot be honoured, or nil when it can.
+// A nil context cannot be used at all, and a cancelled or expired one must not be
+// treated as permission to perform I/O.
+func contextFailure(ctx context.Context) error {
+	if ctx == nil {
+		return errNilContext
+	}
+	return ctx.Err()
+}
+
 // TotalCapacity and AvailableSpace are implemented in platform-specific files:
 // - local_volume_unix.go for Linux/macOS
 // - local_volume_windows.go for Windows
 
 // WriteFile writes a file to the specified path within the volume.
 // Returns the number of bytes written.
-func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath string, content io.Reader) (int64, error) {
+//
+// Every call is observed by WritePathStatistics: a successful write adds one to
+// TotalWrites and its payload to TotalBytes, a failed write adds one to
+// FailedWrites, and the directory-preparation, payload-copy and (when enabled)
+// fsync phases are timed exactly where this implementation performs them. The
+// counters are updated with atomics, so this fast path takes no lock.
+func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath string, content io.Reader) (written int64, err error) {
+	// Accounting lives in one deferred recorder so no return path can bypass it.
+	defer func() {
+		if err != nil {
+			v.writePath.failedWrites.Add(1)
+			return
+		}
+		v.writePath.totalWrites.Add(1)
+		v.writePath.totalBytes.Add(written)
+	}()
+
 	// Sanitize and get full path
 	fullPath, err := v.sanitizer.SanitizeAndJoin(relativePath)
 	if err != nil {
@@ -210,8 +360,11 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 
 	// Ensure directory exists
 	dir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return 0, fmt.Errorf("failed to create directory: %w", err)
+	directoryStarted := time.Now()
+	mkdirErr := os.MkdirAll(dir, 0755)
+	observeWritePhase(&v.writePath.directoryPreparationCount, &v.writePath.directoryPreparationDuration, directoryStarted)
+	if mkdirErr != nil {
+		return 0, fmt.Errorf("failed to create directory: %w", mkdirErr)
 	}
 
 	// Create file
@@ -222,18 +375,23 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 	defer func() { _ = file.Close() }()
 
 	// Copy content
-	written, err := io.Copy(file, content)
-	if err != nil {
+	copyStarted := time.Now()
+	written, copyErr := io.Copy(file, content)
+	observeWritePhase(&v.writePath.copyOperationCount, &v.writePath.copyDuration, copyStarted)
+	if copyErr != nil {
 		// Clean up on error
 		_ = os.Remove(fullPath)
-		return 0, fmt.Errorf("failed to write file content: %w", err)
+		return 0, fmt.Errorf("failed to write file content: %w", copyErr)
 	}
 
 	// Sync to disk if enabled (for durability)
 	// Note: Full sync can be expensive for high-throughput scenarios.
 	if v.enableFsync {
-		if err := file.Sync(); err != nil {
-			return written, fmt.Errorf("failed to sync file: %w", err)
+		fsyncStarted := time.Now()
+		syncErr := file.Sync()
+		observeWritePhase(&v.writePath.fsyncCount, &v.writePath.fsyncDuration, fsyncStarted)
+		if syncErr != nil {
+			return written, fmt.Errorf("failed to sync file: %w", syncErr)
 		}
 	}
 
