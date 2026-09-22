@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1572,8 +1571,8 @@ func normalizeFilePatterns(patterns []string) ([]string, error) {
 }
 
 // matchesAnyPattern reports whether name matches any configured pattern. An
-// empty pattern list matches everything; matching is case-insensitive on
-// Windows, matching the platform's filesystem semantics.
+// empty pattern list matches everything; matching is case-insensitive so the
+// configured watcher behaves consistently across platforms.
 func matchesAnyPattern(name string, patterns []string) bool {
 	if len(patterns) == 0 {
 		return true
@@ -1594,10 +1593,8 @@ func matchPattern(name, pattern string) bool {
 		return true
 	}
 
-	if runtime.GOOS == "windows" {
-		name = strings.ToLower(name)
-		pattern = strings.ToLower(pattern)
-	}
+	name = strings.ToLower(name)
+	pattern = strings.ToLower(pattern)
 
 	matched, err := filepath.Match(pattern, name)
 	if err != nil {

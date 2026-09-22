@@ -576,13 +576,15 @@ func TestResetTimedOutFilesDoesNotOverwriteReplacementLease(t *testing.T) {
 	volumes := createTestVolumes(t)
 	defer cleanupVolumes(volumes)
 
-	oldStart := time.Now().Add(-2 * time.Hour)
-	newStart := time.Now().UTC()
+	oldStart := time.Now().UTC().Add(-2 * time.Hour)
 	file := createTestFileMetadata("replacement-lease", core.FileStatusProcessing)
 	file.ProcessingStartTime = &oldStart
+	file.CreatedAt = oldStart
+	file.UpdatedAt = oldStart
 	if err := baseRepo.AddOrUpdate(ctx, file); err != nil {
 		t.Fatalf("add metadata: %v", err)
 	}
+	newStart := time.Now().UTC()
 
 	repo := &replacementLeaseRepository{
 		MetadataRepository: baseRepo,
