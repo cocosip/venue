@@ -83,6 +83,17 @@ type BadgerRepositoryOptions struct {
 	// goroutine and must not block; a panic from it propagates to the caller.
 	OnCorruptedDatabase func(quarantinedPath string)
 
+	// OnRecoveryIncomplete, when set, is called synchronously after a database
+	// was quarantined and no backup could be restored into its place, so the
+	// repository is about to serve an empty database. It receives the same
+	// quarantine directory path as OnCorruptedDatabase.
+	//
+	// It exists so a runtime can distinguish "recovered from a backup" from
+	// "previous contents are gone": the caller decides whether that is fatal
+	// (see config.Config.FailFastOnStartupRecoveryFailure). It runs on the
+	// opening goroutine and must not block.
+	OnRecoveryIncomplete func(quarantinedPath string)
+
 	// BackupDirectory is where periodic consistent backups of this repository
 	// are written, and where automatic recovery looks for one. An empty value
 	// disables both.
@@ -201,13 +212,15 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 	// is wrapped because automatic recovery must know that a quarantine
 	// happened, not only that it was offered the data.
 	quarantined := false
+	var quarantinePath string
 	db, err := OpenBadgerWithRecovery(dbPath, CorruptedDatabaseRecoveryOptions{
 		RecoverCorruptedDatabase:   opts.RecoverCorruptedDatabase,
 		CorruptedDatabaseRetention: opts.CorruptedDatabaseRetention,
-		OnCorruptedDatabase: func(quarantinedPath string) {
+		OnCorruptedDatabase: func(quarantinedDir string) {
 			quarantined = true
+			quarantinePath = quarantinedDir
 			if opts.OnCorruptedDatabase != nil {
-				opts.OnCorruptedDatabase(quarantinedPath)
+				opts.OnCorruptedDatabase(quarantinedDir)
 			}
 		},
 	}, func() (*badger.DB, error) {
@@ -219,9 +232,17 @@ func NewBadgerMetadataRepository(opts *BadgerRepositoryOptions) (core.MetadataRe
 
 	// A quarantined database is empty. Replace it with the newest readable
 	// backup before the repository starts serving, so a restart after corruption
-	// resumes from the newest backup instead of from nothing.
-	if quarantined && opts.AutoRestoreFromBackup && opts.BackupDirectory != "" {
-		db = restoreNewestBackupIntoDatabase(dbPath, badgerOpts, opts, db)
+	// resumes from the newest backup instead of from nothing. When that does not
+	// happen the caller is told, so it can decide whether serving an empty store
+	// is acceptable.
+	if quarantined {
+		restored := false
+		if opts.AutoRestoreFromBackup && opts.BackupDirectory != "" {
+			db, restored = restoreNewestBackupIntoDatabase(dbPath, badgerOpts, opts, db)
+		}
+		if !restored && opts.OnRecoveryIncomplete != nil {
+			opts.OnRecoveryIncomplete(quarantinePath)
+		}
 	}
 
 	if err := migrateLegacyMetadata(db); err != nil {
@@ -317,21 +338,23 @@ func newBadgerOptions(opts *BadgerRepositoryOptions) (string, badger.Options, er
 //   - Every failure is contained. A missing, unreadable, or wrongly shaped
 //     backup leaves the caller with its original empty database and a single
 //     structured warning, because failing startup would turn a degraded runtime
-//     into no runtime at all.
+//     into no runtime at all. The caller learns the outcome from the second
+//     result so it can decide whether an empty store is acceptable.
 //   - A backup that cannot be read is skipped in favor of the next newest one.
 //
-// The returned handle is owned by the caller and must be closed. The guarantee
-// is bounded by the backup interval: records committed after the newest backup
-// are not recoverable this way.
-func restoreNewestBackupIntoDatabase(dbPath string, badgerOpts badger.Options, opts *BadgerRepositoryOptions, emptyDB *badger.DB) *badger.DB {
+// The returned handle is owned by the caller and must be closed, and the second
+// result reports whether a backup was actually restored. The guarantee is
+// bounded by the backup interval: records committed after the newest backup are
+// not recoverable this way.
+func restoreNewestBackupIntoDatabase(dbPath string, badgerOpts badger.Options, opts *BadgerRepositoryOptions, emptyDB *badger.DB) (db *badger.DB, restored bool) {
 	backups, err := listBackupsNewestFirst(opts.BackupDirectory)
 	if err != nil {
 		warnRepositoryOpen(opts.Logging, "backup_scan_failed", err)
-		return emptyDB
+		return emptyDB, false
 	}
 	if len(backups) == 0 {
 		warnRepositoryOpen(opts.Logging, "no_backup_available", nil)
-		return emptyDB
+		return emptyDB, false
 	}
 
 	for _, backup := range backups {
@@ -347,23 +370,23 @@ func restoreNewestBackupIntoDatabase(dbPath string, badgerOpts badger.Options, o
 		if closeErr := emptyDB.Close(); closeErr != nil {
 			warnRepositoryOpen(opts.Logging, "restore_swap_failed", closeErr)
 			_ = os.RemoveAll(restorePath)
-			return reopenEmptyDatabase(emptyDB, badgerOpts)
+			return reopenEmptyDatabase(emptyDB, badgerOpts), false
 		}
 
 		if _, statErr := os.Stat(dbPath); statErr == nil {
 			if removeErr := os.RemoveAll(dbPath); removeErr != nil {
 				warnRepositoryOpen(opts.Logging, "restore_swap_failed", removeErr)
 				_ = os.RemoveAll(restorePath)
-				return reopenEmptyDatabase(emptyDB, badgerOpts)
+				return reopenEmptyDatabase(emptyDB, badgerOpts), false
 			}
 		}
 		if renameErr := os.Rename(restorePath, dbPath); renameErr != nil {
 			warnRepositoryOpen(opts.Logging, "restore_swap_failed", renameErr)
 			_ = os.RemoveAll(restorePath)
-			return reopenEmptyDatabase(emptyDB, badgerOpts)
+			return reopenEmptyDatabase(emptyDB, badgerOpts), false
 		}
 
-		restored, openErr := badger.Open(badgerOpts)
+		restoredDB, openErr := badger.Open(badgerOpts)
 		if openErr != nil {
 			// The staged copy opened once, so this is an environment failure.
 			// Keep the runtime alive on an empty database instead of failing
@@ -371,13 +394,13 @@ func restoreNewestBackupIntoDatabase(dbPath string, badgerOpts badger.Options, o
 			// quarantine path is unavailable here.
 			warnRepositoryOpen(opts.Logging, "restore_reopen_failed", openErr)
 			_ = os.RemoveAll(dbPath)
-			return reopenEmptyDatabase(emptyDB, badgerOpts)
+			return reopenEmptyDatabase(emptyDB, badgerOpts), false
 		}
-		return restored
+		return restoredDB, true
 	}
 
 	warnRepositoryOpen(opts.Logging, "backup_restore_unavailable", nil)
-	return emptyDB
+	return emptyDB, false
 }
 
 // reopenEmptyDatabase restores the empty-database fallback after a failed swap.
