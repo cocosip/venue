@@ -55,6 +55,7 @@ type Config struct {
 	TenantManager                    TenantManagerConfig       `json:"tenantManagerOptions" yaml:"tenantManagerOptions" mapstructure:"tenantManagerOptions"`
 	Metadata                         MetadataConfig            `json:"metadataOptions" yaml:"metadataOptions" mapstructure:"metadataOptions"`
 	BadgerDB                         BadgerDBConfig            `json:"badgerDBOptions" yaml:"badgerDBOptions" mapstructure:"badgerDBOptions"`
+	Sqlite                           SqliteConfig              `json:"sqliteOptions" yaml:"sqliteOptions" mapstructure:"sqliteOptions"`
 	Volumes                          []VolumeConfig            `json:"volumes" yaml:"volumes" mapstructure:"volumes"`
 	Tenants                          []TenantConfig            `json:"tenants" yaml:"tenants" mapstructure:"tenants"`
 	FileWatchers                     []FileWatcherConfig       `json:"fileWatchers" yaml:"fileWatchers" mapstructure:"fileWatchers"`
@@ -120,6 +121,100 @@ type BadgerDBConfig struct {
 	// This is a recovery aid, not a substitute for an operator: the restored
 	// state is only as new as the newest backup.
 	AutoRestoreFromBackup bool `json:"autoRestoreFromBackup" yaml:"autoRestoreFromBackup" mapstructure:"autoRestoreFromBackup"`
+}
+
+// SqliteConfig configures the SQLite metadata and directory-quota repositories.
+//
+// One database file is created per tenant below the metadata and quota roots:
+// {metadataDirectory}/{tenantId}/metadata.db and
+// {quotaDirectory}/{tenantId}/quotas.db.
+//
+// The engine is a pure-Go SQLite binding, so the runtime needs no cgo and builds
+// with CGO_ENABLED=0.
+type SqliteConfig struct {
+	// JournalMode is the SQLite journal mode. WAL supports concurrent readers
+	// during a write and provides crash recovery. Allowed values:
+	// DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF (case-insensitive).
+	JournalMode string `json:"journalMode" yaml:"journalMode" mapstructure:"journalMode"`
+
+	// SynchronousMode is the SQLite synchronous mode. NORMAL is safe against
+	// process crashes; a power failure can lose the most recent commits. FULL
+	// fsyncs every commit. Allowed values: OFF, NORMAL, FULL, EXTRA, 0, 1, 2, 3.
+	SynchronousMode string `json:"synchronousMode" yaml:"synchronousMode" mapstructure:"synchronousMode"`
+
+	// CacheSizeKb is the per-connection page cache. Negative values are
+	// kilobytes; positive values are pages (4 KB each). Zero is rejected: it
+	// would disable the page cache and is almost always a configuration error.
+	CacheSizeKb int `json:"cacheSizeKb" yaml:"cacheSizeKb" mapstructure:"cacheSizeKb"`
+
+	// BusyTimeoutMs is how long a statement waits for a lock before failing.
+	BusyTimeoutMs int `json:"busyTimeoutMs" yaml:"busyTimeoutMs" mapstructure:"busyTimeoutMs"`
+
+	// CheckpointAfterBatch runs PRAGMA wal_checkpoint(PASSIVE) after every
+	// committed write batch. It bounds WAL growth at the cost of extra I/O.
+	CheckpointAfterBatch bool `json:"checkpointAfterBatch" yaml:"checkpointAfterBatch" mapstructure:"checkpointAfterBatch"`
+
+	// MaxOpenConns is the connection limit of each tenant's pool. Keep it at 1:
+	// the repository serializes every statement of a tenant on one connection,
+	// mirroring Locus's single long-lived connection per tenant.
+	MaxOpenConns int `json:"maxOpenConns" yaml:"maxOpenConns" mapstructure:"maxOpenConns"`
+
+	// MaxOpenDatabases bounds how many tenant database handles stay open at the
+	// same time. Zero means unlimited: every tenant that was touched keeps its
+	// handle until Close.
+	//
+	// Raise the limit only with benchmark evidence; see the storage design.
+	MaxOpenDatabases int `json:"maxOpenDatabases" yaml:"maxOpenDatabases" mapstructure:"maxOpenDatabases"`
+
+	// OpenDatabaseIdleTimeout closes a tenant handle that has been idle for this
+	// long. Zero disables idle eviction. A non-zero value trades reopen cost for
+	// a smaller file-handle footprint.
+	OpenDatabaseIdleTimeout time.Duration `json:"openDatabaseIdleTimeout" yaml:"openDatabaseIdleTimeout" mapstructure:"openDatabaseIdleTimeout"`
+
+	// RecoverCorruptedDatabase quarantines a database file that cannot be opened
+	// because it is corrupted, and recreates an empty one instead of failing
+	// startup. The quarantined file is kept for CorruptedDatabaseRetention.
+	//
+	// This is a destructive repair: the quarantined data is not re-imported
+	// automatically. A lock or permission failure is never treated as
+	// corruption, because the file may hold a healthy database.
+	RecoverCorruptedDatabase bool `json:"recoverCorruptedDatabase" yaml:"recoverCorruptedDatabase" mapstructure:"recoverCorruptedDatabase"`
+
+	// CorruptedDatabaseRetention is how long a quarantined database file is
+	// kept before it is pruned during startup. Zero selects 72h; a negative
+	// value disables pruning.
+	CorruptedDatabaseRetention time.Duration `json:"corruptedDatabaseRetention" yaml:"corruptedDatabaseRetention" mapstructure:"corruptedDatabaseRetention"`
+
+	// BackupDirectory is the root of the per-tenant backup tree. Each tenant
+	// writes to {BackupDirectory}/{tenantId}/metadata.<stamp>.bak. An empty
+	// value disables periodic backups and automatic restore.
+	BackupDirectory string `json:"backupDirectory" yaml:"backupDirectory" mapstructure:"backupDirectory"`
+
+	// BackupInterval is the delay between two backup cycles. A non-positive
+	// value disables the periodic runner.
+	BackupInterval time.Duration `json:"backupInterval" yaml:"backupInterval" mapstructure:"backupInterval"`
+
+	// BackupRetention is how long a backup file is kept inside each tenant
+	// directory. A non-positive value disables pruning.
+	BackupRetention time.Duration `json:"backupRetention" yaml:"backupRetention" mapstructure:"backupRetention"`
+
+	// AutoRestoreFromBackup loads the newest readable backup of a tenant whose
+	// database had to be quarantined. It requires RecoverCorruptedDatabase and
+	// BackupDirectory. A backup that cannot be loaded leaves the tenant empty
+	// and degraded rather than failing startup, unless
+	// FailFastOnStartupRecoveryFailure is set.
+	AutoRestoreFromBackup bool `json:"autoRestoreFromBackup" yaml:"autoRestoreFromBackup" mapstructure:"autoRestoreFromBackup"`
+
+	// SkipBackupVerification disables the PRAGMA integrity_check(1) that runs on
+	// every produced backup before it is accepted. Verification is ON by
+	// default, so the zero value keeps it on: the field is deliberately inverted
+	// because a boolean cannot distinguish "unset" from an explicit false.
+	SkipBackupVerification bool `json:"skipBackupVerification" yaml:"skipBackupVerification" mapstructure:"skipBackupVerification"`
+
+	// OptimizeIdleTenantDatabases lets the maintenance cycle open, VACUUM and
+	// close tenants that currently have no open handle. Disabled by default
+	// because it multiplies file-handle churn during maintenance.
+	OptimizeIdleTenantDatabases bool `json:"optimizeIdleTenantDatabases" yaml:"optimizeIdleTenantDatabases" mapstructure:"optimizeIdleTenantDatabases"`
 }
 
 // RetryPolicyConfig configures failed-file retry behavior.
@@ -510,6 +605,27 @@ func DefaultConfig() *Config {
 			BackupRetention:       7 * 24 * time.Hour,
 			AutoRestoreFromBackup: false,
 		},
+		Sqlite: SqliteConfig{
+			// The defaults mirror the Locus SQLite options so an engine swap does
+			// not silently change durability or cache behaviour.
+			JournalMode:          "WAL",
+			SynchronousMode:      "NORMAL",
+			CacheSizeKb:          -4000,
+			BusyTimeoutMs:        5000,
+			CheckpointAfterBatch: false,
+			MaxOpenConns:         1,
+			// Zero keeps every touched tenant handle open, as Locus does.
+			MaxOpenDatabases:            0,
+			OpenDatabaseIdleTimeout:     0,
+			RecoverCorruptedDatabase:    false,
+			CorruptedDatabaseRetention:  72 * time.Hour,
+			BackupDirectory:             "",
+			BackupInterval:              time.Hour,
+			BackupRetention:             7 * 24 * time.Hour,
+			AutoRestoreFromBackup:       false,
+			SkipBackupVerification:      false,
+			OptimizeIdleTenantDatabases: false,
+		},
 		Volumes: []VolumeConfig{{
 			VolumeID: "default-volume", MountPath: "./venue-storage/default",
 			VolumeType: "LocalFileSystem", ShardingDepth: 2, EnableFsync: true,
@@ -693,6 +809,30 @@ func (c *Config) ApplyDefaults() {
 	if c.BadgerDB.BackupRetention == 0 {
 		c.BadgerDB.BackupRetention = d.BadgerDB.BackupRetention
 	}
+	if c.Sqlite.JournalMode == "" {
+		c.Sqlite.JournalMode = d.Sqlite.JournalMode
+	}
+	if c.Sqlite.SynchronousMode == "" {
+		c.Sqlite.SynchronousMode = d.Sqlite.SynchronousMode
+	}
+	if c.Sqlite.CacheSizeKb == 0 {
+		c.Sqlite.CacheSizeKb = d.Sqlite.CacheSizeKb
+	}
+	if c.Sqlite.BusyTimeoutMs == 0 {
+		c.Sqlite.BusyTimeoutMs = d.Sqlite.BusyTimeoutMs
+	}
+	if c.Sqlite.MaxOpenConns == 0 {
+		c.Sqlite.MaxOpenConns = d.Sqlite.MaxOpenConns
+	}
+	if c.Sqlite.CorruptedDatabaseRetention == 0 {
+		c.Sqlite.CorruptedDatabaseRetention = d.Sqlite.CorruptedDatabaseRetention
+	}
+	if c.Sqlite.BackupInterval == 0 {
+		c.Sqlite.BackupInterval = d.Sqlite.BackupInterval
+	}
+	if c.Sqlite.BackupRetention == 0 {
+		c.Sqlite.BackupRetention = d.Sqlite.BackupRetention
+	}
 	if c.Statistics.WindowSize == 0 {
 		c.Statistics.WindowSize = d.Statistics.WindowSize
 	}
@@ -858,6 +998,9 @@ func (c *Config) Validate() error {
 	if err := validateBadgerDB(&c.BadgerDB); err != nil {
 		return err
 	}
+	if err := validateSqlite(&c.Sqlite); err != nil {
+		return err
+	}
 	if err := validateCaches(&c.TenantManager, &c.Metadata); err != nil {
 		return err
 	}
@@ -980,6 +1123,65 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// sqliteJournalModes and sqliteSynchronousModes are the value whitelists Locus
+// applies to its SQLite pragmas (SqliteOptions.BuildPragmaSql). They are matched
+// case-insensitively.
+var (
+	sqliteJournalModes = map[string]bool{
+		"DELETE": true, "TRUNCATE": true, "PERSIST": true,
+		"MEMORY": true, "WAL": true, "OFF": true,
+	}
+
+	sqliteSynchronousModes = map[string]bool{
+		"OFF": true, "NORMAL": true, "FULL": true, "EXTRA": true,
+		"0": true, "1": true, "2": true, "3": true,
+	}
+)
+
+// validateSqlite checks the SQLite engine configuration, including the pragma
+// value whitelists, so an injection or a typo fails at construction instead of
+// reaching a PRAGMA statement.
+func validateSqlite(sqlite *SqliteConfig) error {
+	if !sqliteJournalModes[strings.ToUpper(sqlite.JournalMode)] {
+		return fmt.Errorf("Sqlite.JournalMode %q is not one of DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF", sqlite.JournalMode)
+	}
+	if !sqliteSynchronousModes[strings.ToUpper(sqlite.SynchronousMode)] {
+		return fmt.Errorf("Sqlite.SynchronousMode %q is not one of OFF, NORMAL, FULL, EXTRA, 0, 1, 2, 3", sqlite.SynchronousMode)
+	}
+	if sqlite.CacheSizeKb == 0 {
+		return fmt.Errorf("Sqlite.CacheSizeKb cannot be 0: it would disable the page cache")
+	}
+	if sqlite.BusyTimeoutMs < 0 {
+		return fmt.Errorf("Sqlite.BusyTimeoutMs cannot be negative")
+	}
+	if sqlite.MaxOpenConns < 1 {
+		return fmt.Errorf("Sqlite.MaxOpenConns must be at least 1")
+	}
+	if sqlite.MaxOpenDatabases < 0 {
+		return fmt.Errorf("Sqlite.MaxOpenDatabases cannot be negative")
+	}
+	if sqlite.OpenDatabaseIdleTimeout < 0 {
+		return fmt.Errorf("Sqlite.OpenDatabaseIdleTimeout cannot be negative")
+	}
+	if sqlite.CorruptedDatabaseRetention < 0 {
+		return fmt.Errorf("Sqlite.CorruptedDatabaseRetention cannot be negative")
+	}
+	if sqlite.BackupInterval < 0 {
+		return fmt.Errorf("Sqlite.BackupInterval cannot be negative")
+	}
+	if sqlite.BackupRetention < 0 {
+		return fmt.Errorf("Sqlite.BackupRetention cannot be negative")
+	}
+	if sqlite.AutoRestoreFromBackup && sqlite.BackupDirectory == "" {
+		return fmt.Errorf("Sqlite.AutoRestoreFromBackup requires Sqlite.BackupDirectory")
+	}
+	// An empty BackupDirectory disables periodic backups, so BackupInterval and
+	// BackupRetention are simply unused in that case. They are not rejected: the
+	// defaults carry a positive interval, and requiring the directory would make
+	// DefaultConfig itself invalid.
 	return nil
 }
 

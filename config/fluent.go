@@ -68,6 +68,14 @@ func (c *Config) WithBadgerDB(value *BadgerDBConfig) *Config {
 	return c
 }
 
+// WithSqlite sets the SQLite engine configuration.
+func (c *Config) WithSqlite(value *SqliteConfig) *Config {
+	if value != nil {
+		c.Sqlite = *value
+	}
+	return c
+}
+
 // WithVolumes replaces configured volumes with copies of values.
 func (c *Config) WithVolumes(values ...*VolumeConfig) *Config {
 	c.Volumes = c.Volumes[:0]
@@ -541,6 +549,104 @@ func (c *MetadataConfig) WithMaxCacheEntries(value int) *MetadataConfig {
 func NewBadgerDBConfig() *BadgerDBConfig {
 	value := DefaultConfig().BadgerDB
 	return &value
+}
+
+// NewSqliteConfig returns the default SQLite engine configuration.
+func NewSqliteConfig() *SqliteConfig {
+	value := DefaultConfig().Sqlite
+	return &value
+}
+
+// WithJournalMode sets the SQLite journal mode.
+func (c *SqliteConfig) WithJournalMode(value string) *SqliteConfig {
+	c.JournalMode = value
+	return c
+}
+
+// WithSynchronousMode sets the SQLite synchronous mode.
+func (c *SqliteConfig) WithSynchronousMode(value string) *SqliteConfig {
+	c.SynchronousMode = value
+	return c
+}
+
+// WithCacheSizeKb sets the per-connection SQLite page cache.
+func (c *SqliteConfig) WithCacheSizeKb(value int) *SqliteConfig {
+	c.CacheSizeKb = value
+	return c
+}
+
+// WithBusyTimeout sets how long a statement waits for a SQLite lock.
+func (c *SqliteConfig) WithBusyTimeout(value time.Duration) *SqliteConfig {
+	c.BusyTimeoutMs = int(value / time.Millisecond)
+	return c
+}
+
+// WithCheckpointAfterBatch enables or disables a passive WAL checkpoint after a
+// committed write batch.
+func (c *SqliteConfig) WithCheckpointAfterBatch(enabled bool) *SqliteConfig {
+	c.CheckpointAfterBatch = enabled
+	return c
+}
+
+// WithMaxOpenConns sets the connection limit of each tenant's pool.
+func (c *SqliteConfig) WithMaxOpenConns(value int) *SqliteConfig {
+	c.MaxOpenConns = value
+	return c
+}
+
+// WithMaxOpenDatabases bounds how many tenant database handles stay open.
+func (c *SqliteConfig) WithMaxOpenDatabases(value int) *SqliteConfig {
+	c.MaxOpenDatabases = value
+	return c
+}
+
+// WithOpenDatabaseIdleTimeout closes a tenant handle that has been idle this long.
+func (c *SqliteConfig) WithOpenDatabaseIdleTimeout(value time.Duration) *SqliteConfig {
+	c.OpenDatabaseIdleTimeout = value
+	return c
+}
+
+// WithCorruptedDatabaseRecovery enables or disables quarantining a corrupt
+// database file and recreating it.
+func (c *SqliteConfig) WithCorruptedDatabaseRecovery(enabled bool) *SqliteConfig {
+	c.RecoverCorruptedDatabase = enabled
+	return c
+}
+
+// WithCorruptedDatabaseRetention sets how long a quarantined database is kept.
+func (c *SqliteConfig) WithCorruptedDatabaseRetention(value time.Duration) *SqliteConfig {
+	c.CorruptedDatabaseRetention = value
+	return c
+}
+
+// WithBackup configures the per-tenant consistent backup tree. An empty
+// directory disables backups.
+func (c *SqliteConfig) WithBackup(directory string, interval time.Duration, retention time.Duration) *SqliteConfig {
+	c.BackupDirectory = directory
+	c.BackupInterval = interval
+	c.BackupRetention = retention
+	return c
+}
+
+// WithAutoRestoreFromBackup enables or disables restoring the newest backup of a
+// quarantined tenant database.
+func (c *SqliteConfig) WithAutoRestoreFromBackup(enabled bool) *SqliteConfig {
+	c.AutoRestoreFromBackup = enabled
+	return c
+}
+
+// WithBackupVerificationSkipped turns the backup integrity check on or off.
+// Verification is on by default, so false keeps it enabled.
+func (c *SqliteConfig) WithBackupVerificationSkipped(skip bool) *SqliteConfig {
+	c.SkipBackupVerification = skip
+	return c
+}
+
+// WithOptimizeIdleTenantDatabases enables or disables VACUUM of tenants that
+// currently have no open handle.
+func (c *SqliteConfig) WithOptimizeIdleTenantDatabases(enabled bool) *SqliteConfig {
+	c.OptimizeIdleTenantDatabases = enabled
+	return c
 }
 
 // WithGCInterval sets the BadgerDB garbage-collection interval.
