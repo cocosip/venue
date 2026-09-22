@@ -55,6 +55,12 @@ venue:
     blockCacheSize: 64
     # Enable synchronous writes (true = durable but slower, false = faster)
     syncWrites: false
+    # Quarantine a database that cannot be opened and recreate it instead of
+    # failing startup. Destructive: the quarantined directory is kept but not
+    # re-imported, so enable it only if you can restore from the backup.
+    recoverCorruptedDatabase: false
+    # How long a quarantined database directory is kept before startup removes it
+    corruptedDatabaseRetention: 72h
 
   # Storage volumes configuration
   volumes:
@@ -64,12 +70,16 @@ venue:
       shardingDepth: 2
       # Enable fsync after file writes (true = durable but slower)
       enableFsync: true
+      # Cache the volume health probe for this long (0 = default 30s,
+      # negative disables caching so every operation probes the volume)
+      healthCheckCacheTTL: 30s
 
     - volumeId: vol-002
       mountPath: ./venue-data/storage/volume-2
       volumeType: LocalFileSystem
       shardingDepth: 2
       enableFsync: true
+      healthCheckCacheTTL: 30s
 
   # Tenant configurations
   tenants:
@@ -89,8 +99,12 @@ venue:
       quota: null
 
   # File watcher configurations
-  fileWatchers:
-    # VIP tenant dedicated watcher
+  #
+  # Note: `enabled` and `includeSubdirectories` default to false when bound from
+  # a file. A boolean key that is absent from the source cannot be distinguished
+  # from an explicit false, so set both explicitly (the Go API uses
+  # config.NewFileWatcherConfig(), which defaults them to true).
+  fileWatchers:    # VIP tenant dedicated watcher
     - watcherId: watcher-vip-tenant-001
       tenantId: tenant-001
       multiTenantMode: false
@@ -126,6 +140,32 @@ venue:
       minFileAge: 5s
       maxConcurrentImports: 8
 
+  # Root watcher templates: every immediate subdirectory of rootPath becomes one
+  # single-tenant watcher (ID auto-<rootBase>-<tenantDir>). Applying a root is
+  # idempotent, and a persisted operator enable/disable decision wins.
+  watcherRoots: []
+  #   - rootPath: ./venue-data/watch/shared
+  #     multiTenantMode: true
+  #     enabled: true
+  #     includeSubdirectories: true
+  #     filePatterns:
+  #       - "*.*"
+  #     postImportAction: Delete
+  #     moveToDirectory: ""
+  #     pollingInterval: 30s
+  #     maxFileSizeBytes: 0
+  #     minFileAge: 5s
+  #     maxConcurrentImports: 4
+
+  # Global file watcher service options (enablement is persisted across restarts)
+  watcherServiceOptions:
+    enabled: true
+    defaultPollingInterval: 30s
+    minimumPollingInterval: 5s
+    maximumPollingInterval: 1h
+    disabledCheckInterval: 1m
+    maxParallelWatcherScans: 4
+
   # Enable background cleanup service
   enableBackgroundCleanup: true
 
@@ -141,18 +181,60 @@ venue:
     cleanupTimedOutFiles: true
     # Processing timeout threshold
     processingTimeout: 30m
+    # Reclaim timed-out files immediately when a worker finds no available work,
+    # so a crashed worker's file is not stuck until the next cleanup cycle
+    recoverTimedOutOnEmptyQueue: true
+    # Minimum interval between immediate reclaim attempts per tenant
+    timedOutReclaimCooldown: 30s
     # Cleanup permanently failed files
     cleanupPermanentlyFailedFiles: true
+    # How a permanently failed payload is handled once the retention elapses:
+    #   Keep              - leave payload and metadata in place (still counts toward quota)
+    #   MoveToDeadLetter  - move the payload into the dead-letter area and release quota (default)
+    #   Delete            - remove the payload and its metadata
+    permanentlyFailedDisposition: MoveToDeadLetter
+    # Dead-letter layout. Relative paths resolve under the owning volume mount path.
+    deadLetter:
+      rootPath: .deadletter
+      includeTenantInPath: true
+      includeDatePartition: true
+      shardingDepth: 2
     # Retention period for failed files
     failedFileRetentionPeriod: 72h  # 3 days
     # Cleanup completed file records
     cleanupCompletedRecords: true
     # Retention period for completed records
     completedRecordRetentionPeriod: 0s  # Remove during the next cleanup cycle
+    # Remove metadata whose physical file is gone (opt-in: one file-existence
+    # check per tracked record, so enable it only if files can disappear
+    # out-of-band, e.g. on a lost or manually pruned volume)
+    cleanupOrphanedMetadata: false
+    # Remove OS junk files (Thumbs.db, .DS_Store, desktop.ini) from the volumes
+    cleanupJunkFiles: true
+    # Minimum interval between recursive junk-file sweeps
+    junkFileCleanupInterval: 20m
+    # Remove quarantined database directories (*.corrupted.*) past their retention
+    cleanupInvalidDatabaseBackups: true
+    # Volumes that were intentionally retired. Disposition is Keep (default) or
+    # PurgeMetadataOnly (drop metadata and quota rows without touching storage).
+    retiredVolumes: []
     # Optimize databases to reclaim space
     optimizeDatabases: true
     # Database optimization interval
     databaseOptimizationInterval: 24h
+
+  # Orphan-file recovery options (disabled by default)
+  # Recovery scans storage volumes for physical files that have no metadata
+  # record (for example after a crash between the physical write and the
+  # metadata commit) and re-registers them as Pending so they re-enter the queue.
+  orphanRecoveryOptions:
+    enabled: false
+    # Run one recovery scan shortly after startup (waits for initialDelay)
+    runOnStartup: false
+    # Delay between periodic recovery scans
+    recoveryInterval: 6h
+    # Delay before the first scan, so storage volumes can finish mounting
+    initialDelay: 10s
 
   # Database health check options
   databaseHealthCheckOptions:

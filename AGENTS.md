@@ -42,9 +42,12 @@ Repository ownership:
 - `pkg/quota/`: tenant and directory quotas.
 - `pkg/volume/`: physical storage volumes and path safety.
 - `pkg/cleanup/`: cleanup and database optimization.
+- `pkg/recovery/`: opt-in orphan-file recovery that rebuilds missing metadata.
 - `pkg/watcher/`: watched-directory imports.
 - `pkg/health/`: startup and periodic health checks.
 - `pkg/logging/`: instance-scoped structured logging runtime.
+- `pkg/statistics/`: bounded in-process runtime statistics (recorder, reader, optional periodic log output).
+- `internal/directorypath/`: shared logical-directory normalization.
 - `test/benchmark/`: public-entry system benchmarks.
 
 Keep edits within these ownership boundaries. Do not create a second runtime configuration model or bypass the public entry point in integration tests and system benchmarks.
@@ -81,6 +84,7 @@ When adding a configuration field, update defaults, cloning, validation where re
 - Never infer a tenant from process-global state, headers, or a package global.
 - Every caller-visible read, status transition, completion, and failure operation must carry tenant context.
 - A tenant must not list, claim, read, mutate, or delete another tenant's metadata or files.
+- Validate every tenant identifier with `core.ValidateTenantID` before it becomes a path segment, a database directory name, or a storage directory name.
 - Legacy metadata migrations must be restartable and idempotent.
 - Rebuild indexes from stored tenant ownership rather than from path assumptions.
 
@@ -95,6 +99,7 @@ When adding a configuration field, update defaults, cloning, validation where re
 - Protect tenant caches and lifecycle state with `sync.Map`, mutexes, or atomic state as appropriate.
 - Do not reduce concurrency to hide races or contention defects.
 - Check `context.Context` cancellation in loops and background services.
+- Long-running maintenance (cleanup, reconciliation, orphan scans) must read status records through `core.StatusPageReader` when the repository provides it, and fall back to the unbounded query only for repositories that do not.
 
 ## Storage And Persistence
 
@@ -150,11 +155,14 @@ Testing rules:
 - Run race tests before any commit.
 - Do not weaken assertions, add retries, or serialize tests merely to hide a race.
 
-On this Windows workspace, if the default Go cache is inaccessible, use ignored repository-local caches:
+If the default Go cache is not writable in the current environment, point the caches and temporary directory at an ignored repository-local directory:
 
 ```powershell
-$env:GOCACHE='D:\Code\go\venue\tmp\go-build'
-$env:GOLANGCI_LINT_CACHE='D:\Code\go\venue\tmp\golangci-lint'
+$env:GOCACHE="$PWD/.gotmp/go-build"
+$env:GOLANGCI_LINT_CACHE="$PWD/.gotmp/golangci-lint"
+$env:GOTMPDIR="$PWD/.gotmp/tmp"
+$env:TMP="$PWD/.gotmp/tmp"
+$env:TEMP="$PWD/.gotmp/tmp"
 ```
 
 ## Benchmarks

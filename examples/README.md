@@ -29,9 +29,14 @@ runtime, err := venue.NewVenue(cfg)
 
 `Config` 以及 `VolumeConfig`、`TenantConfig`、`RetryPolicyConfig`、
 `TenantManagerConfig`、`MetadataConfig`、`BadgerDBConfig`、
-`FileWatcherConfig`、`CleanupConfig` 和 `DatabaseHealthCheckConfig` 都支持
-链式配置。顶层的 `WithVolumes`、`WithTenants`、`WithFileWatchers` 替换整个
-集合；需要追加时使用 `AddVolume`、`AddTenant`、`AddFileWatcher`。
+`FileWatcherConfig`、`CleanupConfig`、`OrphanRecoveryConfig` 和
+`DatabaseHealthCheckConfig` 都支持链式配置。顶层的 `WithVolumes`、
+`WithTenants`、`WithFileWatchers` 替换整个集合；需要追加时使用
+`AddVolume`、`AddTenant`、`AddFileWatcher`。
+
+租户 ID 会作为元数据文件名和物理存储目录段使用，因此所有入口都会先校验：
+包含 `/`、`\`、`:`、控制字符、前导/尾随点或空格、Windows 设备名，或超过
+128 字节的 ID 会被拒绝为 `core.ErrInvalidArgument`。
 
 ## Viper 适配
 
@@ -59,4 +64,9 @@ Viper，也不读取文件；不使用适配器的应用不会被迫依赖 Viper
 - [`viper-config/venue-config.yaml`](viper-config/venue-config.yaml)：根节点配置示例。
 - [`viper-config/venue-config.json`](viper-config/venue-config.json)：JSON 配置示例。
 
-示例会在本地创建临时数据目录，仅用于演示，不应直接作为生产目录规划。
+从文件绑定时，`enabled` 与 `includeSubdirectories` 这类布尔键必须显式写出：
+源文件中缺失的布尔键与显式的 `false` 无法区分。Go 侧的
+`config.NewFileWatcherConfig()` 会把它们默认设为 `true`。
+
+示例会在本地创建临时数据目录，仅用于演示，不应直接作为生产目录规划；生成的
+数据库与配置转储已被 `.gitignore` 排除。
