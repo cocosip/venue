@@ -144,6 +144,80 @@ func (c *Config) WithFileWatcherService(value *FileWatcherServiceConfig) *Config
 	return c
 }
 
+// WithSourceCleanup sets durable post-import source cleanup options.
+func (c *Config) WithSourceCleanup(value *SourceCleanupConfig) *Config {
+	if value != nil {
+		c.SourceCleanup = *value
+	}
+	return c
+}
+
+// NewSourceCleanupConfig returns source cleanup options with Venue defaults.
+func NewSourceCleanupConfig() *SourceCleanupConfig {
+	value := DefaultConfig().SourceCleanup
+	return &value
+}
+
+// WithEnabled enables or disables durable source cleanup.
+func (c *SourceCleanupConfig) WithEnabled(enabled bool) *SourceCleanupConfig {
+	c.Enabled = enabled
+	return c
+}
+
+// WithDatabasePath sets the source cleanup SQLite database path.
+func (c *SourceCleanupConfig) WithDatabasePath(value string) *SourceCleanupConfig {
+	c.DatabasePath = value
+	return c
+}
+
+// WithPollingInterval sets the cleanup worker polling interval.
+func (c *SourceCleanupConfig) WithPollingInterval(value time.Duration) *SourceCleanupConfig {
+	c.PollingInterval = value
+	return c
+}
+
+// WithMaxConcurrentActions bounds concurrent source cleanup actions.
+func (c *SourceCleanupConfig) WithMaxConcurrentActions(value int) *SourceCleanupConfig {
+	c.MaxConcurrentActions = value
+	return c
+}
+
+// WithMaxActiveJobs bounds durable active cleanup reservations.
+func (c *SourceCleanupConfig) WithMaxActiveJobs(value int) *SourceCleanupConfig {
+	c.MaxActiveJobs = value
+	return c
+}
+
+// WithTerminalJobRetention sets how long terminal cleanup records are kept.
+func (c *SourceCleanupConfig) WithTerminalJobRetention(value time.Duration) *SourceCleanupConfig {
+	c.TerminalJobRetentionPeriod = value
+	return c
+}
+
+// WithImportReservationTimeout sets the stale import reservation timeout.
+func (c *SourceCleanupConfig) WithImportReservationTimeout(value time.Duration) *SourceCleanupConfig {
+	c.ImportReservationTimeout = value
+	return c
+}
+
+// WithDatabaseOptimization enables or disables cleanup database optimization.
+func (c *SourceCleanupConfig) WithDatabaseOptimization(enabled bool) *SourceCleanupConfig {
+	c.EnableDatabaseOptimization = enabled
+	return c
+}
+
+// WithDatabaseOptimizationInterval sets the optimization interval.
+func (c *SourceCleanupConfig) WithDatabaseOptimizationInterval(value time.Duration) *SourceCleanupConfig {
+	c.DatabaseOptimizationInterval = value
+	return c
+}
+
+// WithTerminalPruneBatchSize sets the terminal record prune batch size.
+func (c *SourceCleanupConfig) WithTerminalPruneBatchSize(value int) *SourceCleanupConfig {
+	c.TerminalPruneBatchSize = value
+	return c
+}
+
 // NewFileWatcherServiceConfig returns the default global watcher options.
 func NewFileWatcherServiceConfig() *FileWatcherServiceConfig {
 	value := DefaultConfig().FileWatcherService
@@ -196,6 +270,7 @@ func NewFileWatcherRootConfig(rootPath string) *FileWatcherRootConfig {
 		MaxPostImportActionRetryCount:     defaultMaxPostImportActionRetryCount,
 		PostImportActionRetryInitialDelay: defaultPostImportActionRetryInitialDelay,
 		PostImportActionRetryMaxDelay:     defaultPostImportActionRetryMaxDelay,
+		SourceCleanupFailureDirectory:     defaultSourceCleanupFailureDirectory,
 
 		AutoCreateTenantDirectoriesCacheTTL: defaultAutoCreateTenantDirectoriesCacheTTL,
 		FileStabilityCheckDelay:             defaultFileStabilityCheckDelay,
@@ -244,6 +319,12 @@ func (c *FileWatcherRootConfig) WithPostImportAction(value string) *FileWatcherR
 // WithMoveToDirectory sets the derived watcher move destination.
 func (c *FileWatcherRootConfig) WithMoveToDirectory(value string) *FileWatcherRootConfig {
 	c.MoveToDirectory = value
+	return c
+}
+
+// WithSourceCleanupFailureDirectory sets the derived watcher quarantine directory.
+func (c *FileWatcherRootConfig) WithSourceCleanupFailureDirectory(value string) *FileWatcherRootConfig {
+	c.SourceCleanupFailureDirectory = value
 	return c
 }
 
@@ -739,6 +820,7 @@ func NewFileWatcherConfig() *FileWatcherConfig {
 		MaxPostImportActionRetryCount:     defaultMaxPostImportActionRetryCount,
 		PostImportActionRetryInitialDelay: defaultPostImportActionRetryInitialDelay,
 		PostImportActionRetryMaxDelay:     defaultPostImportActionRetryMaxDelay,
+		SourceCleanupFailureDirectory:     defaultSourceCleanupFailureDirectory,
 
 		AutoCreateTenantDirectoriesCacheTTL: defaultAutoCreateTenantDirectoriesCacheTTL,
 		FileStabilityCheckDelay:             defaultFileStabilityCheckDelay,
@@ -836,6 +918,12 @@ func (c *FileWatcherConfig) WithPostImportAction(value string) *FileWatcherConfi
 // WithMoveToDirectory sets the post-import move destination.
 func (c *FileWatcherConfig) WithMoveToDirectory(value string) *FileWatcherConfig {
 	c.MoveToDirectory = value
+	return c
+}
+
+// WithSourceCleanupFailureDirectory sets the watcher quarantine directory.
+func (c *FileWatcherConfig) WithSourceCleanupFailureDirectory(value string) *FileWatcherConfig {
+	c.SourceCleanupFailureDirectory = value
 	return c
 }
 

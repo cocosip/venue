@@ -51,6 +51,7 @@ type Venue struct {
 	fileWatcherAutoManager core.FileWatcherAutoManager
 	databaseHealthChecker  core.DatabaseHealthChecker
 	orphanRecoveryCore     core.OrphanRecoveryService
+	sourceCleanupStore     watcher.SourceCleanupStore
 
 	// Background services
 	cleanupService     *cleanup.BackgroundCleanupService
@@ -591,12 +592,42 @@ func (v *Venue) initialize() error {
 	if len(v.config.FileWatchers) > 0 || len(v.config.FileWatcherRoots) > 0 {
 		v.emit(ctx, slog.LevelInfo, "file_watcher_initializing", "Initializing file watcher service",
 			slog.Int("watchers", len(v.config.FileWatchers)), slog.Int("roots", len(v.config.FileWatcherRoots)))
+		var sourceCleanupStore watcher.SourceCleanupStore
+		var sourceCleanupWorkerOptions *watcher.SourceCleanupWorkerOptions
+		if v.config.SourceCleanup.Enabled {
+			databasePath := v.config.SourceCleanup.DatabasePath
+			if !filepath.IsAbs(databasePath) {
+				databasePath = filepath.Join(v.config.FileWatcherConfigurationDirectory, databasePath)
+			}
+			openedStore, openErr := watcher.OpenSourceCleanupStore(databasePath, watcher.SourceCleanupStoreOptions{
+				MaxActiveJobs: v.config.SourceCleanup.MaxActiveJobs,
+			})
+			if openErr != nil {
+				return fmt.Errorf("failed to open source cleanup store: %w", openErr)
+			}
+			sourceCleanupStore = openedStore
+			v.sourceCleanupStore = openedStore
+			sourceCleanupWorkerOptions = &watcher.SourceCleanupWorkerOptions{
+				PollingInterval:              v.config.SourceCleanup.PollingInterval,
+				MaxConcurrentActions:         v.config.SourceCleanup.MaxConcurrentActions,
+				ImportReservationTimeout:     v.config.SourceCleanup.ImportReservationTimeout,
+				TerminalRetentionPeriod:      v.config.SourceCleanup.TerminalJobRetentionPeriod,
+				TerminalPruneBatchSize:       v.config.SourceCleanup.TerminalPruneBatchSize,
+				DatabaseOptimization:         v.config.SourceCleanup.EnableDatabaseOptimization,
+				DatabaseOptimizationInterval: v.config.SourceCleanup.DatabaseOptimizationInterval,
+				RetryInitialDelay:            5 * time.Second,
+				RetryMaxDelay:                5 * time.Minute,
+				RuntimeEnabled:               v.sourceCleanupRuntimeEnabled,
+			}
+		}
 		fileWatcherCore, err := watcher.NewFileWatcher(&watcher.FileWatcherOptions{
-			TenantManager:        v.tenantManager,
-			StoragePool:          v.storagePool,
-			ConfigurationRootDir: v.config.FileWatcherConfigurationDirectory,
-			Logging:              v.logger,
-			StatisticsRecorder:   v.statisticsRecorder,
+			TenantManager:              v.tenantManager,
+			StoragePool:                v.storagePool,
+			ConfigurationRootDir:       v.config.FileWatcherConfigurationDirectory,
+			Logging:                    v.logger,
+			StatisticsRecorder:         v.statisticsRecorder,
+			SourceCleanupStore:         sourceCleanupStore,
+			SourceCleanupWorkerOptions: sourceCleanupWorkerOptions,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create file watcher: %w", err)
@@ -627,6 +658,7 @@ func (v *Venue) initialize() error {
 				MaxPostImportActionRetryCount:     watcherCfg.MaxPostImportActionRetryCount,
 				PostImportActionRetryInitialDelay: watcherCfg.PostImportActionRetryInitialDelay,
 				PostImportActionRetryMaxDelay:     watcherCfg.PostImportActionRetryMaxDelay,
+				SourceCleanupFailureDirectory:     watcherCfg.SourceCleanupFailureDirectory,
 				Enabled:                           watcherCfg.Enabled,
 
 				// The configuration expresses the two housekeeping switches in
@@ -691,6 +723,7 @@ func (v *Venue) initialize() error {
 					MaxPostImportActionRetryCount:     rootCfg.MaxPostImportActionRetryCount,
 					PostImportActionRetryInitialDelay: rootCfg.PostImportActionRetryInitialDelay,
 					PostImportActionRetryMaxDelay:     rootCfg.PostImportActionRetryMaxDelay,
+					SourceCleanupFailureDirectory:     rootCfg.SourceCleanupFailureDirectory,
 
 					AutoCreateTenantDirectoriesCacheTTL:     rootCfg.AutoCreateTenantDirectoriesCacheTTL,
 					FileStabilityCheckDelay:                 rootCfg.FileStabilityCheckDelay,
@@ -965,6 +998,7 @@ func (v *Venue) Start() error {
 		{"cleanup", "cleanup_started", v.cleanupService},
 		{"orphan recovery", "orphan_recovery_started", v.orphanRecovery},
 		{"file watcher", "file_watcher_started", v.fileWatcherService},
+		{"source cleanup", "source_cleanup_started", v.sourceCleanupService()},
 		{"metadata backup", "metadata_backup_started", v.metadataBackupService()},
 		{"statistics output", "statistics_output_started", v.statisticsOutputService()},
 	}
@@ -1014,6 +1048,7 @@ func (v *Venue) Stop() error {
 		}{
 			{"statistics output", "statistics_output_stop_failed", v.statisticsOutputService()},
 			{"metadata backup", "metadata_backup_stop_failed", v.metadataBackupService()},
+			{"source cleanup", "source_cleanup_stop_failed", v.sourceCleanupService()},
 			{"file watcher", "file_watcher_stop_failed", v.fileWatcherService},
 			{"orphan recovery", "orphan_recovery_stop_failed", v.orphanRecovery},
 			{"cleanup", "cleanup_stop_failed", v.cleanupService},
@@ -1063,6 +1098,44 @@ func (v *Venue) statisticsOutputService() backgroundService {
 	return voidBackgroundService{start: v.statisticsOutput.Start, stop: v.statisticsOutput.Stop}
 }
 
+// sourceCleanupService adapts the optional durable watcher cleanup worker to
+// Venue's background service lifecycle.
+func (v *Venue) sourceCleanupService() backgroundService {
+	if v.sourceCleanupStore == nil {
+		return nil
+	}
+	lifecycle, ok := v.fileWatcherCore.(interface {
+		StartSourceCleanup(context.Context)
+		StopSourceCleanup()
+	})
+	if !ok {
+		return nil
+	}
+	return voidBackgroundService{
+		start: func() { lifecycle.StartSourceCleanup(v.ctx) },
+		stop:  lifecycle.StopSourceCleanup,
+	}
+}
+
+// sourceCleanupRuntimeEnabled follows the background watcher service and the
+// persisted per-watcher enablement state. Source cleanup is paused while the
+// watcher service is globally disabled or no watcher is currently enabled.
+func (v *Venue) sourceCleanupRuntimeEnabled(ctx context.Context) bool {
+	if v.fileWatcherService == nil || !v.fileWatcherService.IsEnabled() || v.fileWatcherCore == nil {
+		return false
+	}
+	watchers, err := v.fileWatcherCore.GetAllWatchers(ctx)
+	if err != nil {
+		return false
+	}
+	for _, watcherConfig := range watchers {
+		if watcherConfig != nil && watcherConfig.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
 // closeRepositories releases every repository opened by NewVenue. It is
 // idempotent so it can run on both the construction-failure and the Stop path.
 func (v *Venue) closeRepositories() {
@@ -1085,6 +1158,12 @@ func (v *Venue) closeRepositories() {
 			}
 		}
 		v.fileWatcherCore = nil
+	}
+	if v.sourceCleanupStore != nil {
+		if err := v.sourceCleanupStore.Close(); err != nil {
+			v.emit(v.ctx, slog.LevelError, "source_cleanup_store_close_failed", "Failed to close source cleanup store", errorTypeAttr(err))
+		}
+		v.sourceCleanupStore = nil
 	}
 
 	if v.metadataRepo != nil {

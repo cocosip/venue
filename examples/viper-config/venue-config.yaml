@@ -7,6 +7,18 @@ autoCreateTenants: true
 defaultTenantQuota: 0  # 0 = unlimited
 enableDatabaseHealthCheck: true
 
+sourceCleanup:
+  enabled: true
+  databasePath: source-cleanup.db
+  pollingInterval: 5s
+  maxConcurrentActions: 2
+  maxActiveJobs: 10000
+  terminalJobRetentionPeriod: 24h
+  importReservationTimeout: 10m
+  enableDatabaseOptimization: true
+  databaseOptimizationInterval: 24h
+  terminalPruneBatchSize: 5000
+
 retryPolicy:
   maxRetryCount: 3
   initialRetryDelay: 5s
@@ -54,6 +66,7 @@ fileWatchers:
     maxPostImportActionRetryCount: 5
     postImportActionRetryInitialDelay: 5s
     postImportActionRetryMaxDelay: 5m
+    sourceCleanupFailureDirectory: ./locus-source-failed
 
   - watcherId: watcher-all-regular-tenants
     tenantId: ""
@@ -72,6 +85,7 @@ fileWatchers:
     maxPostImportActionRetryCount: 5
     postImportActionRetryInitialDelay: 5s
     postImportActionRetryMaxDelay: 5m
+    sourceCleanupFailureDirectory: ./locus-source-failed
 
 enableBackgroundCleanup: true
 

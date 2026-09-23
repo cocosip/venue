@@ -279,6 +279,7 @@ func (m *fileWatcherAutoManager) generatedWatcherConfiguration(root *core.FileWa
 		PostImportActionRetryMaxDelay:           root.PostImportActionRetryMaxDelay,
 		PostImportAction:                        root.PostImportAction,
 		MoveToDirectory:                         root.MoveToDirectory,
+		SourceCleanupFailureDirectory:           root.SourceCleanupFailureDirectory,
 		Enabled:                                 root.Enabled,
 		AutoCreateTenantDirectoriesCacheTTL:     root.AutoCreateTenantDirectoriesCacheTTL,
 		FileStabilityCheckDelay:                 root.FileStabilityCheckDelay,

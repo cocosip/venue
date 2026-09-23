@@ -42,6 +42,17 @@ venue:
 	}
 }
 
+func TestNewWithDefaultsBindsSourceCleanupDefaults(t *testing.T) {
+	cfg, err := Load(NewWithDefaults())
+	if err != nil {
+		t.Fatalf("Load(NewWithDefaults()) error = %v", err)
+	}
+	if !cfg.SourceCleanup.Enabled || cfg.SourceCleanup.DatabasePath != "source-cleanup.db" ||
+		cfg.SourceCleanup.MaxActiveJobs != 10000 || cfg.SourceCleanup.TerminalPruneBatchSize != 5000 {
+		t.Fatalf("source cleanup defaults = %#v", cfg.SourceCleanup)
+	}
+}
+
 func TestLoadFromFileAdaptsFileToConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "venue.yaml")
 	content := []byte("venue:\n  metadataDirectory: ./metadata\n  quotaDirectory: ./quota\n  volumes:\n    - volumeId: v1\n      mountPath: ./storage\n")

@@ -558,6 +558,10 @@ type FileWatcherRootConfiguration struct {
 	// MoveToDirectory is the target directory for PostImportActionMove.
 	MoveToDirectory string
 
+	// SourceCleanupFailureDirectory is inherited by generated watchers when
+	// durable source cleanup exhausts its retry budget.
+	SourceCleanupFailureDirectory string
+
 	// PollingInterval is the scan interval for generated watchers.
 	PollingInterval time.Duration
 

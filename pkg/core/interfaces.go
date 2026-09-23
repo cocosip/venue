@@ -712,6 +712,10 @@ type FileWatcherConfiguration struct {
 	// MoveToDirectory is the target directory for PostImportActionMove.
 	MoveToDirectory string
 
+	// SourceCleanupFailureDirectory is the durable source-cleanup quarantine
+	// directory used after delete or move retries are exhausted.
+	SourceCleanupFailureDirectory string
+
 	// Enabled indicates if this watcher is active.
 	Enabled bool
 

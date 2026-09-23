@@ -62,6 +62,7 @@ const (
 	// FileWatcherConfiguration.ImportedFilesHistoryFlushInterval.
 	defaultImportedFilesHistoryFlushInterval = 2 * time.Second
 	defaultMaxPostImportActionRetryCount     = 5
+	defaultPostImportActionRetryInitialDelay = 5 * time.Second
 	defaultPostImportActionRetryMaxDelay     = 5 * time.Minute
 
 	// fingerprintSampleSize matches the latest Locus watcher: the beginning,
@@ -87,6 +88,14 @@ type FileWatcherOptions struct {
 	// StatisticsRecorder optionally receives in-process scan statistics.
 	// Nil means recording is disabled.
 	StatisticsRecorder core.StatisticsRecorder
+
+	// SourceCleanupStore optionally provides durable post-import cleanup.
+	// Nil preserves the legacy in-memory/history behavior.
+	SourceCleanupStore SourceCleanupStore
+
+	// SourceCleanupWorkerOptions enables the durable cleanup worker. The worker
+	// is started and stopped by the Venue lifecycle, not by construction.
+	SourceCleanupWorkerOptions *SourceCleanupWorkerOptions
 }
 
 // importedFileRecord is the persisted de-duplication state for one source path.
@@ -130,6 +139,9 @@ type fileWatcher struct {
 
 	// statistics optionally receives scan statistics. Nil disables recording.
 	statistics core.StatisticsRecorder
+
+	sourceCleanupStore  SourceCleanupStore
+	sourceCleanupWorker *SourceCleanupWorker
 
 	// now reads the current time. It is injectable so the tenant-directory cache
 	// TTL, the prune throttle and the flush debounce window can be exercised
@@ -239,6 +251,7 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 		configRoot:           configRoot,
 		logger:               logger,
 		statistics:           opts.StatisticsRecorder,
+		sourceCleanupStore:   opts.SourceCleanupStore,
 		now:                  time.Now,
 		stabilityWait:        waitForStabilityDelay,
 		scheduleHistoryFlush: time.AfterFunc,
@@ -257,8 +270,92 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 		fw.emit(context.Background(), slog.LevelWarn, "watcher_state_load_failed", "Failed to load watcher runtime state",
 			slog.String("state_file", watcherStateFileName), errorTypeAttr(err))
 	}
+	if opts.SourceCleanupStore != nil && opts.SourceCleanupWorkerOptions != nil {
+		workerOptions := *opts.SourceCleanupWorkerOptions
+		workerOptions.Store = opts.SourceCleanupStore
+		if workerOptions.Execute == nil {
+			workerOptions.Execute = fw.executeSourceCleanupJob
+		}
+		if workerOptions.Quarantine == nil {
+			workerOptions.Quarantine = fw.quarantineSourceCleanupJob
+		}
+		worker, err := NewSourceCleanupWorker(workerOptions)
+		if err != nil {
+			return nil, err
+		}
+		fw.sourceCleanupWorker = worker
+	}
+	if fw.sourceCleanupStore != nil {
+		if err := fw.migrateLegacySourceCleanup(); err != nil {
+			fw.emit(context.Background(), slog.LevelWarn, "source_cleanup_migration_failed", "Failed to migrate legacy source cleanup records", errorTypeAttr(err))
+		}
+	}
 
 	return fw, nil
+}
+
+// migrateLegacySourceCleanup moves pending imported-files.json records into the
+// durable store before scans can process them. A record is removed from the
+// legacy history only after its SQLite reservation and imported state are safe.
+func (w *fileWatcher) migrateLegacySourceCleanup() error {
+	var migrated int
+	var migrationErr error
+	w.importedFiles.Range(func(key, value any) bool {
+		filePath, ok := key.(string)
+		record, recordOK := value.(importedFileRecord)
+		if !ok || !recordOK || record.WatcherID == "" || record.TenantID == "" {
+			return true
+		}
+		action := sourceCleanupAction(record.PostImportAction)
+		if !record.PendingPostImportAction {
+			action = SourceCleanupActionKeep
+		}
+		job := SourceCleanupJob{
+			WatcherID:         record.WatcherID,
+			TenantID:          record.TenantID,
+			SourcePath:        filePath,
+			Fingerprint:       record.Fingerprint,
+			FileKey:           record.FileKey,
+			Action:            action,
+			MoveTargetPath:    record.MoveTargetPath,
+			MaxAttempts:       defaultMaxPostImportActionRetryCount,
+			RetryInitialDelay: defaultPostImportActionRetryInitialDelay,
+			RetryMaxDelay:     defaultPostImportActionRetryMaxDelay,
+			FailureDirectory:  filepath.Join(w.configRoot, "locus-source-failed"),
+		}
+		reserved, err := w.sourceCleanupStore.TryReserve(context.Background(), &job)
+		if err != nil {
+			migrationErr = errors.Join(migrationErr, err)
+			return true
+		}
+		if reserved {
+			if err := w.sourceCleanupStore.MarkImported(context.Background(), job.JobID, record.FileKey, "", time.Now()); err != nil {
+				migrationErr = errors.Join(migrationErr, err)
+				return true
+			}
+		} else {
+			existing, loadErr := w.sourceCleanupStore.GetBySource(context.Background(), job.WatcherID, job.SourcePath)
+			if loadErr != nil {
+				migrationErr = errors.Join(migrationErr, loadErr)
+				return true
+			}
+			if existing == nil || existing.State == SourceCleanupStateImporting {
+				if existing == nil || existing.FileKey == "" {
+					migrationErr = errors.Join(migrationErr, fmt.Errorf("legacy source cleanup reservation was not persisted for %s", filepath.Base(filePath)))
+					return true
+				}
+			}
+		}
+		w.importedFiles.Delete(filePath)
+		migrated++
+		return true
+	})
+	if migrated > 0 {
+		if err := w.saveImportedFilesHistory(); err != nil {
+			migrationErr = errors.Join(migrationErr, err)
+		}
+	}
+	return migrationErr
 }
 
 // Close persists the import de-duplication history.
@@ -268,6 +365,9 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 // scans. Every history change that is still pending is written before Close
 // returns, including changes a debounced history write had not persisted yet.
 func (w *fileWatcher) Close() error {
+	if w.sourceCleanupWorker != nil {
+		w.sourceCleanupWorker.Stop()
+	}
 	w.importedFilesMu.Lock()
 	if w.closed {
 		w.importedFilesMu.Unlock()
@@ -289,6 +389,20 @@ func (w *fileWatcher) Close() error {
 	w.awaitPendingHistoryFlush()
 
 	return w.saveImportedFilesHistory()
+}
+
+// StartSourceCleanup starts the durable source cleanup worker when configured.
+func (w *fileWatcher) StartSourceCleanup(ctx context.Context) {
+	if w.sourceCleanupWorker != nil {
+		w.sourceCleanupWorker.Start(ctx)
+	}
+}
+
+// StopSourceCleanup stops the durable source cleanup worker when configured.
+func (w *fileWatcher) StopSourceCleanup() {
+	if w.sourceCleanupWorker != nil {
+		w.sourceCleanupWorker.Stop()
+	}
 }
 
 // RegisterWatcher adds a new file watcher configuration.
@@ -420,6 +534,12 @@ func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration
 	}
 	if config.PostImportActionRetryMaxDelay < 0 {
 		return nil, fmt.Errorf("post-import action retry max delay cannot be negative: %w", core.ErrInvalidArgument)
+	}
+	if failureDirectory := strings.TrimSpace(config.SourceCleanupFailureDirectory); failureDirectory != "" {
+		cleaned := filepath.Clean(failureDirectory)
+		if filepath.IsAbs(failureDirectory) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("source cleanup failure directory must remain below the watcher configuration root: %w", core.ErrInvalidArgument)
+		}
 	}
 
 	patterns, err := normalizeFilePatterns(config.FilePatterns)
@@ -1008,6 +1128,38 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 
 	defer w.releaseImportSlot(filePath, token)
 
+	operationID, operationErr := createImportOperationID(tenant.ID, filePath, fingerprint)
+	if operationErr != nil {
+		return outcome, operationErr
+	}
+	var cleanupJob SourceCleanupJob
+	if w.sourceCleanupStore != nil {
+		failureDirectory := ""
+		if config.SourceCleanupFailureDirectory != "" {
+			failureDirectory = filepath.Join(w.configRoot, config.SourceCleanupFailureDirectory)
+		}
+		cleanupJob = SourceCleanupJob{
+			WatcherID:         config.WatcherID,
+			TenantID:          tenant.ID,
+			SourcePath:        filePath,
+			Fingerprint:       fingerprint,
+			OperationID:       operationID,
+			Action:            sourceCleanupAction(config.PostImportAction),
+			MoveTargetPath:    moveTargetPathForConfig(filePath, config),
+			FailureDirectory:  failureDirectory,
+			MaxAttempts:       config.MaxPostImportActionRetryCount,
+			RetryInitialDelay: config.PostImportActionRetryInitialDelay,
+			RetryMaxDelay:     config.PostImportActionRetryMaxDelay,
+		}
+		reserved, err := w.sourceCleanupStore.TryReserve(ctx, &cleanupJob)
+		if err != nil {
+			return outcome, fmt.Errorf("failed to reserve source cleanup: %w", err)
+		}
+		if !reserved {
+			return outcome, nil
+		}
+	}
+
 	// Extract original filename for diagnostics only; physical paths are never
 	// derived from caller-supplied names.
 	originalFileName := filepath.Base(filePath)
@@ -1018,10 +1170,6 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 
 	var fileKey string
 	if idempotent, ok := w.storagePool.(core.IdempotentStoragePool); ok {
-		operationID, operationErr := createImportOperationID(tenant.ID, filePath, fingerprint)
-		if operationErr != nil {
-			return outcome, operationErr
-		}
 		fileKey, err = idempotent.WriteFileIdempotently(
 			ctx, tenant, file, &originalFileName, operationID)
 	} else {
@@ -1037,6 +1185,14 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	// open handle blocks the rename or delete.
 	if err := file.Close(); err != nil {
 		return outcome, fmt.Errorf("failed to close source file: %w", err)
+	}
+	if w.sourceCleanupStore != nil {
+		if err := w.sourceCleanupStore.MarkImported(ctx, cleanupJob.JobID, fileKey, operationID, w.now()); err != nil {
+			return outcome, fmt.Errorf("failed to persist source cleanup job: %w", err)
+		}
+		w.emit(ctx, slog.LevelInfo, "file_imported", "Imported watched file",
+			slog.String("watcher_id", config.WatcherID), slog.String("file_key", fileKey), slog.Int64("bytes", fileInfo.Size()))
+		return outcome, nil
 	}
 
 	if config.PostImportAction == core.PostImportActionKeep {
@@ -1083,6 +1239,98 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 		slog.String("watcher_id", config.WatcherID), slog.String("file_key", fileKey), slog.Int64("bytes", fileInfo.Size()))
 
 	return outcome, nil
+}
+
+func sourceCleanupAction(action core.PostImportAction) SourceCleanupAction {
+	switch action {
+	case core.PostImportActionMove:
+		return SourceCleanupActionMove
+	case core.PostImportActionKeep:
+		return SourceCleanupActionKeep
+	default:
+		return SourceCleanupActionDelete
+	}
+}
+
+func moveTargetPathForConfig(filePath string, config *core.FileWatcherConfiguration) string {
+	if config == nil || config.PostImportAction != core.PostImportActionMove || config.MoveToDirectory == "" {
+		return ""
+	}
+	target, err := resolveMoveTargetPath(filePath, config.MoveToDirectory)
+	if err == nil && target != "" {
+		return target
+	}
+	return filepath.Join(config.MoveToDirectory, filepath.Base(filePath))
+}
+
+func (w *fileWatcher) executeSourceCleanupJob(ctx context.Context, job SourceCleanupJob) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Stat(job.SourcePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(job.SourcePath)
+	if err != nil {
+		return err
+	}
+	fingerprint, fingerprintErr := fileFingerprint(file, info)
+	closeErr := file.Close()
+	if fingerprintErr != nil {
+		return fingerprintErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if fingerprint != job.Fingerprint {
+		return fmt.Errorf("%w: source file changed after import", ErrSourceCleanupFingerprintChanged)
+	}
+	return w.performPostImportAction(ctx, job.SourcePath, postImportAction(job.Action), job.MoveTargetPath)
+}
+
+func (w *fileWatcher) quarantineSourceCleanupJob(ctx context.Context, job SourceCleanupJob) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Stat(job.SourcePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(job.SourcePath)
+	if err != nil {
+		return err
+	}
+	fingerprint, fingerprintErr := fileFingerprint(file, info)
+	_ = file.Close()
+	if fingerprintErr != nil {
+		return fingerprintErr
+	}
+	if fingerprint != job.Fingerprint {
+		return fmt.Errorf("%w: source file changed after import", ErrSourceCleanupFingerprintChanged)
+	}
+	target := filepath.Join(job.FailureDirectory, job.WatcherID, filepath.Base(job.SourcePath))
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return err
+	}
+	return moveFileWithFallback(ctx, job.SourcePath, target, os.Rename)
+}
+
+func postImportAction(action SourceCleanupAction) core.PostImportAction {
+	switch action {
+	case SourceCleanupActionMove:
+		return core.PostImportActionMove
+	case SourceCleanupActionKeep:
+		return core.PostImportActionKeep
+	default:
+		return core.PostImportActionDelete
+	}
 }
 
 // performPostImportAction performs the configured action after successful import.

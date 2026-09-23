@@ -172,6 +172,7 @@ The configuration lifecycle is:
 | `FileWatchers` | `fileWatchers` | Directory import watchers |
 | `FileWatcherRoots` | `watcherRoots` | Root templates that derive one watcher per tenant directory |
 | `FileWatcherService` | `watcherServiceOptions` | Global watcher service enablement, polling bounds, and scan parallelism |
+| `SourceCleanup` | `sourceCleanup` | Durable post-import source cleanup database, leases, retries, and retention |
 | `EnableBackgroundCleanup` | `enableBackgroundCleanup` | Start the periodic cleanup service |
 | `Cleanup` | `cleanupOptions` | Cleanup intervals, retention, and processing timeout |
 | `OrphanRecovery` | `orphanRecoveryOptions` | Optional orphan-file recovery (disabled by default) |
@@ -202,6 +203,7 @@ Each configuration module has its own constructor and chainable methods:
 | `FileWatcherConfig` | `config.NewFileWatcherConfig()` | Watched-directory imports |
 | `FileWatcherRootConfig` | `config.NewFileWatcherRootConfig(path)` | Per-tenant watcher derivation from a root |
 | `FileWatcherServiceConfig` | `config.NewFileWatcherServiceConfig()` | Global watcher service options |
+| `SourceCleanupConfig` | `config.NewSourceCleanupConfig()` | Durable post-import Delete/Move/Keep actions |
 | `CleanupConfig` | `config.NewCleanupConfig()` | Cleanup and processing timeouts |
 | `OrphanRecoveryConfig` | `config.NewOrphanRecoveryConfig()` | Opt-in orphan-file recovery |
 | `DatabaseHealthCheckConfig` | `config.NewDatabaseHealthCheckConfig()` | Startup and periodic checks |
@@ -282,6 +284,10 @@ The important runtime defaults are:
 | Watcher minimum file age | `5s` |
 | Watcher concurrent imports | `4` |
 | Watcher post-import action attempts | `5` (`5s` initial delay, exponential backoff capped at `5m`) |
+| Durable source cleanup | enabled (`source-cleanup.db`, `5s` polling, `2` concurrent actions, `10,000` total records) |
+| Source cleanup reservation timeout | `10m`; terminal records retained `24h` and pruned in batches of `5,000` |
+| Source cleanup database optimization | enabled every `24h` |
+| Source cleanup failure directory | `./locus-source-failed` below the watcher configuration directory |
 
 Watcher defaults are applied for durations, capacities, patterns, and the
 post-import action. `enabled` and `includeSubdirectories` are booleans: the Go
@@ -748,17 +754,33 @@ the import pipeline:
 | `autoCreateTenantDirectoriesCacheTtl` | `60s` | How long the tenant list used by `autoCreateTenantDirectories` is cached |
 | `fileStabilityCheckDelay` | `100ms` | Delay before the second stability probe; negative disables the probe |
 | `skipStabilityCheckAfterAge` | `1m` | Skip the second probe for candidates at least this old; negative always probes |
-| `maxPostImportActionRetryCount` | `5` | Maximum delete or move attempts after the storage write succeeds; exhaustion quarantines the source revision |
+| `maxPostImportActionRetryCount` | `5` | Maximum durable delete or move attempts after the storage write succeeds |
 | `postImportActionRetryInitialDelay` | `5s` | Initial retry delay; retries use exponential backoff |
 | `postImportActionRetryMaxDelay` | `5m` | Maximum delay between post-import action attempts |
+| `sourceCleanupFailureDirectory` | `./locus-source-failed` | Relative quarantine directory for exhausted durable source cleanup jobs |
 | `disableImportedFilesPruneThrottle` | `false` | Deliberately inverted: the prune throttle is **on** by default, so the zero value keeps it on and `true` turns it off |
 | `importedFilesPruneInterval` | `5m` | Minimum delay between prune runs while the throttle is on |
 | `disableImportedFilesHistoryFlushDebounce` | `false` | Deliberately inverted: the write debounce is **on** by default, so the zero value keeps it on and `true` turns it off |
-| `importedFilesHistoryFlushInterval` | `2s` | Minimum delay between import-history persistence writes while the debounce is on |
+| `importedFilesHistoryFlushInterval` | `2s` | Minimum delay between legacy import-history persistence writes while the debounce is on |
 
 The double-negative naming is intentional: both switches are on by default, so a
 configuration file that omits them keeps the throttled, debounced behavior
 instead of silently disabling it.
+
+When `sourceCleanup.enabled` is true, the watcher reserves a durable SQLite
+cleanup job before writing storage. The storage write keeps the deterministic
+tenant-scoped operation ID; Delete, Move, and Keep are completed by a separate
+lease-based worker. A process crash leaves the job recoverable after
+`importReservationTimeout`, and total-record capacity prevents an unbounded
+backlog. The worker rechecks the sampled fingerprint immediately before a
+source action, so a replacement file is never deleted or moved by an older
+import. Exhausted failures without a failure directory are retained as terminal
+suppression records. When `sourceCleanupFailureDirectory` is configured, the
+worker retries moving the matching source revision below
+`<failure-directory>/<watcher-id>/`; after a successful quarantine the cleanup
+job is removed. Existing `imported-files.json` pending
+records are migrated into the SQLite store at startup; disabling source
+cleanup keeps the legacy history behavior for compatibility.
 
 Watcher fingerprints include file size, modification time, and SHA-256 hashes
 of bounded beginning/middle/end content samples. Before a Delete or Move action,
@@ -975,7 +997,10 @@ Not implemented (out of scope for this project, listed for completeness):
   directory counts from stored metadata at startup and on demand through
   `ReconcileQuotaCounts`, and compensates on the write path.
 
-Implemented and aligned with Locus: permanently-failed disposition with
+Implemented and aligned with Locus v1.5.5 watcher lifecycle: durable source
+cleanup reservations and leases, restart recovery, bounded cleanup capacity,
+fingerprint-safe Delete/Move/Keep execution, and legacy pending-action migration.
+Other aligned capabilities include permanently-failed disposition with
 dead-letter storage, junk-file cleanup, quarantined-database cleanup,
 retired-volume policy, cumulative cleanup statistics, watcher root derivation,
 global watcher options with a global enable/disable switch and a persisted

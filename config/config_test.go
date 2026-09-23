@@ -321,3 +321,97 @@ func TestFollowUpOptimizationDefaultsAndFluent(t *testing.T) {
 		t.Fatalf("Validate() error = %v", err)
 	}
 }
+
+func TestSourceCleanupDefaultsAndFluentConstruction(t *testing.T) {
+	defaults := DefaultConfig()
+	if !defaults.SourceCleanup.Enabled {
+		t.Fatal("SourceCleanup.Enabled = false, want true")
+	}
+	if defaults.SourceCleanup.DatabasePath == "" ||
+		defaults.SourceCleanup.PollingInterval != 5*time.Second ||
+		defaults.SourceCleanup.MaxConcurrentActions != 2 ||
+		defaults.SourceCleanup.MaxActiveJobs != 10000 ||
+		defaults.SourceCleanup.TerminalJobRetentionPeriod != 24*time.Hour ||
+		defaults.SourceCleanup.ImportReservationTimeout != 10*time.Minute ||
+		defaults.SourceCleanup.DatabaseOptimizationInterval != 24*time.Hour ||
+		defaults.SourceCleanup.TerminalPruneBatchSize != 5000 {
+		t.Fatalf("unexpected source cleanup defaults: %#v", defaults.SourceCleanup)
+	}
+
+	cfg := New().
+		WithSourceCleanup(NewSourceCleanupConfig().
+			WithEnabled(false).
+			WithDatabasePath("cleanup.db").
+			WithPollingInterval(3 * time.Second).
+			WithMaxConcurrentActions(4).
+			WithMaxActiveJobs(12).
+			WithTerminalJobRetention(2 * time.Hour).
+			WithImportReservationTimeout(7 * time.Minute).
+			WithDatabaseOptimization(false).
+			WithDatabaseOptimizationInterval(3 * time.Hour).
+			WithTerminalPruneBatchSize(19)).
+		WithFileWatchers(NewFileWatcherConfig().
+			WithWatcherID("w1").
+			WithTenantID("t1").
+			WithWatchPath("incoming").
+			WithSourceCleanupFailureDirectory("failed"))
+
+	if cfg.SourceCleanup.Enabled || cfg.SourceCleanup.DatabasePath != "cleanup.db" ||
+		cfg.SourceCleanup.MaxActiveJobs != 12 || cfg.SourceCleanup.TerminalPruneBatchSize != 19 {
+		t.Fatalf("source cleanup fluent values not retained: %#v", cfg.SourceCleanup)
+	}
+	if cfg.FileWatchers[0].SourceCleanupFailureDirectory != "failed" {
+		t.Fatalf("failure directory = %q, want failed", cfg.FileWatchers[0].SourceCleanupFailureDirectory)
+	}
+}
+
+func TestApplyDefaultsRestoresSourceCleanupAndDeadLetterDefaults(t *testing.T) {
+	cfg := &Config{}
+	cfg.ApplyDefaults()
+
+	defaults := DefaultConfig()
+	if cfg.SourceCleanup != defaults.SourceCleanup {
+		t.Fatalf("SourceCleanup defaults = %#v, want %#v", cfg.SourceCleanup, defaults.SourceCleanup)
+	}
+	if cfg.Cleanup.DeadLetter.IncludeTenantInPath != defaults.Cleanup.DeadLetter.IncludeTenantInPath ||
+		cfg.Cleanup.DeadLetter.IncludeDatePartition != defaults.Cleanup.DeadLetter.IncludeDatePartition {
+		t.Fatalf("dead-letter boolean defaults = {%v %v}, want {%v %v}",
+			cfg.Cleanup.DeadLetter.IncludeTenantInPath,
+			cfg.Cleanup.DeadLetter.IncludeDatePartition,
+			defaults.Cleanup.DeadLetter.IncludeTenantInPath,
+			defaults.Cleanup.DeadLetter.IncludeDatePartition)
+	}
+}
+
+func TestValidateRejectsInvalidSourceCleanupValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"empty database path when enabled", func(c *Config) {
+			c.SourceCleanup.DatabasePath = ""
+		}},
+		{"negative polling interval", func(c *Config) {
+			c.SourceCleanup.PollingInterval = -time.Second
+		}},
+		{"zero concurrent actions", func(c *Config) {
+			c.SourceCleanup.MaxConcurrentActions = 0
+		}},
+		{"zero active jobs", func(c *Config) {
+			c.SourceCleanup.MaxActiveJobs = 0
+		}},
+		{"negative reservation timeout", func(c *Config) {
+			c.SourceCleanup.ImportReservationTimeout = -time.Second
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			test.mutate(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want source cleanup validation error")
+			}
+		})
+	}
+}

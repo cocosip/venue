@@ -39,6 +39,15 @@ const (
 	defaultMaxPostImportActionRetryCount       = 5
 	defaultPostImportActionRetryInitialDelay   = 5 * time.Second
 	defaultPostImportActionRetryMaxDelay       = 5 * time.Minute
+	defaultSourceCleanupDatabasePath           = "source-cleanup.db"
+	defaultSourceCleanupPollingInterval        = 5 * time.Second
+	defaultSourceCleanupMaxConcurrentActions   = 2
+	defaultSourceCleanupMaxActiveJobs          = 10000
+	defaultSourceCleanupTerminalRetention      = 24 * time.Hour
+	defaultSourceCleanupReservationTimeout     = 10 * time.Minute
+	defaultSourceCleanupOptimizationInterval   = 24 * time.Hour
+	defaultSourceCleanupTerminalPruneBatch     = 5000
+	defaultSourceCleanupFailureDirectory       = "./locus-source-failed"
 )
 
 // Config configures one Venue runtime instance.
@@ -63,6 +72,7 @@ type Config struct {
 	FileWatchers                     []FileWatcherConfig       `json:"fileWatchers" yaml:"fileWatchers" mapstructure:"fileWatchers"`
 	FileWatcherRoots                 []FileWatcherRootConfig   `json:"watcherRoots" yaml:"watcherRoots" mapstructure:"watcherRoots"`
 	FileWatcherService               FileWatcherServiceConfig  `json:"watcherServiceOptions" yaml:"watcherServiceOptions" mapstructure:"watcherServiceOptions"`
+	SourceCleanup                    SourceCleanupConfig       `json:"sourceCleanup" yaml:"sourceCleanup" mapstructure:"sourceCleanup"`
 	EnableBackgroundCleanup          bool                      `json:"enableBackgroundCleanup" yaml:"enableBackgroundCleanup" mapstructure:"enableBackgroundCleanup"`
 	Cleanup                          CleanupConfig             `json:"cleanupOptions" yaml:"cleanupOptions" mapstructure:"cleanupOptions"`
 	OrphanRecovery                   OrphanRecoveryConfig      `json:"orphanRecoveryOptions" yaml:"orphanRecoveryOptions" mapstructure:"orphanRecoveryOptions"`
@@ -240,6 +250,9 @@ type FileWatcherConfig struct {
 	MaxPostImportActionRetryCount     int           `json:"maxPostImportActionRetryCount" yaml:"maxPostImportActionRetryCount" mapstructure:"maxPostImportActionRetryCount"`
 	PostImportActionRetryInitialDelay time.Duration `json:"postImportActionRetryInitialDelay" yaml:"postImportActionRetryInitialDelay" mapstructure:"postImportActionRetryInitialDelay"`
 	PostImportActionRetryMaxDelay     time.Duration `json:"postImportActionRetryMaxDelay" yaml:"postImportActionRetryMaxDelay" mapstructure:"postImportActionRetryMaxDelay"`
+	// SourceCleanupFailureDirectory quarantines exhausted source cleanup jobs.
+	// An empty value leaves the source in place after the final failed attempt.
+	SourceCleanupFailureDirectory string `json:"sourceCleanupFailureDirectory" yaml:"sourceCleanupFailureDirectory" mapstructure:"sourceCleanupFailureDirectory"`
 
 	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
 	// AutoCreateTenantDirectories. Zero selects the default (60s).
@@ -321,6 +334,10 @@ type FileWatcherRootConfig struct {
 	// PostImportActionRetryMaxDelay caps exponential action retry backoff.
 	PostImportActionRetryMaxDelay time.Duration `json:"postImportActionRetryMaxDelay" yaml:"postImportActionRetryMaxDelay" mapstructure:"postImportActionRetryMaxDelay"`
 
+	// SourceCleanupFailureDirectory quarantines exhausted source cleanup jobs
+	// for every watcher derived from this root template.
+	SourceCleanupFailureDirectory string `json:"sourceCleanupFailureDirectory" yaml:"sourceCleanupFailureDirectory" mapstructure:"sourceCleanupFailureDirectory"`
+
 	// AutoCreateTenantDirectoriesCacheTTL caches the tenant list used by
 	// AutoCreateTenantDirectories. Zero selects the default (60s).
 	AutoCreateTenantDirectoriesCacheTTL time.Duration `json:"autoCreateTenantDirectoriesCacheTtl" yaml:"autoCreateTenantDirectoriesCacheTtl" mapstructure:"autoCreateTenantDirectoriesCacheTtl"`
@@ -376,6 +393,22 @@ type FileWatcherServiceConfig struct {
 	// parallel. Zero selects the runtime default; a negative value means
 	// sequential scanning.
 	MaxParallelWatcherScans int `json:"maxParallelWatcherScans" yaml:"maxParallelWatcherScans" mapstructure:"maxParallelWatcherScans"`
+}
+
+// SourceCleanupConfig configures the durable post-import source cleanup worker.
+// DatabasePath is resolved relative to FileWatcherConfigurationDirectory unless
+// it is absolute.
+type SourceCleanupConfig struct {
+	Enabled                      bool          `json:"enabled" yaml:"enabled" mapstructure:"enabled"`
+	DatabasePath                 string        `json:"databasePath" yaml:"databasePath" mapstructure:"databasePath"`
+	PollingInterval              time.Duration `json:"pollingInterval" yaml:"pollingInterval" mapstructure:"pollingInterval"`
+	MaxConcurrentActions         int           `json:"maxConcurrentActions" yaml:"maxConcurrentActions" mapstructure:"maxConcurrentActions"`
+	MaxActiveJobs                int           `json:"maxActiveJobs" yaml:"maxActiveJobs" mapstructure:"maxActiveJobs"`
+	TerminalJobRetentionPeriod   time.Duration `json:"terminalJobRetentionPeriod" yaml:"terminalJobRetentionPeriod" mapstructure:"terminalJobRetentionPeriod"`
+	ImportReservationTimeout     time.Duration `json:"importReservationTimeout" yaml:"importReservationTimeout" mapstructure:"importReservationTimeout"`
+	EnableDatabaseOptimization   bool          `json:"enableDatabaseOptimization" yaml:"enableDatabaseOptimization" mapstructure:"enableDatabaseOptimization"`
+	DatabaseOptimizationInterval time.Duration `json:"databaseOptimizationInterval" yaml:"databaseOptimizationInterval" mapstructure:"databaseOptimizationInterval"`
+	TerminalPruneBatchSize       int           `json:"terminalPruneBatchSize" yaml:"terminalPruneBatchSize" mapstructure:"terminalPruneBatchSize"`
 }
 
 // StatisticsConfig configures in-process runtime statistics.
@@ -598,6 +631,18 @@ func DefaultConfig() *Config {
 			DisabledCheckInterval:   time.Minute,
 			MaxParallelWatcherScans: 4,
 		},
+		SourceCleanup: SourceCleanupConfig{
+			Enabled:                      true,
+			DatabasePath:                 defaultSourceCleanupDatabasePath,
+			PollingInterval:              defaultSourceCleanupPollingInterval,
+			MaxConcurrentActions:         defaultSourceCleanupMaxConcurrentActions,
+			MaxActiveJobs:                defaultSourceCleanupMaxActiveJobs,
+			TerminalJobRetentionPeriod:   defaultSourceCleanupTerminalRetention,
+			ImportReservationTimeout:     defaultSourceCleanupReservationTimeout,
+			EnableDatabaseOptimization:   true,
+			DatabaseOptimizationInterval: defaultSourceCleanupOptimizationInterval,
+			TerminalPruneBatchSize:       defaultSourceCleanupTerminalPruneBatch,
+		},
 		EnableBackgroundCleanup: true,
 		Cleanup: CleanupConfig{
 			CleanupInterval:               time.Hour,
@@ -678,6 +723,37 @@ func (c *Config) ApplyDefaults() {
 		return
 	}
 	d := DefaultConfig()
+	if c.SourceCleanup == (SourceCleanupConfig{}) {
+		c.SourceCleanup = d.SourceCleanup
+	} else {
+		if c.SourceCleanup.DatabasePath == "" && c.SourceCleanup.Enabled {
+			c.SourceCleanup.DatabasePath = d.SourceCleanup.DatabasePath
+		}
+		if c.SourceCleanup.PollingInterval == 0 {
+			c.SourceCleanup.PollingInterval = d.SourceCleanup.PollingInterval
+		}
+		if c.SourceCleanup.MaxConcurrentActions == 0 {
+			c.SourceCleanup.MaxConcurrentActions = d.SourceCleanup.MaxConcurrentActions
+		}
+		if c.SourceCleanup.MaxActiveJobs == 0 {
+			c.SourceCleanup.MaxActiveJobs = d.SourceCleanup.MaxActiveJobs
+		}
+		if c.SourceCleanup.TerminalJobRetentionPeriod == 0 {
+			c.SourceCleanup.TerminalJobRetentionPeriod = d.SourceCleanup.TerminalJobRetentionPeriod
+		}
+		if c.SourceCleanup.ImportReservationTimeout == 0 {
+			c.SourceCleanup.ImportReservationTimeout = d.SourceCleanup.ImportReservationTimeout
+		}
+		if c.SourceCleanup.DatabaseOptimizationInterval == 0 {
+			c.SourceCleanup.DatabaseOptimizationInterval = d.SourceCleanup.DatabaseOptimizationInterval
+		}
+		if c.SourceCleanup.TerminalPruneBatchSize == 0 {
+			c.SourceCleanup.TerminalPruneBatchSize = d.SourceCleanup.TerminalPruneBatchSize
+		}
+	}
+	if c.Cleanup.DeadLetter == (DeadLetterConfig{}) {
+		c.Cleanup.DeadLetter = d.Cleanup.DeadLetter
+	}
 	if c.MetadataDirectory == "" {
 		c.MetadataDirectory = d.MetadataDirectory
 	}
@@ -833,6 +909,9 @@ func (c *Config) ApplyDefaults() {
 		if root.PostImportAction == "" {
 			root.PostImportAction = "Delete"
 		}
+		if root.SourceCleanupFailureDirectory == "" {
+			root.SourceCleanupFailureDirectory = defaultSourceCleanupFailureDirectory
+		}
 		applyFileWatcherRootAdvancedDefaults(root)
 	}
 	for i := range c.Volumes {
@@ -861,6 +940,9 @@ func (c *Config) ApplyDefaults() {
 		}
 		if c.FileWatchers[i].PostImportAction == "" {
 			c.FileWatchers[i].PostImportAction = "Delete"
+		}
+		if c.FileWatchers[i].SourceCleanupFailureDirectory == "" {
+			c.FileWatchers[i].SourceCleanupFailureDirectory = defaultSourceCleanupFailureDirectory
 		}
 		applyFileWatcherAdvancedDefaults(&c.FileWatchers[i])
 	}
@@ -963,6 +1045,9 @@ func (c *Config) Validate() error {
 	if err := validateFileWatcherService(&c.FileWatcherService); err != nil {
 		return err
 	}
+	if err := validateSourceCleanup(&c.SourceCleanup); err != nil {
+		return err
+	}
 	if err := validateFileWatcherRoots(c.FileWatcherRoots); err != nil {
 		return err
 	}
@@ -1061,6 +1146,11 @@ func (c *Config) Validate() error {
 		}
 		if watcher.PollingInterval < 0 {
 			return fmt.Errorf("fileWatcher[%d]: PollingInterval cannot be negative", i)
+		}
+		if err := validateSourceCleanupFailureDirectory(
+			fmt.Sprintf("fileWatcher[%d]", i), watcher.SourceCleanupFailureDirectory,
+		); err != nil {
+			return err
 		}
 		if err := validateWatcherAdvancedSettings(
 			"fileWatcher["+fmt.Sprint(i)+"]",
@@ -1341,6 +1431,48 @@ func validateFileWatcherService(service *FileWatcherServiceConfig) error {
 	return nil
 }
 
+func validateSourceCleanup(cleanup *SourceCleanupConfig) error {
+	if cleanup.Enabled && strings.TrimSpace(cleanup.DatabasePath) == "" {
+		return fmt.Errorf("SourceCleanup.DatabasePath is required when enabled")
+	}
+	if cleanup.PollingInterval <= 0 {
+		return fmt.Errorf("SourceCleanup.PollingInterval must be positive")
+	}
+	if cleanup.MaxConcurrentActions <= 0 {
+		return fmt.Errorf("SourceCleanup.MaxConcurrentActions must be positive")
+	}
+	if cleanup.MaxActiveJobs <= 0 {
+		return fmt.Errorf("SourceCleanup.MaxActiveJobs must be positive")
+	}
+	if cleanup.TerminalJobRetentionPeriod <= 0 {
+		return fmt.Errorf("SourceCleanup.TerminalJobRetentionPeriod must be positive")
+	}
+	if cleanup.ImportReservationTimeout <= 0 {
+		return fmt.Errorf("SourceCleanup.ImportReservationTimeout must be positive")
+	}
+	if cleanup.DatabaseOptimizationInterval <= 0 {
+		return fmt.Errorf("SourceCleanup.DatabaseOptimizationInterval must be positive")
+	}
+	if cleanup.TerminalPruneBatchSize <= 0 {
+		return fmt.Errorf("SourceCleanup.TerminalPruneBatchSize must be positive")
+	}
+	return nil
+}
+
+func validateSourceCleanupFailureDirectory(label, path string) error {
+	if path == "" {
+		return nil
+	}
+	if filepath.IsAbs(path) {
+		return fmt.Errorf("%s.SourceCleanupFailureDirectory must be relative", label)
+	}
+	clean := filepath.Clean(path)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%s.SourceCleanupFailureDirectory must remain below its configuration root", label)
+	}
+	return nil
+}
+
 func validateFileWatcherRoots(roots []FileWatcherRootConfig) error {
 	seen := make(map[string]bool, len(roots))
 	for i, root := range roots {
@@ -1382,6 +1514,11 @@ func validateFileWatcherRoots(roots []FileWatcherRootConfig) error {
 		}
 		if root.PollingInterval < 0 {
 			return fmt.Errorf("watcherRoots[%d]: PollingInterval cannot be negative", i)
+		}
+		if err := validateSourceCleanupFailureDirectory(
+			fmt.Sprintf("watcherRoots[%d]", i), root.SourceCleanupFailureDirectory,
+		); err != nil {
+			return err
 		}
 		if err := validateWatcherAdvancedSettings(
 			"watcherRoots["+fmt.Sprint(i)+"]",
