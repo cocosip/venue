@@ -95,7 +95,7 @@ func TestSourceCleanupDoesNotDeleteReplacedSourceRevision(t *testing.T) {
 func TestFileWatcherRejectsEscapingSourceCleanupFailureDirectory(t *testing.T) {
 	w, _ := newTestWatcher(t)
 	config := newConfig("w1", t.TempDir(), func(config *core.FileWatcherConfiguration) {
-		config.SourceCleanupFailureDirectory = `..\outside`
+		config.SourceCleanupFailureDirectory = filepath.Join("..", "outside")
 	})
 	if err := w.RegisterWatcher(context.Background(), config); err == nil {
 		t.Fatal("RegisterWatcher() error = nil, want source cleanup path validation error")

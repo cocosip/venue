@@ -3,13 +3,14 @@ package watcher
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestSourceCleanupWorkerRetriesDueJobAndCompletesIt(t *testing.T) {
-	path := t.TempDir() + `\cleanup.db`
+	path := filepath.Join(t.TempDir(), "cleanup.db")
 	store, err := OpenSourceCleanupStore(path, SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -48,21 +49,28 @@ func TestSourceCleanupWorkerRetriesDueJobAndCompletesIt(t *testing.T) {
 	for time.Now().Before(deadline) && attempts.Load() < 2 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	worker.Stop()
 	if attempts.Load() != 2 {
+		worker.Stop()
 		t.Fatalf("execute attempts = %d, want 2", attempts.Load())
 	}
-	loaded, err := store.GetBySource(context.Background(), job.WatcherID, job.SourcePath)
-	if err != nil {
-		t.Fatal(err)
+	for time.Now().Before(deadline) {
+		loaded, loadErr := store.GetBySource(context.Background(), job.WatcherID, job.SourcePath)
+		if loadErr != nil {
+			worker.Stop()
+			t.Fatal(loadErr)
+		}
+		if loaded == nil {
+			worker.Stop()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if loaded != nil {
-		t.Fatalf("completed Delete job = %#v, want removed", loaded)
-	}
+	worker.Stop()
+	t.Fatal("completed Delete job was not removed")
 }
 
 func TestSourceCleanupWorkerPausesWhenRuntimeIsDisabled(t *testing.T) {
-	store, err := OpenSourceCleanupStore(t.TempDir()+`\cleanup.db`, SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +112,7 @@ func TestSourceCleanupWorkerPausesWhenRuntimeIsDisabled(t *testing.T) {
 }
 
 func TestSourceCleanupWorkerDiscardsObsoleteFingerprintJob(t *testing.T) {
-	store, err := OpenSourceCleanupStore(t.TempDir()+`\cleanup.db`, SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +156,7 @@ func TestSourceCleanupWorkerDiscardsObsoleteFingerprintJob(t *testing.T) {
 }
 
 func TestSourceCleanupWorkerRetriesFailureQuarantineAfterCleanupExhaustion(t *testing.T) {
-	store, err := OpenSourceCleanupStore(t.TempDir()+`\cleanup.db`, SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

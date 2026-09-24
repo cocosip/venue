@@ -2,13 +2,14 @@ package watcher
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestSourceCleanupStoreConcurrentReservationsRespectCapacity(t *testing.T) {
-	store, err := OpenSourceCleanupStore(t.TempDir()+`\cleanup.db`, SourceCleanupStoreOptions{MaxActiveJobs: 1})
+	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +46,7 @@ func TestSourceCleanupStoreConcurrentReservationsRespectCapacity(t *testing.T) {
 }
 
 func TestSourceCleanupStoreReservesCapacityAndPersistsAcrossRestart(t *testing.T) {
-	path := t.TempDir() + `\cleanup.db`
+	path := filepath.Join(t.TempDir(), "cleanup.db")
 	store, err := OpenSourceCleanupStore(path, SourceCleanupStoreOptions{MaxActiveJobs: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +93,7 @@ func TestSourceCleanupStoreReservesCapacityAndPersistsAcrossRestart(t *testing.T
 }
 
 func TestSourceCleanupStoreLeaseAllowsOnlyCurrentTokenToUpdate(t *testing.T) {
-	path := t.TempDir() + `\cleanup.db`
+	path := filepath.Join(t.TempDir(), "cleanup.db")
 	store, err := OpenSourceCleanupStore(path, SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +132,7 @@ func TestSourceCleanupStoreLeaseAllowsOnlyCurrentTokenToUpdate(t *testing.T) {
 }
 
 func TestSourceCleanupStoreRecoversStaleImportReservation(t *testing.T) {
-	path := t.TempDir() + `\cleanup.db`
+	path := filepath.Join(t.TempDir(), "cleanup.db")
 	store, err := OpenSourceCleanupStore(path, SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +159,7 @@ func TestSourceCleanupStoreRecoversStaleImportReservation(t *testing.T) {
 }
 
 func TestSourceCleanupStoreReplacesPendingJobWhenSourceRevisionChanges(t *testing.T) {
-	store, err := OpenSourceCleanupStore(t.TempDir()+`\cleanup.db`, SourceCleanupStoreOptions{MaxActiveJobs: 1})
+	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +197,7 @@ func TestSourceCleanupStoreReplacesPendingJobWhenSourceRevisionChanges(t *testin
 }
 
 func TestSourceCleanupStoreCapacityIncludesTerminalSuppressionRecords(t *testing.T) {
-	store, err := OpenSourceCleanupStore(t.TempDir()+`\cleanup.db`, SourceCleanupStoreOptions{MaxActiveJobs: 1})
+	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
