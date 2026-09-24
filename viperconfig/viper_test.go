@@ -69,6 +69,31 @@ func TestLoadFromFileAdaptsFileToConfig(t *testing.T) {
 	}
 }
 
+func TestShippedViperExampleFilesUseVenueSection(t *testing.T) {
+	for _, fileName := range []string{"venue-config.yaml", "venue-config.json"} {
+		t.Run(fileName, func(t *testing.T) {
+			path := filepath.Join("..", "examples", "viper-config", fileName)
+			source := viper.New()
+			source.SetConfigFile(path)
+			if err := source.ReadInConfig(); err != nil {
+				t.Fatalf("ReadInConfig(%s) error = %v", path, err)
+			}
+			if source.Sub("venue") == nil {
+				t.Fatalf("%s does not define a top-level venue section", path)
+			}
+
+			cfg, err := LoadFromFile(path)
+			if err != nil {
+				t.Fatalf("LoadFromFile(%s) error = %v", path, err)
+			}
+			if len(cfg.Volumes) != 2 || len(cfg.Tenants) != 3 || len(cfg.FileWatchers) != 2 {
+				t.Fatalf("configuration shape = %d volumes, %d tenants, %d watchers",
+					len(cfg.Volumes), len(cfg.Tenants), len(cfg.FileWatchers))
+			}
+		})
+	}
+}
+
 func TestLoadSectionUsesBoundEnvironmentOverride(t *testing.T) {
 	t.Setenv("APP_VENUE_RETRYPOLICY_MAXRETRYCOUNT", "9")
 

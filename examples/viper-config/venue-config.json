@@ -1,124 +1,126 @@
 {
-  "metadataDirectory": "./venue-data/metadata",
-  "quotaDirectory": "./venue-data/quota",
-  "fileWatcherConfigurationDirectory": "./venue-data/watchers",
-  "autoCreateTenants": true,
-  "defaultTenantQuota": 0,
-  "enableDatabaseHealthCheck": true,
-  "sourceCleanup": {
-    "enabled": true,
-    "databasePath": "source-cleanup.db",
-    "pollingInterval": "5s",
-    "maxConcurrentActions": 2,
-    "maxActiveJobs": 10000,
-    "terminalJobRetentionPeriod": "24h",
-    "importReservationTimeout": "10m",
-    "enableDatabaseOptimization": true,
-    "databaseOptimizationInterval": "24h",
-    "terminalPruneBatchSize": 5000
-  },
-  "retryPolicy": {
-    "maxRetryCount": 3,
-    "initialRetryDelay": "5s",
-    "useExponentialBackoff": true,
-    "maxRetryDelay": "5m"
-  },
-  "volumes": [
-    {
-      "volumeId": "vol-001",
-      "mountPath": "./venue-data/storage/volume-1",
-      "volumeType": "LocalFileSystem",
-      "shardingDepth": 2
+  "venue": {
+    "metadataDirectory": "./venue-data/metadata",
+    "quotaDirectory": "./venue-data/quota",
+    "fileWatcherConfigurationDirectory": "./venue-data/watchers",
+    "autoCreateTenants": true,
+    "defaultTenantQuota": 0,
+    "enableDatabaseHealthCheck": true,
+    "sourceCleanup": {
+      "enabled": true,
+      "databasePath": "source-cleanup.db",
+      "pollingInterval": "5s",
+      "maxConcurrentActions": 2,
+      "maxActiveJobs": 10000,
+      "terminalJobRetentionPeriod": "24h",
+      "importReservationTimeout": "10m",
+      "enableDatabaseOptimization": true,
+      "databaseOptimizationInterval": "24h",
+      "terminalPruneBatchSize": 5000
     },
-    {
-      "volumeId": "vol-002",
-      "mountPath": "./venue-data/storage/volume-2",
-      "volumeType": "LocalFileSystem",
-      "shardingDepth": 2
+    "retryPolicy": {
+      "maxRetryCount": 3,
+      "initialRetryDelay": "5s",
+      "useExponentialBackoff": true,
+      "maxRetryDelay": "5m"
+    },
+    "volumes": [
+      {
+        "volumeId": "vol-001",
+        "mountPath": "./venue-data/storage/volume-1",
+        "volumeType": "LocalFileSystem",
+        "shardingDepth": 2
+      },
+      {
+        "volumeId": "vol-002",
+        "mountPath": "./venue-data/storage/volume-2",
+        "volumeType": "LocalFileSystem",
+        "shardingDepth": 2
+      }
+    ],
+    "tenants": [
+      {
+        "tenantId": "tenant-001",
+        "enabled": true,
+        "quota": 10000000
+      },
+      {
+        "tenantId": "tenant-002",
+        "enabled": true,
+        "quota": null
+      },
+      {
+        "tenantId": "tenant-disabled",
+        "enabled": false,
+        "quota": null
+      }
+    ],
+    "fileWatchers": [
+      {
+        "watcherId": "watcher-vip-tenant-001",
+        "tenantId": "tenant-001",
+        "multiTenantMode": false,
+        "autoCreateTenantDirectories": false,
+        "watchPath": "./venue-data/watch/vip/tenant-001",
+        "enabled": true,
+        "includeSubdirectories": true,
+        "filePatterns": [
+          "*.pdf",
+          "*.docx",
+          "*.xlsx"
+        ],
+        "postImportAction": "Delete",
+        "pollingInterval": "10s",
+        "maxFileSizeBytes": 104857600,
+        "minFileAge": "5s",
+        "maxConcurrentImports": 16,
+        "maxPostImportActionRetryCount": 5,
+        "postImportActionRetryInitialDelay": "5s",
+        "postImportActionRetryMaxDelay": "5m",
+        "sourceCleanupFailureDirectory": "./locus-source-failed"
+      },
+      {
+        "watcherId": "watcher-all-regular-tenants",
+        "tenantId": "",
+        "multiTenantMode": true,
+        "autoCreateTenantDirectories": true,
+        "watchPath": "./venue-data/watch/shared",
+        "enabled": true,
+        "includeSubdirectories": true,
+        "filePatterns": [
+          "*.*"
+        ],
+        "postImportAction": "Delete",
+        "pollingInterval": "30s",
+        "maxFileSizeBytes": 0,
+        "minFileAge": "5s",
+        "maxConcurrentImports": 8,
+        "maxPostImportActionRetryCount": 5,
+        "postImportActionRetryInitialDelay": "5s",
+        "postImportActionRetryMaxDelay": "5m",
+        "sourceCleanupFailureDirectory": "./locus-source-failed"
+      }
+    ],
+    "enableBackgroundCleanup": true,
+    "cleanupOptions": {
+      "cleanupInterval": "1h",
+      "initialDelay": "1m",
+      "cleanupEmptyDirectories": true,
+      "cleanupTimedOutFiles": true,
+      "processingTimeout": "30m",
+      "cleanupPermanentlyFailedFiles": true,
+      "failedFileRetentionPeriod": "72h",
+      "cleanupCompletedRecords": false,
+      "completedRecordRetentionPeriod": "720h",
+      "optimizeDatabases": true,
+      "databaseOptimizationInterval": "24h"
+    },
+    "databaseHealthCheckOptions": {
+      "initialDelay": "2s",
+      "maxRetries": 3,
+      "retryDelay": "1s",
+      "checkOnStartupOnly": true,
+      "periodicCheckInterval": "1h"
     }
-  ],
-  "tenants": [
-    {
-      "tenantId": "tenant-001",
-      "enabled": true,
-      "quota": 10000000
-    },
-    {
-      "tenantId": "tenant-002",
-      "enabled": true,
-      "quota": null
-    },
-    {
-      "tenantId": "tenant-disabled",
-      "enabled": false,
-      "quota": null
-    }
-  ],
-  "fileWatchers": [
-    {
-      "watcherId": "watcher-vip-tenant-001",
-      "tenantId": "tenant-001",
-      "multiTenantMode": false,
-      "autoCreateTenantDirectories": false,
-      "watchPath": "./venue-data/watch/vip/tenant-001",
-      "enabled": true,
-      "includeSubdirectories": true,
-      "filePatterns": [
-        "*.pdf",
-        "*.docx",
-        "*.xlsx"
-      ],
-      "postImportAction": "Delete",
-      "pollingInterval": "10s",
-      "maxFileSizeBytes": 104857600,
-      "minFileAge": "5s",
-      "maxConcurrentImports": 16,
-      "maxPostImportActionRetryCount": 5,
-      "postImportActionRetryInitialDelay": "5s",
-      "postImportActionRetryMaxDelay": "5m",
-      "sourceCleanupFailureDirectory": "./locus-source-failed"
-    },
-    {
-      "watcherId": "watcher-all-regular-tenants",
-      "tenantId": "",
-      "multiTenantMode": true,
-      "autoCreateTenantDirectories": true,
-      "watchPath": "./venue-data/watch/shared",
-      "enabled": true,
-      "includeSubdirectories": true,
-      "filePatterns": [
-        "*.*"
-      ],
-      "postImportAction": "Delete",
-      "pollingInterval": "30s",
-      "maxFileSizeBytes": 0,
-      "minFileAge": "5s",
-      "maxConcurrentImports": 8,
-      "maxPostImportActionRetryCount": 5,
-      "postImportActionRetryInitialDelay": "5s",
-      "postImportActionRetryMaxDelay": "5m",
-      "sourceCleanupFailureDirectory": "./locus-source-failed"
-    }
-  ],
-  "enableBackgroundCleanup": true,
-  "cleanupOptions": {
-    "cleanupInterval": "1h",
-    "initialDelay": "1m",
-    "cleanupEmptyDirectories": true,
-    "cleanupTimedOutFiles": true,
-    "processingTimeout": "30m",
-    "cleanupPermanentlyFailedFiles": true,
-    "failedFileRetentionPeriod": "72h",
-    "cleanupCompletedRecords": false,
-    "completedRecordRetentionPeriod": "720h",
-    "optimizeDatabases": true,
-    "databaseOptimizationInterval": "24h"
-  },
-  "databaseHealthCheckOptions": {
-    "initialDelay": "2s",
-    "maxRetries": 3,
-    "retryDelay": "1s",
-    "checkOnStartupOnly": true,
-    "periodicCheckInterval": "1h"
   }
 }

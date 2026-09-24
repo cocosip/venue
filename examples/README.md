@@ -77,10 +77,10 @@ injected by the application after decoding.
   example with a `venue` root node, including the `sqliteOptions` engine
   settings, statistics, per-tenant metadata-backup, per-volume startup, advanced
   watcher, and timed-out reclaim options.
-- [`viper-config/venue-config.yaml`](viper-config/venue-config.yaml): a
-  root-level configuration example.
+- [`viper-config/venue-config.yaml`](viper-config/venue-config.yaml): a YAML
+  configuration example with a top-level `venue` section.
 - [`viper-config/venue-config.json`](viper-config/venue-config.json): a JSON
-  configuration example.
+  configuration example with a top-level `venue` section.
 
 When binding from a file, boolean keys such as `enabled` and
 `includeSubdirectories` must be written explicitly: a boolean key that is absent
