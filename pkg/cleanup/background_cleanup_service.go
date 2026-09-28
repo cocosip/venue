@@ -115,6 +115,13 @@ type BackgroundCleanupService struct {
 	wg     sync.WaitGroup
 	mu     sync.RWMutex
 
+	// lifecycleMu serializes Start against the cancel-and-join sequence of
+	// Stop. The run goroutine reads the ctx field freely, so a Start must never
+	// overwrite it while a run goroutine could still be reading it: Stop joins
+	// that goroutine before releasing this lock, and Start takes it before
+	// writing a new context.
+	lifecycleMu sync.Mutex
+
 	lastOptimizationTime time.Time
 	lastJunkFileCleanup  time.Time
 	running              bool
@@ -203,15 +210,17 @@ func NewBackgroundCleanupService(opts *BackgroundCleanupServiceOptions) (*Backgr
 
 // Start starts the background cleanup service.
 func (s *BackgroundCleanupService) Start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
+	s.mu.Lock()
 	if s.running {
+		s.mu.Unlock()
 		return fmt.Errorf("background cleanup service is already running")
 	}
-
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.running = true
+	s.mu.Unlock()
 
 	s.wg.Add(1)
 	go s.run()
@@ -225,8 +234,13 @@ func (s *BackgroundCleanupService) Start() error {
 //
 // Stop never holds s.mu while it waits for the run goroutine: the run goroutine
 // takes s.mu.RLock() through shouldOptimizeDatabases(), so holding the write lock
-// across s.wg.Wait() would deadlock against an in-flight cleanup cycle.
+// across s.wg.Wait() would deadlock against an in-flight cleanup cycle. The
+// lifecycle mutex instead delays a concurrent Start until the join has finished,
+// which is what keeps the WaitGroup and the context handoff race-free.
 func (s *BackgroundCleanupService) Stop() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.mu.Lock()
 
 	if !s.running {
@@ -243,7 +257,7 @@ func (s *BackgroundCleanupService) Stop() error {
 	s.cancel()
 	s.mu.Unlock()
 
-	// Wait outside the lock: the run goroutine must be able to take s.mu.RLock().
+	// Wait outside s.mu: the run goroutine must be able to take s.mu.RLock().
 	s.wg.Wait()
 
 	s.emit(ctx, slog.LevelInfo, "stopped", "Background cleanup service stopped")

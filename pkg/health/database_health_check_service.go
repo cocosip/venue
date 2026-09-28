@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
@@ -50,11 +51,13 @@ type DatabaseHealthCheckService struct {
 	checkOnStartupOnly    bool
 	periodicCheckInterval time.Duration
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	mu      sync.RWMutex
-	running bool
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	// running is atomic because the run goroutine itself clears it when the
+	// startup-only loop finishes: the flag tracks the goroutine, not just the
+	// Stop call, and Stop must not hold a mutex across wg.Wait.
+	running atomic.Bool
 }
 
 // NewDatabaseHealthCheckService creates a new database health check service.
@@ -101,21 +104,16 @@ func NewDatabaseHealthCheckService(opts *DatabaseHealthCheckServiceOptions) (*Da
 		retryDelay:            retryDelay,
 		checkOnStartupOnly:    opts.CheckOnStartupOnly,
 		periodicCheckInterval: periodicCheckInterval,
-		running:               false,
 	}, nil
 }
 
 // Start starts the database health check service.
 func (s *DatabaseHealthCheckService) Start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.running {
+	if !s.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("database health check service is already running")
 	}
 
 	s.ctx, s.cancel = context.WithCancel(context.Background())
-	s.running = true
 
 	s.wg.Add(1)
 	go s.run()
@@ -126,18 +124,20 @@ func (s *DatabaseHealthCheckService) Start() error {
 }
 
 // Stop stops the database health check service gracefully.
+//
+// Stop does not hold a mutex while joining the run goroutine: in startup-only
+// mode that goroutine clears the running flag itself when its loop ends, so a
+// mutex across wg.Wait could interleave with it.
 func (s *DatabaseHealthCheckService) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.running {
+	if !s.running.Swap(false) {
 		return fmt.Errorf("database health check service is not running")
 	}
 
 	s.emit(s.ctx, slog.LevelInfo, "stopping", "Stopping database health check service")
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.wg.Wait()
-	s.running = false
 
 	s.emit(s.ctx, slog.LevelInfo, "stopped", "Database health check service stopped")
 
@@ -146,9 +146,7 @@ func (s *DatabaseHealthCheckService) Stop() error {
 
 // IsRunning returns whether the service is currently running.
 func (s *DatabaseHealthCheckService) IsRunning() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.running
+	return s.running.Load()
 }
 
 // run is the main loop that performs health checks.
@@ -168,8 +166,11 @@ func (s *DatabaseHealthCheckService) run() {
 	s.emit(s.ctx, slog.LevelInfo, "check_started", "Starting database health check")
 	s.performHealthCheckWithRetry()
 
-	// If startup-only mode, stop here
+	// If startup-only mode, stop here. The loop ends, so the running flag goes
+	// with it: IsRunning reports a service that is actually executing, and a
+	// later Start is not blocked by a finished goroutine.
 	if s.checkOnStartupOnly {
+		s.running.Store(false)
 		s.emit(s.ctx, slog.LevelInfo, "startup_check_completed", "Database health check completed")
 		return
 	}

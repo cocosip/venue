@@ -320,6 +320,11 @@ func (s *MetadataBackupService) prune(ctx context.Context) {
 }
 
 // run performs the periodic backup cycles until the stop channel is closed.
+//
+// Each cycle runs under a context derived from the stop channel, so closing it
+// interrupts an in-flight backup pass instead of making Stop wait out a whole
+// cycle of VACUUM INTO copies on slow storage. RunOnce observes that context
+// through its per-tenant cancellation checks.
 func (s *MetadataBackupService) run(stopCh <-chan struct{}) {
 	defer s.wg.Done()
 
@@ -331,9 +336,15 @@ func (s *MetadataBackupService) run(stopCh <-chan struct{}) {
 		case <-stopCh:
 			return
 		case <-ticker.C:
-			if err := s.RunOnce(context.Background()); err != nil {
+			cycleCtx, cancel := context.WithCancel(context.Background())
+			go func() {
+				<-stopCh
+				cancel()
+			}()
+			if err := s.RunOnce(cycleCtx); err != nil {
 				s.warn(context.Background(), "backup_cycle_failed", err)
 			}
+			cancel()
 		}
 	}
 }
@@ -538,7 +549,7 @@ func writeArchiveEntry(ctx context.Context, entry *zip.File, targetPath string) 
 // verifyRestoredDatabase opens the restored file and runs an integrity check, so
 // a truncated or damaged backup is rejected before a runtime can serve it.
 func verifyRestoredDatabase(ctx context.Context, path string) error {
-	db, err := sqlite.Open(path, sqlite.DefaultOptions())
+	db, err := sqlite.Open(ctx, path, sqlite.DefaultOptions())
 	if err != nil {
 		return fmt.Errorf("the restored database cannot be opened: %w", err)
 	}

@@ -12,7 +12,7 @@ import (
 
 func TestFileWatcherDurableSourceCleanupRunsAfterImport(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "cleanup.db")
-	store, err := OpenSourceCleanupStore(storePath, SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(context.Background(), storePath, SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -405,9 +405,15 @@ func (c *Config) WithBackgroundCleanupEnabled(enabled bool) *Config {
 }
 
 // WithCleanup sets cleanup configuration.
+//
+// The cleanup struct is copied with its RetiredVolumes slice deep-copied, so
+// later changes to the caller's slice cannot leak into the config (and the
+// fluent WithRetiredVolumes cannot rewrite a source config's elements through a
+// shared backing array).
 func (c *Config) WithCleanup(value *CleanupConfig) *Config {
 	if value != nil {
 		c.Cleanup = *value
+		c.Cleanup.RetiredVolumes = append([]RetiredVolumeConfig(nil), value.RetiredVolumes...)
 	}
 	return c
 }
@@ -1074,13 +1080,18 @@ func (c *CleanupConfig) WithInvalidDatabaseBackupCleanup(enabled bool) *CleanupC
 }
 
 // WithRetiredVolumes replaces the retired volume declarations with copies.
+//
+// The replacement rebuilds the slice instead of truncating it in place: the
+// receiver may share a backing array with a Clone()d or WithCleanup()d source,
+// and an in-place [:0] would overwrite that source's elements.
 func (c *CleanupConfig) WithRetiredVolumes(values ...*RetiredVolumeConfig) *CleanupConfig {
-	c.RetiredVolumes = c.RetiredVolumes[:0]
+	replaced := make([]RetiredVolumeConfig, 0, len(values))
 	for _, value := range values {
 		if value != nil {
-			c.RetiredVolumes = append(c.RetiredVolumes, *value)
+			replaced = append(replaced, *value)
 		}
 	}
+	c.RetiredVolumes = replaced
 	return c
 }
 
@@ -1179,6 +1190,13 @@ func (c *OrphanRecoveryConfig) WithRecoveryInterval(value time.Duration) *Orphan
 // WithInitialDelay sets the delay before the first recovery scan.
 func (c *OrphanRecoveryConfig) WithInitialDelay(value time.Duration) *OrphanRecoveryConfig {
 	c.InitialDelay = value
+	return c
+}
+
+// WithMinimumFileAge sets the age floor below which a file is not treated as an
+// orphan yet. A negative value disables the guard.
+func (c *OrphanRecoveryConfig) WithMinimumFileAge(value time.Duration) *OrphanRecoveryConfig {
+	c.MinimumFileAge = value
 	return c
 }
 

@@ -493,7 +493,7 @@ func (failingRepository) CompareAndUpdateProcessing(context.Context, core.FilePr
 	return nil, errors.New("not implemented")
 }
 
-func (failingRepository) GetTimedOutProcessingFiles(context.Context, string, time.Duration) ([]*core.FileMetadata, error) {
+func (failingRepository) GetTimedOutProcessingFiles(context.Context, string, time.Duration, int) ([]*core.FileMetadata, error) {
 	return nil, nil
 }
 

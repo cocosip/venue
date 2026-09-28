@@ -44,6 +44,11 @@ var ErrSourceCleanupLeaseLost = errors.New("source cleanup lease lost")
 // a different file revision than the one recorded by the cleanup job.
 var ErrSourceCleanupFingerprintChanged = errors.New("source cleanup fingerprint changed")
 
+// ErrSourceCleanupCapacityExceeded indicates that the store's active-job budget
+// is exhausted, so the import was not reserved and must be retried on a later
+// scan. It is a backpressure signal rather than a failure of the import itself.
+var ErrSourceCleanupCapacityExceeded = errors.New("source cleanup capacity exceeded")
+
 // SourceCleanupJob is one durable post-import source action.
 type SourceCleanupJob struct {
 	JobID             int64
@@ -85,7 +90,7 @@ type SourceCleanupStore interface {
 	MarkRetry(context.Context, SourceCleanupJob, time.Time, error) error
 	MarkMovePending(context.Context, SourceCleanupJob, time.Time, error) error
 	MarkFailed(context.Context, SourceCleanupJob, error) error
-	RecoverStaleImports(context.Context, time.Time, time.Duration) (int, error)
+	RecoverStaleImports(ctx context.Context, now time.Time, timeout time.Duration, keep func(SourceCleanupJob) bool) (int, error)
 	PruneTerminal(context.Context, time.Time, int) (int, error)
 	Optimize(context.Context) error
 }
@@ -127,19 +132,19 @@ CREATE INDEX IF NOT EXISTS source_cleanup_terminal_idx
 `
 
 // OpenSourceCleanupStore opens or creates the pure-Go SQLite cleanup database.
-func OpenSourceCleanupStore(path string, options SourceCleanupStoreOptions) (SourceCleanupStore, error) {
+func OpenSourceCleanupStore(ctx context.Context, path string, options SourceCleanupStoreOptions) (SourceCleanupStore, error) {
 	if options.MaxActiveJobs <= 0 {
 		return nil, fmt.Errorf("max active jobs must be positive: %w", core.ErrInvalidArgument)
 	}
 	if err := os.MkdirAll(filepath.Dir(filepath.Clean(path)), 0o755); err != nil {
 		return nil, fmt.Errorf("create source cleanup database directory: %w", err)
 	}
-	db, err := sqlite.Open(path, sqlite.DefaultOptions())
+	db, err := sqlite.Open(ctx, path, sqlite.DefaultOptions())
 	if err != nil {
 		return nil, fmt.Errorf("open source cleanup database: %w", err)
 	}
 	store := &sqliteSourceCleanupStore{db: db, maxActiveJobs: options.MaxActiveJobs}
-	if _, err := db.ExecContext(context.Background(), sourceCleanupSchema); err != nil {
+	if _, err := db.ExecContext(ctx, sourceCleanupSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize source cleanup schema: %w", err)
 	}
@@ -227,11 +232,16 @@ func (s *sqliteSourceCleanupStore) TryReserve(ctx context.Context, job *SourceCl
 		return false, fmt.Errorf("find source cleanup reservation: %w", err)
 	}
 	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM source_cleanup_jobs`).Scan(&active); err != nil {
+	// Only non-terminal states consume capacity: Kept and Failed rows are
+	// retained for the terminal retention window (and a Kept row whose source
+	// still exists is kept as its dedup tombstone), so counting them would let
+	// finished work permanently shrink the import budget.
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM source_cleanup_jobs WHERE state IN (?, ?, ?, ?)`,
+		SourceCleanupStateImporting, SourceCleanupStatePending, SourceCleanupStateRetrying, SourceCleanupStateMovePending).Scan(&active); err != nil {
 		return false, fmt.Errorf("count active source cleanup jobs: %w", err)
 	}
 	if active >= s.maxActiveJobs {
-		return false, nil
+		return false, ErrSourceCleanupCapacityExceeded
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO source_cleanup_jobs (watcher_id, tenant_id, source_path, fingerprint, action, move_target_path, failure_directory, max_attempts, retry_initial_delay_nano, retry_max_delay_nano, next_attempt_unix_nano, state, created_unix_nano, updated_unix_nano) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		job.WatcherID, job.TenantID, job.SourcePath, job.Fingerprint, job.Action, job.MoveTargetPath, job.FailureDirectory, job.MaxAttempts, job.RetryInitialDelay.Nanoseconds(), job.RetryMaxDelay.Nanoseconds(), now.UnixNano(), SourceCleanupStateImporting, now.UnixNano(), now.UnixNano())
@@ -389,28 +399,122 @@ func (s *sqliteSourceCleanupStore) updateLeaseState(ctx context.Context, job Sou
 	return nil
 }
 
-func (s *sqliteSourceCleanupStore) RecoverStaleImports(ctx context.Context, now time.Time, timeout time.Duration) (int, error) {
+// RecoverStaleImports returns abandoned reservations to the actionable set.
+//
+// Importing rows with no file key are reservations whose import never finished:
+// they are deleted so the next scan re-imports the file. Importing rows that
+// already carry a file key were imported but their action never ran; they go
+// back to Pending.
+//
+// The keep predicate protects live work from that recovery: an import that
+// legitimately outlives the reservation timeout (a very large file on slow
+// storage) is still running in this process, and deleting its reservation would
+// turn a successful import into a spurious failure and a duplicate. keep
+// receives every stale candidate and reports whether it must be left untouched;
+// nil recovers everything stale.
+func (s *sqliteSourceCleanupStore) RecoverStaleImports(ctx context.Context, now time.Time, timeout time.Duration, keep func(SourceCleanupJob) bool) (int, error) {
 	cutoff := now.Add(-timeout).UnixNano()
-	result, err := s.db.ExecContext(ctx, `DELETE FROM source_cleanup_jobs WHERE state = ? AND updated_unix_nano < ? AND file_key = ''`, SourceCleanupStateImporting, cutoff)
+
+	rows, err := s.db.QueryContext(ctx, sourceCleanupSelect+` WHERE state = ? AND updated_unix_nano < ?`, SourceCleanupStateImporting, cutoff)
 	if err != nil {
-		return 0, fmt.Errorf("remove stale source cleanup reservations: %w", err)
+		return 0, fmt.Errorf("find stale source cleanup reservations: %w", err)
 	}
-	count, _ := result.RowsAffected()
-	result, err = s.db.ExecContext(ctx, `UPDATE source_cleanup_jobs SET state = ?, next_attempt_unix_nano = ?, updated_unix_nano = ? WHERE state = ? AND updated_unix_nano < ? AND file_key <> ''`, SourceCleanupStatePending, now.UnixNano(), now.UnixNano(), SourceCleanupStateImporting, cutoff)
-	if err != nil {
-		return int(count), fmt.Errorf("recover stale imported source cleanup jobs: %w", err)
+	stale := make([]SourceCleanupJob, 0, 8)
+	for rows.Next() {
+		job, scanErr := scanSourceCleanupJob(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan stale source cleanup reservation: %w", scanErr)
+		}
+		stale = append(stale, job)
 	}
-	recovered, _ := result.RowsAffected()
-	return int(count + recovered), nil
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("scan stale source cleanup reservations: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("close stale source cleanup scan: %w", err)
+	}
+
+	count := 0
+	for _, job := range stale {
+		if keep != nil && keep(job) {
+			continue
+		}
+		if job.FileKey == "" {
+			result, delErr := s.db.ExecContext(ctx, `DELETE FROM source_cleanup_jobs WHERE id = ? AND state = ?`, job.JobID, SourceCleanupStateImporting)
+			if delErr != nil {
+				return count, fmt.Errorf("remove stale source cleanup reservation: %w", delErr)
+			}
+			if affected, _ := result.RowsAffected(); affected > 0 {
+				count++
+			}
+			continue
+		}
+		result, recErr := s.db.ExecContext(ctx, `UPDATE source_cleanup_jobs SET state = ?, next_attempt_unix_nano = ?, updated_unix_nano = ? WHERE id = ? AND state = ?`,
+			SourceCleanupStatePending, now.UnixNano(), now.UnixNano(), job.JobID, SourceCleanupStateImporting)
+		if recErr != nil {
+			return count, fmt.Errorf("recover stale imported source cleanup job: %w", recErr)
+		}
+		if affected, _ := result.RowsAffected(); affected > 0 {
+			count++
+		}
+	}
+	return count, nil
 }
 
+// PruneTerminal retires terminal jobs older than the retention cutoff.
+//
+// A Kept job whose source file still exists is never pruned: the row is the
+// durable dedup tombstone that stops the still-present file from being imported
+// again after the retention window (deleting it would re-import every Keep file
+// once per retention period). A Kept job whose source is gone has nothing left
+// to dedup and is retired like a Failed job, which keeps the table bounded by
+// the files that actually exist.
 func (s *sqliteSourceCleanupStore) PruneTerminal(ctx context.Context, before time.Time, limit int) (int, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM source_cleanup_jobs WHERE id IN (SELECT id FROM source_cleanup_jobs WHERE state IN (?, ?) AND updated_unix_nano < ? ORDER BY updated_unix_nano LIMIT ?)`, SourceCleanupStateFailed, SourceCleanupStateKept, before.UnixNano(), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, source_path FROM source_cleanup_jobs WHERE state IN (?, ?) AND updated_unix_nano < ? ORDER BY updated_unix_nano LIMIT ?`,
+		SourceCleanupStateFailed, SourceCleanupStateKept, before.UnixNano(), limit)
 	if err != nil {
-		return 0, fmt.Errorf("prune terminal source cleanup jobs: %w", err)
+		return 0, fmt.Errorf("list terminal source cleanup jobs: %w", err)
 	}
-	count, _ := result.RowsAffected()
-	return int(count), nil
+	type terminalCandidate struct {
+		id         int64
+		sourcePath string
+	}
+	candidates := make([]terminalCandidate, 0, 8)
+	for rows.Next() {
+		var candidate terminalCandidate
+		if err := rows.Scan(&candidate.id, &candidate.sourcePath); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan terminal source cleanup job: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("scan terminal source cleanup jobs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("close terminal source cleanup scan: %w", err)
+	}
+
+	count := 0
+	for _, candidate := range candidates {
+		// A Kept job keeps its source; a Failed job does not necessarily (the
+		// action may have partially completed). Only an existing source file
+		// protects a row from pruning, so the tombstone tracks reality.
+		if _, statErr := os.Stat(candidate.sourcePath); statErr == nil {
+			continue
+		}
+		result, delErr := s.db.ExecContext(ctx, `DELETE FROM source_cleanup_jobs WHERE id = ? AND state IN (?, ?)`, candidate.id, SourceCleanupStateFailed, SourceCleanupStateKept)
+		if delErr != nil {
+			return count, fmt.Errorf("prune terminal source cleanup job: %w", delErr)
+		}
+		if affected, _ := result.RowsAffected(); affected > 0 {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (s *sqliteSourceCleanupStore) Optimize(ctx context.Context) error {

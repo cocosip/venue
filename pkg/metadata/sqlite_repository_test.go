@@ -356,7 +356,7 @@ func TestSQLiteMetadataRepositoryMigratesVersionOneForImportOperations(t *testin
 	if err := os.MkdirAll(tenantDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
-	db, err := sqlite.Open(filepath.Join(tenantDir, metadataDatabaseFileName), sqlite.DefaultOptions())
+	db, err := sqlite.Open(context.Background(), filepath.Join(tenantDir, metadataDatabaseFileName), sqlite.DefaultOptions())
 	if err != nil {
 		t.Fatalf("open version-one fixture: %v", err)
 	}
@@ -742,13 +742,13 @@ func TestSQLiteMetadataRepositoryTimeoutRecoveryDoesNotClobberNewerClaim(t *test
 		ProcessingStartTimeUTC: *claimed.ProcessingStartTime,
 	}
 
-	if timedOut, err := repo.GetTimedOutProcessingFiles(ctx, tenantID, timeout); err != nil || len(timedOut) != 0 {
+	if timedOut, err := repo.GetTimedOutProcessingFiles(ctx, tenantID, timeout, 0); err != nil || len(timedOut) != 0 {
 		t.Fatalf("GetTimedOutProcessingFiles() = (%v, %v), want no candidate before the timeout", fileKeys(timedOut), err)
 	}
 
 	// Move the clock past the timeout and reclaim through the lease-checked path.
 	clock.Advance(timeout + time.Minute)
-	timedOut, err := repo.GetTimedOutProcessingFiles(ctx, tenantID, timeout)
+	timedOut, err := repo.GetTimedOutProcessingFiles(ctx, tenantID, timeout, 0)
 	if err != nil {
 		t.Fatalf("GetTimedOutProcessingFiles() error = %v", err)
 	}
@@ -1633,7 +1633,7 @@ func TestSQLiteMetadataRepositoryEmptyArgumentsAreRejected(t *testing.T) {
 			return err
 		}},
 		{name: "GetTimedOutProcessingFiles empty tenant", call: func() error {
-			_, err := repo.GetTimedOutProcessingFiles(ctx, "", time.Minute)
+			_, err := repo.GetTimedOutProcessingFiles(ctx, "", time.Minute, 0)
 			return err
 		}},
 		{name: "invalid tenant id", call: func() error {

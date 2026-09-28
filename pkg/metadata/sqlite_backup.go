@@ -38,15 +38,22 @@ func (r *SQLiteMetadataRepository) BackupTenant(ctx context.Context, tenantID st
 		return fmt.Errorf("backup destination cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
+	// The database file is inspected before the handle is opened: begin would
+	// lazily create the tenant directory and an empty database, silently turning
+	// a backup of an unknown tenant into a backup of an empty store.
+	sourcePath := filepath.Join(r.dataPath, tenantID, metadataDatabaseFileName)
+	if _, err := os.Stat(sourcePath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("tenant %s has no metadata database: %w", tenantID, core.ErrDatabaseError)
+		}
+		return fmt.Errorf("failed to inspect the tenant metadata database: %w: %w", err, core.ErrDatabaseError)
+	}
+
 	handle, err := r.begin(ctx, tenantID)
 	if err != nil {
 		return err
 	}
 	defer r.end(handle)
-
-	if !r.hasDatabase(handle) {
-		return fmt.Errorf("tenant metadata database is not open: %w", core.ErrDatabaseError)
-	}
 
 	if err := r.backupTenantInto(ctx, handle.path, destPath); err != nil {
 		return err
@@ -75,13 +82,6 @@ func (r *SQLiteMetadataRepository) KnownTenantIDs(ctx context.Context) ([]string
 		return nil, errRepositoryClosed()
 	}
 	return r.knownTenantIDs(ctx)
-}
-
-// hasDatabase reports whether a handle has an open connection.
-func (r *SQLiteMetadataRepository) hasDatabase(handle *sqliteTenantDatabase) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return handle != nil && handle.db != nil
 }
 
 // backupTenantInto writes one tenant's database to destPath with VACUUM INTO.

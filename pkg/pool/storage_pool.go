@@ -13,6 +13,7 @@ import (
 
 	"github.com/cocosip/venue/internal/directorypath"
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/volume"
 	"github.com/google/uuid"
 )
 
@@ -277,16 +278,27 @@ func (p *storagePool) writeFile(
 	// Generate unique file key
 	fileKey = generateFileKey()
 
-	// Extract file extension
+	// Extract the extension from the caller-supplied name for diagnostics and
+	// the physical layout, but never trust it verbatim: it becomes a path
+	// segment and a metadata column.
 	fileExtension := ""
 	if originalFileName != nil {
-		fileExtension = filepath.Ext(*originalFileName)
+		ext, extErr := volume.SanitizeExtension(filepath.Ext(*originalFileName))
+		if extErr != nil {
+			return "", fmt.Errorf("invalid file extension: %w", extErr)
+		}
+		fileExtension = ext
 	}
 
 	// Physical file creation and metadata persistence form one logical
 	// operation. Every resource acquired below is tracked so that a single
 	// deferred cleanup rolls back exactly what was taken, on error and on
 	// panic, before the panic keeps propagating.
+	//
+	// The rollback runs on a cancellation-detached context: when the write
+	// failed because the caller's context died, the dead context must not stop
+	// the quotas from being released, or the counts would leak until the next
+	// startup reconciliation.
 	var resources writeResources
 	defer func() {
 		recovered := recover()
@@ -295,7 +307,7 @@ func (p *storagePool) writeFile(
 			return
 		}
 
-		cleanupErr := p.rollbackWrite(ctx, tenant.ID, logicalDirectoryPath, &resources)
+		cleanupErr := p.rollbackWrite(context.WithoutCancel(ctx), tenant.ID, logicalDirectoryPath, &resources)
 		if recovered != nil {
 			panic(recovered)
 		}
@@ -597,6 +609,12 @@ func (p *storagePool) ReadFile(ctx context.Context, tenant core.TenantContext, f
 // tryCorrectPhysicalPath rebuilds the canonical relative path for a file and, if
 // the bytes are actually there, persists the corrected path. It reports whether
 // the metadata was corrected.
+//
+// The correction is a guarded single-column update (core.PhysicalPathUpdater),
+// never a whole-record write-back: the snapshot this method received was read
+// before the failed volume access, and the queue state may have moved on since
+// (a worker may have claimed the file). Rewriting every column would resurrect
+// the stale snapshot over that newer transition.
 func (p *storagePool) tryCorrectPhysicalPath(
 	ctx context.Context,
 	volume core.StorageVolume,
@@ -612,11 +630,14 @@ func (p *storagePool) tryCorrectPhysicalPath(
 		return "", false
 	}
 
-	// Persist a copy so a failed write cannot mutate shared metadata state.
-	corrected := *metadata
-	corrected.PhysicalPath = canonicalPath
-	corrected.UpdatedAt = time.Now()
-	if err := p.metadataRepo.AddOrUpdate(ctx, &corrected); err != nil {
+	updater, ok := p.metadataRepo.(core.PhysicalPathUpdater)
+	if !ok {
+		// Without the guarded-update capability a correction cannot be made
+		// safely; the caller falls back to reporting the original read failure.
+		return "", false
+	}
+	updated, err := updater.UpdatePhysicalPath(ctx, metadata.TenantID, metadata.FileKey, metadata.PhysicalPath, canonicalPath)
+	if err != nil || !updated {
 		return "", false
 	}
 
@@ -711,15 +732,16 @@ func (p *storagePool) recordDequeue(location *core.FileLocation) {
 
 // MarkAsCompleted marks a file as successfully processed.
 func (p *storagePool) MarkAsCompleted(ctx context.Context, lease core.FileProcessingLease) error {
-	if err := p.scheduler.MarkAsCompleted(ctx, lease); err != nil {
+	// The scheduler hands back the record it just wrote, so the statistic's
+	// volume dimension needs no second read: a completed record is uncached by
+	// design, and a repo Get here would be one extra transaction per completion.
+	metadata, err := p.scheduler.MarkAsCompleted(ctx, lease)
+	if err != nil {
 		return err
 	}
 
-	// A completed file is still durable metadata, so its volume is resolved
-	// after the successful transition. A failed resolution never affects the
-	// completion; it only leaves the volume dimension empty.
 	volumeID := ""
-	if metadata, err := p.metadataRepo.Get(ctx, lease.TenantID, lease.FileKey); err == nil {
+	if metadata != nil {
 		volumeID = metadata.VolumeID
 	}
 
@@ -756,14 +778,21 @@ func (p *storagePool) GetAvailableSpace(ctx context.Context) (int64, error) {
 
 // capacitySnapshot returns the cached aggregate capacity of the healthy
 // volumes, recomputing it when the cache window has expired.
+//
+// The recompute runs without the lock: a health probe stats the mount point and
+// writes and deletes a probe file, and every capacity query would otherwise
+// serialize behind one slow volume. The lock only guards the cached aggregate,
+// which is published in a short critical section. p.volumes is immutable after
+// construction, so iterating it needs no synchronization.
 func (p *storagePool) capacitySnapshot(ctx context.Context) capacitySnapshot {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	now := p.timeNow()
 	if p.capacity.valid && now.Before(p.capacity.expiresAt) {
-		return p.capacity
+		cached := p.capacity
+		p.mu.Unlock()
+		return cached
 	}
+	p.mu.Unlock()
 
 	snapshot := capacitySnapshot{expiresAt: now.Add(p.capacityCacheDuration()), valid: true}
 
@@ -786,7 +815,13 @@ func (p *storagePool) capacitySnapshot(ctx context.Context) capacitySnapshot {
 	}
 
 	if complete {
-		p.capacity = snapshot
+		p.mu.Lock()
+		// A concurrent recompute may have published while this one was probing;
+		// keep the snapshot that stays valid longer.
+		if !p.capacity.valid || p.capacity.expiresAt.Before(snapshot.expiresAt) {
+			p.capacity = snapshot
+		}
+		p.mu.Unlock()
 	}
 
 	return snapshot

@@ -311,7 +311,11 @@ func TestOrphanRecoveryRequeuesStrayFileThroughVenue(t *testing.T) {
 			WithShardingDepth(2)).
 		WithOrphanRecovery(config.NewOrphanRecoveryConfig().
 			WithEnabled(true).
-			WithRecoveryInterval(time.Hour))
+			WithRecoveryInterval(time.Hour).
+			// The stray file is written moments before the scan; the default
+			// age floor exists precisely to skip such a file, so the test
+			// disables the guard explicitly with a negative value.
+			WithMinimumFileAge(-time.Second))
 
 	runtime, err := venue.NewVenue(cfg)
 	if err != nil {

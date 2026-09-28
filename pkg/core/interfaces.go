@@ -179,7 +179,9 @@ type FileScheduler interface {
 
 	// MarkAsCompleted marks a file as completed and schedules it for deletion.
 	// The lease must still identify the active Processing state of the file.
-	MarkAsCompleted(ctx context.Context, lease FileProcessingLease) error
+	// It returns the updated record, which carries the volume assignment, so
+	// callers do not need to read the metadata again.
+	MarkAsCompleted(ctx context.Context, lease FileProcessingLease) (*FileMetadata, error)
 
 	// MarkAsFailed marks a file as failed and schedules retry or permanent failure.
 	// The lease must still identify the active Processing state of the file.
@@ -569,8 +571,10 @@ type MetadataRepository interface {
 		update func(*FileMetadata) error,
 	) (*FileMetadata, error)
 
-	// GetTimedOutProcessingFiles retrieves files in Processing status that exceed timeout.
-	GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration) ([]*FileMetadata, error)
+	// GetTimedOutProcessingFiles retrieves files in Processing status that
+	// exceed timeout. limit > 0 bounds the candidate set at the database;
+	// limit <= 0 returns every match.
+	GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration, limit int) ([]*FileMetadata, error)
 
 	// Optimize triggers repository-level garbage collection / compaction work.
 	Optimize(ctx context.Context) error
@@ -584,6 +588,30 @@ type MetadataRepository interface {
 // remove the mapping when the owning metadata record is deleted.
 type ImportOperationRepository interface {
 	GetByImportOperationID(ctx context.Context, tenantID string, operationID string) (*FileMetadata, error)
+}
+
+// PhysicalPathUpdater is the optional MetadataRepository capability that
+// corrects a drifted physical path with a guarded single-column update.
+//
+// A whole-record upsert is the wrong tool for a read-path correction: the
+// snapshot the caller read can go stale while it verifies the bytes on the
+// volume, and writing every column back would then resurrect that snapshot over
+// a newer queue transition (a claim that happened in between). The guarded
+// update touches physical_path and updated_at only, and it is rejected unless
+// the stored physical path still equals expectedPhysicalPath. It reports
+// whether a row was updated; no match is not an error.
+type PhysicalPathUpdater interface {
+	UpdatePhysicalPath(ctx context.Context, tenantID string, fileKey string, expectedPhysicalPath string, newPhysicalPath string) (bool, error)
+}
+
+// PendingFilesPager is the optional MetadataRepository capability that continues
+// a pending-queue scan after a returned record, with the same ordering as
+// GetPendingFiles (availability, then arrival, then file key). A nil after
+// starts at the beginning of the queue. It lets a batch claim walk several
+// bounded windows instead of either capping at one window or issuing an
+// unbounded query.
+type PendingFilesPager interface {
+	GetPendingFilesAfter(ctx context.Context, tenantID string, after *FileMetadata, limit int) ([]*FileMetadata, error)
 }
 
 // DirectoryQuotaRepository manages directory quota persistence.

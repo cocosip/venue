@@ -124,7 +124,7 @@ func TestCleanupPermanentlyFailedFiles_MoveToDeadLetterDefaultLayout(t *testing.
 
 	base := volumes["test-volume"]
 	mover := &moveRecordingVolume{StorageVolume: base}
-	volumes["test-volume"] = mover
+	replaceCleanupVolume(service, mover)
 
 	record := newDeadLetterRecord(deadLetterTestKey, filepath.Join("tenant-001", deadLetterTestKey+".txt"))
 	if err := writeVolumeFile(t, base, record.PhysicalPath); err != nil {
@@ -231,7 +231,7 @@ func TestCleanupPermanentlyFailedFiles_MoveToDeadLetterWithoutFileMover(t *testi
 	if _, isMover := any(fallback).(core.FileMover); isMover {
 		t.Fatal("the fallback wrapper unexpectedly implements core.FileMover")
 	}
-	volumes["test-volume"] = fallback
+	replaceCleanupVolume(service, fallback)
 
 	const payload = "dead-letter payload bytes"
 	record := newDeadLetterRecord(deadLetterTestKey, filepath.Join("tenant-001", deadLetterTestKey+".txt"))
@@ -286,7 +286,7 @@ func TestCleanupPermanentlyFailedFiles_MoveToDeadLetterCustomLayout(t *testing.T
 
 	base := volumes["test-volume"]
 	mover := &moveRecordingVolume{StorageVolume: base}
-	volumes["test-volume"] = mover
+	replaceCleanupVolume(service, mover)
 
 	record := newDeadLetterRecord(deadLetterTestKey, filepath.Join("tenant-001", deadLetterTestKey+".txt"))
 	if err := writeVolumeFile(t, base, record.PhysicalPath); err != nil {
@@ -398,12 +398,7 @@ func TestBuildDeadLetterPath_RejectsUnsafeTargets(t *testing.T) {
 			service, _, _ := newRegressionCleanupService(t, []string{"test-tenant"}, func(opts *CleanupServiceOptions) {
 				opts.DeadLetter = test.options
 			})
-			concrete, ok := service.(*cleanupService)
-			if !ok {
-				t.Fatalf("unexpected cleanup service type %T", service)
-			}
-
-			path, err := concrete.buildDeadLetterPath(test.record, time.Now())
+			path, err := service.buildDeadLetterPath(test.record, time.Now())
 			if test.wantErr {
 				if err == nil {
 					t.Fatalf("buildDeadLetterPath() = %q, want an error", path)
@@ -439,7 +434,7 @@ func TestCleanupPermanentlyFailedFiles_UnsafeDeadLetterTargetLeavesRecordUntouch
 
 	base := volumes["test-volume"]
 	mover := &moveRecordingVolume{StorageVolume: base}
-	volumes["test-volume"] = mover
+	replaceCleanupVolume(service, mover)
 
 	record := newDeadLetterRecord(deadLetterTestKey, filepath.Join("tenant-001", deadLetterTestKey+".txt"))
 	if err := writeVolumeFile(t, base, record.PhysicalPath); err != nil {
@@ -494,7 +489,7 @@ func TestCleanupPermanentlyFailedFiles_KeepLeavesEverythingUntouched(t *testing.
 
 	base := volumes["test-volume"]
 	mover := &moveRecordingVolume{StorageVolume: base}
-	volumes["test-volume"] = mover
+	replaceCleanupVolume(service, mover)
 
 	record := newDeadLetterRecord(deadLetterTestKey, filepath.Join("tenant-001", deadLetterTestKey+".txt"))
 	if err := writeVolumeFile(t, base, record.PhysicalPath); err != nil {
@@ -578,7 +573,7 @@ func TestCleanupPermanentlyFailedFiles_MoveFailureKeepsRecordAndContinues(t *tes
 			return nil
 		},
 	}
-	volumes["test-volume"] = mover
+	replaceCleanupVolume(service, mover)
 
 	for _, record := range []*core.FileMetadata{failingRecord, succeedingRecord} {
 		if err := writeVolumeFile(t, base, record.PhysicalPath); err != nil {
@@ -651,7 +646,7 @@ func TestCleanupPermanentlyFailedFiles_QuotaFailureRollsBackTransition(t *testin
 
 	base := volumes["test-volume"]
 	mover := &moveRecordingVolume{StorageVolume: base}
-	volumes["test-volume"] = mover
+	replaceCleanupVolume(service, mover)
 
 	record := newDeadLetterRecord(deadLetterTestKey, filepath.Join("tenant-001", deadLetterTestKey+".txt"))
 	if err := writeVolumeFile(t, base, record.PhysicalPath); err != nil {
@@ -710,7 +705,7 @@ func TestCleanupPermanentlyFailedFiles_DeadLetterMoveFailureFromReadFallback(t *
 	})
 
 	base := volumes["test-volume"]
-	volumes["test-volume"] = &readFailVolume{StorageVolume: base, readErr: errors.New("volume read failed")}
+	replaceCleanupVolume(service, &readFailVolume{StorageVolume: base, readErr: errors.New("volume read failed")})
 
 	record := newDeadLetterRecord(deadLetterTestKey, filepath.Join("tenant-001", deadLetterTestKey+".txt"))
 	if err := writeVolumeFile(t, base, record.PhysicalPath); err != nil {
@@ -755,7 +750,7 @@ func TestCleanupPermanentlyFailedFiles_DeadLetterTransitionsMissingPayload(t *te
 
 	base := volumes["test-volume"]
 	mover := &moveRecordingVolume{StorageVolume: base}
-	volumes["test-volume"] = mover
+	replaceCleanupVolume(service, mover)
 
 	record := newDeadLetterRecord(deadLetterTestKey, "")
 	if err := repo.AddOrUpdate(ctx, record); err != nil {

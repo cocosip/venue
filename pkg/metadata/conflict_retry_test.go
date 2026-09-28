@@ -30,13 +30,13 @@ func sqliteBusyError(t *testing.T) error {
 	options := sqlite.DefaultOptions()
 	options.BusyTimeoutMs = 0 // fail immediately instead of waiting out the lock
 
-	holder, err := sqlite.Open(path, options)
+	holder, err := sqlite.Open(context.Background(), path, options)
 	if err != nil {
 		t.Fatalf("sqlite.Open(holder) error = %v", err)
 	}
 	t.Cleanup(func() { _ = holder.Close() })
 
-	contender, err := sqlite.Open(path, options)
+	contender, err := sqlite.Open(context.Background(), path, options)
 	if err != nil {
 		t.Fatalf("sqlite.Open(contender) error = %v", err)
 	}

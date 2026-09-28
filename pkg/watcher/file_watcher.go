@@ -175,6 +175,13 @@ type fileWatcher struct {
 	importedFiles   sync.Map // map[string]importedFileRecord
 	importedCount   int
 
+	// inFlightImports tracks the durable source-cleanup reservations whose
+	// import is currently running in this process, keyed by
+	// durableImportKey(watcherID, sourcePath). The cleanup worker consults it
+	// before recovering a stale reservation, so an import that legitimately
+	// outlives the reservation timeout is not torn down mid-write.
+	inFlightImports sync.Map // map[string]struct{}
+
 	// historyFlushDirty marks history changes that are not persisted yet.
 	historyFlushDirty bool
 	// historyFlushTimer is non-nil while one debounced write is scheduled. At
@@ -273,6 +280,7 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 	if opts.SourceCleanupStore != nil && opts.SourceCleanupWorkerOptions != nil {
 		workerOptions := *opts.SourceCleanupWorkerOptions
 		workerOptions.Store = opts.SourceCleanupStore
+		workerOptions.ImportInFlight = fw.importReservationInFlight
 		if workerOptions.Execute == nil {
 			workerOptions.Execute = fw.executeSourceCleanupJob
 		}
@@ -516,6 +524,13 @@ func (w *fileWatcher) UpdateWatcher(ctx context.Context, config *core.FileWatche
 func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration) (*core.FileWatcherConfiguration, error) {
 	if config.WatchPath == "" {
 		return nil, fmt.Errorf("watch path cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	// The watcher ID becomes a directory segment below the failure directory
+	// and the key of persisted state files, so it must never carry path
+	// separators, traversal segments, or control characters.
+	if err := validateWatcherID(config.WatcherID); err != nil {
+		return nil, err
 	}
 
 	// Validate tenant in single-tenant mode
@@ -874,13 +889,13 @@ func (w *fileWatcher) scanMultiTenant(ctx context.Context, config *core.FileWatc
 		// instead of once per file.
 		tenant, err := w.tenantMgr.GetTenant(ctx, tenantID)
 		if err != nil {
-			w.addResultError(result, fmt.Sprintf("watcher %s tenant resolution failed: %v", config.WatcherID, err))
+			w.addResultError(result, fmt.Sprintf("watcher %s tenant resolution failed: %s", config.WatcherID, errorTypeText(err)))
 			continue
 		}
 
 		files, err := w.discoverFiles(ctx, tenantPath, config)
 		if err != nil {
-			w.addResultError(result, fmt.Sprintf("watcher %s discovery failed: %v", config.WatcherID, err))
+			w.addResultError(result, fmt.Sprintf("watcher %s discovery failed: %s", config.WatcherID, errorTypeText(err)))
 			continue
 		}
 
@@ -925,6 +940,7 @@ func (w *fileWatcher) importDiscoveredFiles(
 	semaphore := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	capacityDeferred := 0
 
 	for _, file := range files {
 		if ctx.Err() != nil {
@@ -953,11 +969,14 @@ func (w *fileWatcher) importDiscoveredFiles(
 			}
 			if err != nil {
 				result.FilesFailed++
-				w.addResultError(result, fmt.Sprintf("watcher %s import failed: %v", config.WatcherID, err))
+				w.addResultError(result, fmt.Sprintf("watcher %s import failed: %s", config.WatcherID, errorTypeText(err)))
 
 				return
 			}
 
+			if outcome.capacityDeferred {
+				capacityDeferred++
+			}
 			if !outcome.imported {
 				result.FilesSkipped++
 			}
@@ -965,6 +984,14 @@ func (w *fileWatcher) importDiscoveredFiles(
 	}
 
 	wg.Wait()
+
+	// One backpressure event per scan, not per file: the store's active-job
+	// budget deferred this many imports, and they retry on the next scan.
+	if capacityDeferred > 0 {
+		w.emit(ctx, slog.LevelWarn, "source_cleanup_capacity_deferred",
+			"Imports deferred because the source cleanup store reached its active job budget",
+			slog.String("watcher_id", config.WatcherID), slog.Int("deferred", capacityDeferred))
+	}
 }
 
 // addResultError records a scan error without leaking physical paths or
@@ -1068,6 +1095,9 @@ type fileImportOutcome struct {
 	bytesImported            int64
 	postImportActionsRetried int
 	quarantined              bool
+	// capacityDeferred marks an import that was skipped because the durable
+	// source cleanup store reached its active-job budget.
+	capacityDeferred bool
 }
 
 func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext, filePath string, config *core.FileWatcherConfiguration) (fileImportOutcome, error) {
@@ -1153,11 +1183,23 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 		}
 		reserved, err := w.sourceCleanupStore.TryReserve(ctx, &cleanupJob)
 		if err != nil {
+			if errors.Is(err, ErrSourceCleanupCapacityExceeded) {
+				// Backpressure, not a failed import: the store's active-job
+				// budget is exhausted, so this file waits for a later scan.
+				// The scan surfaces it once instead of failing every file.
+				outcome.capacityDeferred = true
+				return outcome, nil
+			}
 			return outcome, fmt.Errorf("failed to reserve source cleanup: %w", err)
 		}
 		if !reserved {
 			return outcome, nil
 		}
+		// The reservation exists and the import is about to run. Register it as
+		// in flight so the worker's stale-reservation recovery cannot delete it
+		// when this import legitimately outlives the reservation timeout.
+		w.inFlightImports.Store(durableImportKey(config.WatcherID, filePath), struct{}{})
+		defer w.inFlightImports.Delete(durableImportKey(config.WatcherID, filePath))
 	}
 
 	// Extract original filename for diagnostics only; physical paths are never
@@ -2521,4 +2563,57 @@ func (w *fileWatcher) emit(ctx context.Context, level slog.Level, event, message
 
 func errorTypeAttr(err error) slog.Attr {
 	return slog.String("error_type", fmt.Sprintf("%T", err))
+}
+
+// errorTypeText reduces an error to its Go type for scan-result messages.
+//
+// Scan errors reach the application through core.FileWatcherScanResult.Errors,
+// where the project contract lets the caller log them freely. OS-level failures
+// arrive wrapped in *fs.PathError, whose message carries the full physical
+// source path and the original file name, so the raw text must never be
+// interpolated into these strings; the type preserves the failure class without
+// the leak.
+func errorTypeText(err error) string {
+	if err == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%T", err)
+}
+
+// validateWatcherID rejects a watcher ID that cannot safely become a directory
+// segment or a state-file name: empty values, path separators, traversal
+// segments, NUL bytes and control characters.
+func validateWatcherID(watcherID string) error {
+	if watcherID == "" {
+		return fmt.Errorf("watcher ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if strings.ContainsAny(watcherID, `/\`) {
+		return fmt.Errorf("watcher ID must not contain path separators: %w", core.ErrInvalidArgument)
+	}
+	if watcherID == "." || watcherID == ".." {
+		return fmt.Errorf("watcher ID must not be a relative path segment: %w", core.ErrInvalidArgument)
+	}
+	if strings.ContainsRune(watcherID, 0) {
+		return fmt.Errorf("watcher ID contains a NUL byte: %w", core.ErrInvalidArgument)
+	}
+	for _, r := range watcherID {
+		if r < 32 || r == 127 {
+			return fmt.Errorf("watcher ID contains a control character: %w", core.ErrInvalidArgument)
+		}
+	}
+	return nil
+}
+
+// durableImportKey is the in-flight registry key of one durable source-cleanup
+// import reservation.
+func durableImportKey(watcherID, sourcePath string) string {
+	return watcherID + "\x00" + sourcePath
+}
+
+// importReservationInFlight reports whether the durable import of this job's
+// source is currently running in this process. The cleanup worker consults it
+// before recovering a stale reservation.
+func (w *fileWatcher) importReservationInFlight(job SourceCleanupJob) bool {
+	_, inFlight := w.inFlightImports.Load(durableImportKey(job.WatcherID, job.SourcePath))
+	return inFlight
 }

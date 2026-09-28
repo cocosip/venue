@@ -176,10 +176,13 @@ func NewCleanupService(opts *CleanupServiceOptions) (core.CleanupService, error)
 	}
 
 	return &cleanupService{
-		tenantManager:                opts.TenantManager,
-		metadataRepo:                 opts.MetadataRepository,
-		scheduler:                    opts.FileScheduler,
-		volumes:                      opts.Volumes,
+		tenantManager: opts.TenantManager,
+		metadataRepo:  opts.MetadataRepository,
+		scheduler:     opts.FileScheduler,
+		// A defensive copy: the caller keeps ownership of the original map, and
+		// every read below goes through volumeSnapshot, so a caller mutation of
+		// the input cannot race a running sweep.
+		volumes:                      copyVolumes(opts.Volumes),
 		tenantQuotaMgr:               opts.TenantQuotaManager,
 		dirQuotaMgr:                  opts.DirectoryQuotaManager,
 		dirQuotaRepo:                 opts.DirectoryQuotaRepository,
@@ -192,6 +195,16 @@ func NewCleanupService(opts *CleanupServiceOptions) (core.CleanupService, error)
 		quotaDirectory:               opts.QuotaDirectory,
 		corruptedDatabaseRetention:   opts.CorruptedDatabaseRetention,
 	}, nil
+}
+
+// copyVolumes duplicates a volumes map. A nil input yields an empty map, which
+// keeps the snapshot helper allocation-free of nil handling.
+func copyVolumes(volumes map[string]core.StorageVolume) map[string]core.StorageVolume {
+	copied := make(map[string]core.StorageVolume, len(volumes))
+	for id, volume := range volumes {
+		copied[id] = volume
+	}
+	return copied
 }
 
 // volumeSnapshot returns a stable copy of the registered volumes, so a cleanup
@@ -739,6 +752,9 @@ func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, rete
 	}
 
 	cutoff := time.Now().Add(-retention)
+	// One snapshot per sweep: the visitors below resolve volumes against a
+	// stable set instead of re-copying the map for every record.
+	volumes := s.volumeSnapshot()
 	for _, tenant := range tenants {
 		if err := s.forEachStatusRecord(ctx, tenant.ID, core.FileStatusPermanentlyFailed, func(file *core.FileMetadata) error {
 			// A row that is already dead-lettered was never scanned by status, but
@@ -754,7 +770,7 @@ func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, rete
 				return nil
 			}
 
-			volume, exists := s.volumes[file.VolumeID]
+			volume, exists := volumes[file.VolumeID]
 			if !exists {
 				if s.purgeRecordForMissingVolume(ctx, file, "failed_file_volume_missing", slog.LevelWarn) {
 					stats.PermanentlyFailedFilesRemoved++
@@ -858,12 +874,13 @@ func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention ti
 		return stats, fmt.Errorf("failed to list tenants: %w", err)
 	}
 	cutoff := time.Now().Add(-retention)
+	volumes := s.volumeSnapshot()
 	for _, tenant := range tenants {
 		if err := s.forEachStatusRecord(ctx, tenant.ID, core.FileStatusCompleted, func(file *core.FileMetadata) error {
 			if file.CompletedAt == nil || file.CompletedAt.After(cutoff) {
 				return nil
 			}
-			volume, exists := s.volumes[file.VolumeID]
+			volume, exists := volumes[file.VolumeID]
 			if !exists {
 				if s.purgeRecordForMissingVolume(ctx, file, "completed_file_volume_missing", slog.LevelDebug) {
 					stats.CompletedRecordsRemoved++
@@ -932,6 +949,7 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 	if err != nil {
 		return stats, fmt.Errorf("failed to list tenants: %w", err)
 	}
+	volumes := s.volumeSnapshot()
 	for _, tenant := range tenants {
 		for _, status := range allStatuses {
 			if err := s.forEachStatusRecord(ctx, tenant.ID, status, func(file *core.FileMetadata) error {
@@ -941,7 +959,7 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 				// live metadata loses the only reference to a real file.
 				confirmedMissing := false
 
-				if volume, exists := s.volumes[file.VolumeID]; !exists {
+				if volume, exists := volumes[file.VolumeID]; !exists {
 					// The volume is not registered with this service, so the physical
 					// file cannot be checked. The retired-volume policy decides
 					// whether the metadata is purged or retained; the accounting

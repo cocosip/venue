@@ -59,6 +59,13 @@ func DefaultTenantManagerOptions(rootPath string) *TenantManagerOptions {
 	}
 }
 
+// tenantLockStripes is the fixed size of the per-tenant lock table. The stripes
+// are keyed by a hash of the tenant ID: mutual exclusion is preserved per
+// tenant (and occasionally shared between unrelated tenants that hash to the
+// same stripe, which only over-serializes), and the table can never grow with
+// API input the way one-mutex-per-tenant-ID would.
+const tenantLockStripes = 64
+
 // TenantManager manages tenant lifecycle and multi-tenant isolation.
 type TenantManager struct {
 	opts   *TenantManagerOptions
@@ -69,9 +76,11 @@ type TenantManager struct {
 	cache   map[string]*cacheEntry
 	cacheMu sync.RWMutex
 
-	// Per-tenant locks for operations
-	locks   map[string]*sync.Mutex
-	locksMu sync.Mutex
+	// putCount drives the periodic expired-entry sweep in putCache.
+	putCount uint64
+
+	// Fixed stripe table of per-tenant operation locks.
+	locks [tenantLockStripes]sync.Mutex
 }
 
 // NewTenantManager creates a new TenantManager.
@@ -111,7 +120,6 @@ func NewTenantManager(opts *TenantManagerOptions) (core.TenantManager, error) {
 		store:  store,
 		logger: logger,
 		cache:  make(map[string]*cacheEntry),
-		locks:  make(map[string]*sync.Mutex),
 	}, nil
 }
 
@@ -402,7 +410,13 @@ func (m *TenantManager) getCached(tenantID string) (core.TenantContext, bool) {
 	return entry.context, true
 }
 
-// putCache adds a tenant to cache.
+// putCache adds a tenant to the cache.
+//
+// Every sweep-threshold writes trigger one pass over the map that deletes
+// expired entries. Without it, expired entries stayed until an overwrite or an
+// explicit invalidation, so probing many unknown tenant IDs grew the map
+// without bound; with it, entries for IDs that stop being refreshed are
+// eventually reclaimed.
 func (m *TenantManager) putCache(tenantID string, tenant core.TenantContext) {
 	m.cacheMu.Lock()
 	defer m.cacheMu.Unlock()
@@ -411,7 +425,20 @@ func (m *TenantManager) putCache(tenantID string, tenant core.TenantContext) {
 		context:   tenant,
 		expiresAt: time.Now().Add(m.opts.CacheTTL),
 	}
+
+	m.putCount++
+	if m.putCount%cacheSweepInterval == 0 {
+		for id, entry := range m.cache {
+			if entry.isExpired() {
+				delete(m.cache, id)
+			}
+		}
+	}
 }
+
+// cacheSweepInterval is how many cache writes separate two expired-entry
+// sweeps. Amortized, the sweep costs one map pass per 64 writes.
+const cacheSweepInterval = 64
 
 // invalidateCache removes a tenant from cache.
 func (m *TenantManager) invalidateCache(tenantID string) {
@@ -421,16 +448,13 @@ func (m *TenantManager) invalidateCache(tenantID string) {
 	delete(m.cache, tenantID)
 }
 
-// getTenantLock gets or creates a lock for a tenant.
+// getTenantLock returns the fixed stripe that serializes operations for one
+// tenant. The table is allocated once and never grows, so an ID stream that
+// passes validation but names no real tenant cannot allocate per-request state.
 func (m *TenantManager) getTenantLock(tenantID string) *sync.Mutex {
-	m.locksMu.Lock()
-	defer m.locksMu.Unlock()
-
-	lock, ok := m.locks[tenantID]
-	if !ok {
-		lock = &sync.Mutex{}
-		m.locks[tenantID] = lock
+	var h uint32
+	for _, c := range []byte(tenantID) {
+		h = (h ^ uint32(c)) * 16777619
 	}
-
-	return lock
+	return &m.locks[h%tenantLockStripes]
 }

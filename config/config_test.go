@@ -370,8 +370,23 @@ func TestApplyDefaultsRestoresSourceCleanupAndDeadLetterDefaults(t *testing.T) {
 	cfg.ApplyDefaults()
 
 	defaults := DefaultConfig()
-	if cfg.SourceCleanup != defaults.SourceCleanup {
-		t.Fatalf("SourceCleanup defaults = %#v, want %#v", cfg.SourceCleanup, defaults.SourceCleanup)
+	// A zero SourceCleanupConfig means "disabled": only the numeric knobs are
+	// filled, and the boolean flags are left exactly as the caller wrote them.
+	// Re-enabling an explicitly disabled component here is the bug the
+	// field-by-field defaulting removed.
+	if cfg.SourceCleanup.Enabled {
+		t.Fatalf("SourceCleanup.Enabled = true, want false for an untouched zero config")
+	}
+	if cfg.SourceCleanup.PollingInterval != defaults.SourceCleanup.PollingInterval ||
+		cfg.SourceCleanup.MaxActiveJobs != defaults.SourceCleanup.MaxActiveJobs ||
+		cfg.SourceCleanup.TerminalJobRetentionPeriod != defaults.SourceCleanup.TerminalJobRetentionPeriod {
+		t.Fatalf("SourceCleanup numeric defaults = %#v, want the documented durations and budgets", cfg.SourceCleanup)
+	}
+
+	enabled := &Config{SourceCleanup: SourceCleanupConfig{Enabled: true}}
+	enabled.ApplyDefaults()
+	if !enabled.SourceCleanup.Enabled || enabled.SourceCleanup.DatabasePath != defaults.SourceCleanup.DatabasePath {
+		t.Fatalf("enabled SourceCleanup defaults = %#v, want the default database path", enabled.SourceCleanup)
 	}
 	if cfg.Cleanup.DeadLetter.IncludeTenantInPath != defaults.Cleanup.DeadLetter.IncludeTenantInPath ||
 		cfg.Cleanup.DeadLetter.IncludeDatePartition != defaults.Cleanup.DeadLetter.IncludeDatePartition {

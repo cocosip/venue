@@ -27,7 +27,7 @@ func (s *stubMetadataRepository) GetPendingFiles(ctx context.Context, tenantID s
 	return s.pendingFiles(ctx, tenantID, limit)
 }
 
-func (s *stubMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration) ([]*core.FileMetadata, error) {
+func (s *stubMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration, limit int) ([]*core.FileMetadata, error) {
 	if s.timedOutFiles == nil {
 		return nil, nil
 	}

@@ -488,7 +488,7 @@ func (r *stubMetadataRepository) CompareAndUpdateProcessing(
 	return nil, core.ErrProcessingLeaseMismatch
 }
 
-func (r *stubMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration) ([]*core.FileMetadata, error) {
+func (r *stubMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration, limit int) ([]*core.FileMetadata, error) {
 	return nil, nil
 }
 

@@ -22,9 +22,10 @@ func (r *reclaimCountingRepository) GetTimedOutProcessingFiles(
 	ctx context.Context,
 	tenantID string,
 	timeout time.Duration,
+	limit int,
 ) ([]*core.FileMetadata, error) {
 	r.timedOutCalls.Add(1)
-	return r.MetadataRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout)
+	return r.MetadataRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout, limit)
 }
 
 // reclaimTestScheduler builds a scheduler over a real repository with immediate

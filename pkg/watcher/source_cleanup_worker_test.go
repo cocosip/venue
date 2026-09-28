@@ -11,7 +11,7 @@ import (
 
 func TestSourceCleanupWorkerRetriesDueJobAndCompletesIt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cleanup.db")
-	store, err := OpenSourceCleanupStore(path, SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(context.Background(), path, SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestSourceCleanupWorkerRetriesDueJobAndCompletesIt(t *testing.T) {
 }
 
 func TestSourceCleanupWorkerPausesWhenRuntimeIsDisabled(t *testing.T) {
-	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(context.Background(), filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestSourceCleanupWorkerPausesWhenRuntimeIsDisabled(t *testing.T) {
 }
 
 func TestSourceCleanupWorkerDiscardsObsoleteFingerprintJob(t *testing.T) {
-	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(context.Background(), filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestSourceCleanupWorkerDiscardsObsoleteFingerprintJob(t *testing.T) {
 }
 
 func TestSourceCleanupWorkerRetriesFailureQuarantineAfterCleanupExhaustion(t *testing.T) {
-	store, err := OpenSourceCleanupStore(filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(context.Background(), filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

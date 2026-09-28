@@ -380,47 +380,102 @@ func (s *fileScheduler) claimNextPendingFile(ctx context.Context, tenantID strin
 	return nil, false, nil
 }
 
-// claimPendingBatch claims up to batchSize pending files from one bounded
-// candidate window. It returns the claimed files, which may be empty when
-// nothing was claimable, or nil when the pending scan failed.
+// claimPendingBatch claims up to batchSize pending files, walking the pending
+// queue in bounded candidate windows. It returns the claimed files, which may
+// be empty when nothing was claimable, or nil when the pending scan failed.
+//
+// A window never exceeds batchCandidateLimit, so one call cannot issue an
+// unbounded query, and the walk continues into the next window (keyset-paged
+// through core.PendingFilesPager) only while it makes progress: the loop stops
+// once batchSize is reached, at the end of the queue, or when a full window
+// yielded no claim, which is what contention looks like. That keeps a bounded
+// claim bounded even when every candidate is being stolen by other workers.
 func (s *fileScheduler) claimPendingBatch(ctx context.Context, tenantID string, batchSize int) ([]*core.FileLocation, error) {
 	// Get pending files (fetch more than needed to account for race conditions)
-	fetchSize := batchSize * 2
-	if fetchSize > batchCandidateLimit {
-		fetchSize = batchCandidateLimit
+	fetchSize := batchFetchSize(batchSize)
+	pager, canPage := s.metadataRepo.(core.PendingFilesPager)
+
+	// Non-nil so an empty result keeps the documented empty-slice contract.
+	claimed := make([]*core.FileLocation, 0, batchSize)
+	var after *core.FileMetadata
+	for {
+		window, err := s.fetchPendingWindow(ctx, tenantID, fetchSize, after, pager, canPage)
+		if err != nil {
+			return nil, err
+		}
+		if len(window) == 0 {
+			return claimed, nil
+		}
+
+		claimedInWindow := 0
+		for _, file := range window {
+			if len(claimed) >= batchSize {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+
+			err := s.transitionToProcessing(ctx, file)
+			if err == nil {
+				// Successfully claimed the file.
+				claimed = append(claimed, file.ToFileLocation())
+				claimedInWindow++
+				continue
+			}
+			if !claimRetryable(err) {
+				return nil, fmt.Errorf("failed to claim file %q: %w", file.FileKey, err)
+			}
+		}
+
+		if len(claimed) >= batchSize {
+			return claimed, nil
+		}
+		// A window smaller than the fetch bound is the end of the queue; a full
+		// window without a single claim is contention, not an invitation to
+		// scan the queue.
+		if len(window) < fetchSize || claimedInWindow == 0 || !canPage {
+			return claimed, nil
+		}
+		after = window[len(window)-1]
+	}
+}
+
+// batchFetchSize is the candidate window for one batch claim: twice the batch
+// size when that stays inside the bounded candidate window, the window cap
+// otherwise. The cap check doubles as the overflow guard, so a huge batchSize
+// can never turn the fetch into a negative, unlimited query.
+func batchFetchSize(batchSize int) int {
+	if batchSize <= batchCandidateLimit/2 {
+		return batchSize * 2
+	}
+	return batchCandidateLimit
+}
+
+// fetchPendingWindow reads one candidate window, keyset-paging from after when
+// the repository provides the pager capability and the caller asks for a
+// continuation.
+func (s *fileScheduler) fetchPendingWindow(
+	ctx context.Context,
+	tenantID string,
+	fetchSize int,
+	after *core.FileMetadata,
+	pager core.PendingFilesPager,
+	canPage bool,
+) ([]*core.FileMetadata, error) {
+	if after == nil || !canPage {
+		pendingFiles, err := s.metadataRepo.GetPendingFiles(ctx, tenantID, fetchSize)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pending files: %w", err)
+		}
+		return pendingFiles, nil
 	}
 
-	pendingFiles, err := s.metadataRepo.GetPendingFiles(ctx, tenantID, fetchSize)
+	pendingFiles, err := pager.GetPendingFilesAfter(ctx, tenantID, after, fetchSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pending files: %w", err)
 	}
-
-	if len(pendingFiles) == 0 {
-		return []*core.FileLocation{}, nil
-	}
-
-	// Try to claim files up to batchSize
-	var claimedFiles []*core.FileLocation
-	for _, file := range pendingFiles {
-		if len(claimedFiles) >= batchSize {
-			break
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		err := s.transitionToProcessing(ctx, file)
-		if err == nil {
-			// Successfully claimed the file.
-			claimedFiles = append(claimedFiles, file.ToFileLocation())
-			continue
-		}
-		if !claimRetryable(err) {
-			return nil, fmt.Errorf("failed to claim file %q: %w", file.FileKey, err)
-		}
-	}
-
-	return claimedFiles, nil
+	return pendingFiles, nil
 }
 
 // reclaimTimedOutOnEmptyQueue resets timed-out Processing files after a claim
@@ -671,16 +726,21 @@ func (s *fileScheduler) transitionToProcessing(ctx context.Context, file *core.F
 }
 
 // MarkAsCompleted marks a file as completed and schedules it for deletion.
-func (s *fileScheduler) MarkAsCompleted(ctx context.Context, lease core.FileProcessingLease) error {
+//
+// It returns the updated record with the lease applied, so a caller that needs
+// the completion's volume assignment does not have to read the metadata again
+// (a completed record is uncached by design, so that read would be a fresh
+// transaction).
+func (s *fileScheduler) MarkAsCompleted(ctx context.Context, lease core.FileProcessingLease) (*core.FileMetadata, error) {
 	if lease.TenantID == "" {
-		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
 	if lease.FileKey == "" {
-		return fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
+		return nil, fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
 	completedAt := time.Now()
-	_, err := s.metadataRepo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
+	metadata, err := s.metadataRepo.CompareAndUpdateProcessing(ctx, lease, func(current *core.FileMetadata) error {
 		current.Status = core.FileStatusCompleted
 		current.ProcessingStartTime = nil
 		current.CompletedAt = &completedAt
@@ -690,10 +750,10 @@ func (s *fileScheduler) MarkAsCompleted(ctx context.Context, lease core.FileProc
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("failed to complete processing lease: %w", err)
+		return nil, fmt.Errorf("failed to complete processing lease: %w", err)
 	}
 
-	return nil
+	return metadata, nil
 }
 
 // MarkAsFailed marks a file as failed and schedules retry or permanent failure.
@@ -785,20 +845,20 @@ func (s *fileScheduler) ResetTimedOutFiles(ctx context.Context, tenant core.Tena
 //
 // limit > 0 bounds how many timed-out candidates are examined, which the
 // empty-queue reclaim and the opportunistic background pass use to cap one
-// attempt; limit <= 0 examines them all. The reset is intentionally best-effort
-// per file so one lease mismatch does not abort the rest of the scan.
+// attempt; the bound is pushed into the repository query so a bounded pass
+// never materializes the whole timed-out set. limit <= 0 examines them all,
+// which is the drain-everything contract of ResetTimedOutFiles. The reset is
+// intentionally best-effort per file so one lease mismatch does not abort the
+// rest of the scan.
 func (s *fileScheduler) resetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration, limit int) (int, error) {
 	// Get timed out files
-	timedOutFiles, err := s.metadataRepo.GetTimedOutProcessingFiles(ctx, tenantID, timeout)
+	timedOutFiles, err := s.metadataRepo.GetTimedOutProcessingFiles(ctx, tenantID, timeout, limit)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get timed out files: %w", err)
 	}
 
 	resetCount := 0
-	for index, file := range timedOutFiles {
-		if limit > 0 && index >= limit {
-			break
-		}
+	for _, file := range timedOutFiles {
 		if err := ctx.Err(); err != nil {
 			return resetCount, err
 		}

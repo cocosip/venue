@@ -774,7 +774,7 @@ func TestSQLiteMetadataRepositoryRejectsNewerSchemaVersion(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	db, err := sqlite.Open(databasePath, sqlite.DefaultOptions())
+	db, err := sqlite.Open(context.Background(), databasePath, sqlite.DefaultOptions())
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}

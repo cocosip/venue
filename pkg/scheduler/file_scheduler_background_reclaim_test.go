@@ -88,9 +88,10 @@ func (r *backgroundTrackingRepository) GetTimedOutProcessingFiles(
 	ctx context.Context,
 	tenantID string,
 	timeout time.Duration,
+	limit int,
 ) ([]*core.FileMetadata, error) {
 	r.timedOutCalls.Add(1)
-	return r.MetadataRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout)
+	return r.MetadataRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout, limit)
 }
 
 func (r *backgroundTrackingRepository) CompareAndUpdateProcessing(
@@ -131,12 +132,13 @@ func (r *gatedReclaimRepository) GetTimedOutProcessingFiles(
 	ctx context.Context,
 	tenantID string,
 	timeout time.Duration,
+	limit int,
 ) ([]*core.FileMetadata, error) {
 	if r.gate.CompareAndSwap(false, true) {
 		close(r.scanStarted)
 		<-r.release
 	}
-	return r.backgroundTrackingRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout)
+	return r.backgroundTrackingRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout, limit)
 }
 
 // releaseGate lets a gated background pass continue. It is safe to call more

@@ -346,7 +346,7 @@ func TestSQLiteDirectoryQuotaRepositoryDoesNotQuarantineLockedDatabase(t *testin
 	options := sqlite.DefaultOptions()
 	options.JournalMode = "DELETE"
 	options.BusyTimeoutMs = 1
-	holder, err := sqlite.Open(path, options)
+	holder, err := sqlite.Open(context.Background(), path, options)
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}

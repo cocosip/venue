@@ -2,6 +2,7 @@ package venue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -326,7 +327,7 @@ func (v *Venue) initialize() error {
 	if len(v.config.Tenants) > 0 {
 		v.emit(ctx, slog.LevelInfo, "tenants_configuring", "Creating tenants from configuration", slog.Int("count", len(v.config.Tenants)))
 		for _, tenantCfg := range v.config.Tenants {
-			if err := v.tenantManager.CreateTenant(ctx, tenantCfg.TenantID); err != nil && err != core.ErrTenantAlreadyExists {
+			if err := v.tenantManager.CreateTenant(ctx, tenantCfg.TenantID); err != nil && !errors.Is(err, core.ErrTenantAlreadyExists) {
 				return fmt.Errorf("failed to create tenant %s: %w", tenantCfg.TenantID, err)
 			}
 
@@ -599,7 +600,7 @@ func (v *Venue) initialize() error {
 			if !filepath.IsAbs(databasePath) {
 				databasePath = filepath.Join(v.config.FileWatcherConfigurationDirectory, databasePath)
 			}
-			openedStore, openErr := watcher.OpenSourceCleanupStore(databasePath, watcher.SourceCleanupStoreOptions{
+			openedStore, openErr := watcher.OpenSourceCleanupStore(ctx, databasePath, watcher.SourceCleanupStoreOptions{
 				MaxActiveJobs: v.config.SourceCleanup.MaxActiveJobs,
 			})
 			if openErr != nil {
@@ -618,6 +619,7 @@ func (v *Venue) initialize() error {
 				RetryInitialDelay:            5 * time.Second,
 				RetryMaxDelay:                5 * time.Minute,
 				RuntimeEnabled:               v.sourceCleanupRuntimeEnabled,
+				Logging:                      v.logger,
 			}
 		}
 		fileWatcherCore, err := watcher.NewFileWatcher(&watcher.FileWatcherOptions{
@@ -768,6 +770,7 @@ func (v *Venue) initialize() error {
 			RecoveryInterval:      v.config.OrphanRecovery.RecoveryInterval,
 			InitialDelay:          v.config.OrphanRecovery.InitialDelay,
 			RunOnStartup:          v.config.OrphanRecovery.RunOnStartup,
+			MinimumFileAge:        v.config.OrphanRecovery.MinimumFileAge,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create orphan recovery service: %w", err)
@@ -1012,6 +1015,10 @@ func (v *Venue) Start() error {
 			for i := len(started) - 1; i >= 0; i-- {
 				_ = started[i].Stop()
 			}
+			// Release the context this Start created, so a later Start cannot
+			// silently overwrite the cancel of an orphaned child context.
+			v.cancel()
+			v.cancel = nil
 			v.running = false
 			return fmt.Errorf("failed to start %s service: %w", entry.name, err)
 		}
@@ -1120,6 +1127,12 @@ func (v *Venue) sourceCleanupService() backgroundService {
 // sourceCleanupRuntimeEnabled follows the background watcher service and the
 // persisted per-watcher enablement state. Source cleanup is paused while the
 // watcher service is globally disabled or no watcher is currently enabled.
+//
+// Ordering contract: this callback runs on source cleanup worker goroutines and
+// reads the fileWatcherCore field. Venue.Stop joins those workers (the source
+// cleanup service is stopped in the shutdown sequence) before closeRepositories
+// nils the field, so a running callback can never observe the nil-out; the
+// worker's Stop must keep joining its pass goroutines for that to hold.
 func (v *Venue) sourceCleanupRuntimeEnabled(ctx context.Context) bool {
 	if v.fileWatcherService == nil || !v.fileWatcherService.IsEnabled() || v.fileWatcherCore == nil {
 		return false
@@ -1395,9 +1408,17 @@ func (v *Venue) DatabaseHealthChecker() core.DatabaseHealthChecker {
 	return v.databaseHealthChecker
 }
 
-// Volumes returns the map of all storage volumes.
+// Volumes returns a copy of the map of all storage volumes.
+//
+// The copy is deliberate: the runtime's own map is shared with every component
+// and iterated without synchronization, so a caller mutating the returned map
+// must not be able to change volume selection under a running Venue.
 func (v *Venue) Volumes() map[string]core.StorageVolume {
-	return v.volumes
+	volumes := make(map[string]core.StorageVolume, len(v.volumes))
+	for id, volume := range v.volumes {
+		volumes[id] = volume
+	}
+	return volumes
 }
 
 // Config returns an independent copy of this Venue instance's runtime configuration.

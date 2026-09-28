@@ -34,7 +34,7 @@ func Example() {
 	// DefaultOptions mirrors the Locus SqliteOptions defaults: WAL journaling,
 	// NORMAL synchronous mode, a 4000 KiB cache and a 5000 ms busy timeout.
 	opts := venuesqlite.DefaultOptions()
-	db, err := venuesqlite.Open(path, opts)
+	db, err := venuesqlite.Open(context.Background(), path, opts)
 	if err != nil {
 		log.Fatal(err)
 	}

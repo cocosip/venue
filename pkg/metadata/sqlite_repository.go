@@ -341,6 +341,16 @@ type sqliteTenantDatabase struct {
 	// reads without taking mu.
 	lastUsedNanos int64
 	lastUsed      time.Time
+
+	// checkpointAfterBatch mirrors Sqlite.CheckpointAfterBatch: after every
+	// committed write transaction the handle runs PRAGMA wal_checkpoint(PASSIVE)
+	// outside the transaction, which the single-connection policy makes safe.
+	checkpointAfterBatch bool
+
+	// logging is the instance-scoped logging runtime, captured so the
+	// post-commit checkpoint can report a failure without reaching back into
+	// the repository.
+	logging *logging.Runtime
 }
 
 // SQLiteMetadataTenantBackupService is the optional capability that exposes one
@@ -798,6 +808,71 @@ WHERE tenant_id = @tenant
 ORDER BY available_for_processing_at ASC, created_at ASC, file_key ASC
 LIMIT @limit`
 
+// GetPendingFilesAfter returns the pending files that sort strictly after the
+// given record, with the same availability window and ordering as
+// GetPendingFiles. A nil after starts at the beginning of the queue. It is the
+// keyset continuation the scheduler's batch claim uses to walk several bounded
+// candidate windows without ever issuing an unbounded query.
+func (r *SQLiteMetadataRepository) GetPendingFilesAfter(ctx context.Context, tenantID string, after *core.FileMetadata, limit int) ([]*core.FileMetadata, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	handle, err := r.begin(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer r.end(handle)
+
+	var afterAvailable, afterCreated int64
+	var afterKey string
+	if after != nil {
+		// The availability column stores 0 for "not yet scheduled", matching the
+		// optionalTimeToNanos write path, so a nil availability keeps its
+		// position in the keyset comparison.
+		afterAvailable = optionalTimeToNanos(after.AvailableForProcessingAt)
+		afterCreated = timeToNanos(after.CreatedAt)
+		afterKey = after.FileKey
+	}
+
+	rows, err := handle.db.QueryContext(ctx, sqliteSelectPendingAfterSQL,
+		sql.Named("tenant", tenantID),
+		sql.Named("status", int(core.FileStatusPending)),
+		sql.Named("now", r.now().UTC().UnixNano()),
+		sql.Named("afterAvailable", afterAvailable),
+		sql.Named("afterCreated", afterCreated),
+		sql.Named("afterKey", afterKey),
+		sql.Named("limit", sqliteLimit(limit)))
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("failed to get pending files: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	results, err := sqliteScanMetadataRows(ctx, rows)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("failed to get pending files: %w", err)
+	}
+	return results, nil
+}
+
+const sqliteSelectPendingAfterSQL = `
+SELECT ` + sqliteFileMetadataColumns + `
+FROM files
+WHERE tenant_id = @tenant
+  AND status = @status
+  AND available_for_processing_at <= @now
+  AND (available_for_processing_at > @afterAvailable
+       OR (available_for_processing_at = @afterAvailable AND created_at > @afterCreated)
+       OR (available_for_processing_at = @afterAvailable AND created_at = @afterCreated AND file_key > @afterKey))
+ORDER BY available_for_processing_at ASC, created_at ASC, file_key ASC
+LIMIT @limit`
+
 // UpdateStatus applies a status change unconditionally.
 //
 // This is the administrative/repair operation the interface describes: it
@@ -850,6 +925,67 @@ func (r *SQLiteMetadataRepository) UpdateStatus(ctx context.Context, tenantID st
 		r.cacheRecord(updated)
 	}
 	return nil
+}
+
+// UpdatePhysicalPath corrects a drifted physical path without rewriting any
+// other column of the record.
+//
+// The update is rejected unless the stored physical path still equals
+// expectedPhysicalPath, and it reports whether a row was updated. A whole-record
+// upsert is the wrong tool for this correction: the snapshot a caller read can
+// go stale while it verifies the bytes on the volume, and writing every column
+// back would then resurrect that snapshot over a newer queue transition.
+// Implementing core.PhysicalPathUpdater is what lets the storage pool correct
+// paths without that race.
+func (r *SQLiteMetadataRepository) UpdatePhysicalPath(ctx context.Context, tenantID string, fileKey string, expectedPhysicalPath string, newPhysicalPath string) (bool, error) {
+	if tenantID == "" {
+		return false, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if fileKey == "" {
+		return false, fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if expectedPhysicalPath == "" || newPhysicalPath == "" {
+		return false, fmt.Errorf("physical paths cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if expectedPhysicalPath == newPhysicalPath {
+		return false, nil
+	}
+
+	handle, err := r.begin(ctx, tenantID)
+	if err != nil {
+		return false, err
+	}
+	defer r.end(handle)
+
+	updated := false
+	if err := handle.inTx(ctx, func(tx *sql.Tx) error {
+		result, execErr := tx.ExecContext(ctx,
+			`UPDATE files SET physical_path = @new, updated_at = @now
+			 WHERE tenant_id = @tenant AND file_key = @key AND physical_path = @expected`,
+			sql.Named("new", newPhysicalPath),
+			sql.Named("now", r.now().UTC().UnixNano()),
+			sql.Named("tenant", tenantID),
+			sql.Named("key", fileKey),
+			sql.Named("expected", expectedPhysicalPath))
+		if execErr != nil {
+			return execErr
+		}
+		affected, affectedErr := result.RowsAffected()
+		if affectedErr != nil {
+			return affectedErr
+		}
+		updated = affected > 0
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("failed to update physical path: %w", err)
+	}
+	if updated {
+		r.recordPersistedBatch(1)
+		// The cached copy still carries the old path; drop it so the next read
+		// observes the correction instead of re-triggering it.
+		r.cache.delete(tenantID, fileKey)
+	}
+	return updated, nil
 }
 
 // CompareAndTransitionToProcessing atomically moves a file from Pending to
@@ -1104,10 +1240,13 @@ func sqliteProcessingUpdateArgs(metadata *core.FileMetadata, lease core.FileProc
 // GetTimedOutProcessingFiles returns the Processing records whose lease started
 // strictly before now-timeout.
 //
-// The result is only a candidate set: the reclaim action must still pass the
-// lease check of CompareAndUpdateProcessing, because the identity of a claim is
-// its processing start time rather than its status.
-func (r *SQLiteMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration) ([]*core.FileMetadata, error) {
+// limit > 0 bounds the candidate set at the database, so a reclaim pass that
+// examines only a window never materializes the whole timed-out set; limit <= 0
+// returns every match, which is the caller's choice when it intends to drain
+// the set completely. The result is only a candidate set: the reclaim action
+// must still pass the lease check of CompareAndUpdateProcessing, because the
+// identity of a claim is its processing start time rather than its status.
+func (r *SQLiteMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration, limit int) ([]*core.FileMetadata, error) {
 	if tenantID == "" {
 		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
 	}
@@ -1122,7 +1261,8 @@ func (r *SQLiteMetadataRepository) GetTimedOutProcessingFiles(ctx context.Contex
 	rows, err := handle.db.QueryContext(ctx, sqliteSelectTimedOutSQL,
 		sql.Named("tenant", tenantID),
 		sql.Named("processing", int(core.FileStatusProcessing)),
-		sql.Named("cutoff", cutoff))
+		sql.Named("cutoff", cutoff),
+		sql.Named("limit", sqliteLimit(limit)))
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -1148,7 +1288,8 @@ WHERE tenant_id = @tenant
   AND status = @processing
   AND processing_start_time IS NOT NULL
   AND processing_start_time < @cutoff
-ORDER BY processing_start_time ASC, file_key ASC`
+ORDER BY processing_start_time ASC, file_key ASC
+LIMIT @limit`
 
 // Optimize compacts the tenants that currently have an open handle: it truncates
 // the write-ahead log and then VACUUMs the database in place.
@@ -1373,7 +1514,7 @@ func (r *SQLiteMetadataRepository) begin(ctx context.Context, tenantID string) (
 
 		r.mu.Lock()
 		delete(r.openings, tenantID)
-		handle := &sqliteTenantDatabase{tenantID: tenantID, path: path, db: db}
+		handle := &sqliteTenantDatabase{tenantID: tenantID, path: path, db: db, checkpointAfterBatch: r.sqlite.CheckpointAfterBatch, logging: r.logging}
 		switch {
 		case err != nil:
 			pending.err = err
@@ -1533,10 +1674,18 @@ func (r *SQLiteMetadataRepository) openTenantDatabase(ctx context.Context, tenan
 // openDatabaseWithRecovery opens path, quarantining it and recreating an empty
 // database when the failure is a positive corruption verdict and recovery is
 // enabled. A lock, permission, or path failure is never treated as corruption.
+//
+// The first corruption verdict is never acted on directly: SQLITE_IOERR also
+// covers transient I/O failures (an antivirus or backup tool briefly holding the
+// file, a failing network share), and quarantining is destructive. The verdict
+// is therefore confirmed by one plain re-open, and only a verdict that
+// reproduces reaches the quarantine.
 func (r *SQLiteMetadataRepository) openDatabaseWithRecovery(ctx context.Context, path string) (*sql.DB, error) {
 	var lastErr error
+	verified := false
+	quarantines := 0
 
-	for attempt := 0; attempt < corruptedDatabaseRecoveryAttempts; attempt++ {
+	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -1553,6 +1702,14 @@ func (r *SQLiteMetadataRepository) openDatabaseWithRecovery(ctx context.Context,
 		if !r.corruptRecovery {
 			return nil, err
 		}
+		if !verified {
+			verified = true
+			continue
+		}
+		if quarantines >= corruptedDatabaseRecoveryAttempts {
+			break
+		}
+		quarantines++
 
 		quarantinePath, quarantineErr := quarantineDatabaseFile(path, r.now())
 		if quarantineErr != nil {
@@ -1581,14 +1738,17 @@ func (r *SQLiteMetadataRepository) openDatabaseWithRecovery(ctx context.Context,
 }
 
 // openTenantDatabaseOnce opens one connection through the shared SQLite
-// foundation, re-asserts the pragmas, verifies the file with integrity_check(1),
-// and creates the schema.
+// foundation, re-asserts the pragmas, verifies the file with integrity_check(1)
+// when corruption recovery is enabled, and creates the schema.
 //
 // The integrity check is the second half of the corruption verdict: a file can
 // be structurally readable and still hold a malformed b-tree, and that state is
-// exactly what the quarantine and automatic-restore paths are for.
+// exactly what the quarantine and automatic-restore paths are for. It reads
+// every page of the database, so it runs only when RecoverCorruptedDatabase
+// makes a caller act on its verdict; a whole-database scan on every lazy open
+// would otherwise sit on the hot path of the first touch of each tenant.
 func (r *SQLiteMetadataRepository) openTenantDatabaseOnce(ctx context.Context, path string) (*sql.DB, error) {
-	db, err := sqlite.Open(path, r.sqlite)
+	db, err := sqlite.Open(ctx, path, r.sqlite)
 	if err != nil {
 		return nil, err
 	}
@@ -1598,9 +1758,11 @@ func (r *SQLiteMetadataRepository) openTenantDatabaseOnce(ctx context.Context, p
 		return nil, fmt.Errorf("failed to configure the metadata database: %w: %w", err, core.ErrDatabaseError)
 	}
 
-	if err := sqlite.IntegrityCheck(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, err
+	if r.corruptRecovery {
+		if err := sqlite.IntegrityCheck(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 
 	if err := r.applySchema(ctx, db); err != nil {
@@ -1769,6 +1931,12 @@ func tableColumns(ctx context.Context, db *sql.DB, table string) (map[string]boo
 // The DSN's _txlock=immediate makes BeginTx issue BEGIN IMMEDIATE, so the write
 // lock is taken when the transaction starts instead of failing on a mid-way lock
 // upgrade. The rollback is deferred and the commit stays explicit.
+//
+// When the handle was configured with CheckpointAfterBatch, a successful commit
+// is followed by PRAGMA wal_checkpoint(PASSIVE) on the same connection. The
+// checkpoint runs after the commit and outside the transaction, which is what
+// the single-connection policy guarantees here; a checkpoint failure is a
+// warning, not a failed write, because the batch itself is already durable.
 func (h *sqliteTenantDatabase) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1781,6 +1949,11 @@ func (h *sqliteTenantDatabase) inTx(ctx context.Context, fn func(*sql.Tx) error)
 	}
 	if err := tx.Commit(); err != nil {
 		return classifySQLiteError(ctx, err)
+	}
+	if h.checkpointAfterBatch {
+		if err := sqlite.Checkpoint(ctx, h.db); err != nil {
+			warnRepositoryEvent(h.logging, "metadata_checkpoint_failed", "wal_checkpoint_failed")
+		}
 	}
 	return nil
 }

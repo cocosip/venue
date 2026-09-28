@@ -25,6 +25,14 @@ func NewPathSanitizer(rootPath string) *PathSanitizer {
 
 // SanitizeAndJoin sanitizes a relative path and joins it with the root path.
 // Returns an error if the resulting path would escape the root directory.
+//
+// The containment check is lexical (Clean plus a Rel-based root check); it does
+// not resolve symlinks. Venue itself never creates symlinks, so an attacker
+// would need pre-existing write access to the volume's local filesystem to plant
+// one — at which point the storage is already compromised independently of this
+// check. That trusted-local-filesystem model is deliberate: resolving every
+// path would put extra syscalls on the hot write path for protection that a
+// local attacker with volume write access does not need to bypass.
 func (s *PathSanitizer) SanitizeAndJoin(relativePath string) (string, error) {
 	if relativePath == "" {
 		return "", fmt.Errorf("relative path cannot be empty: %w", core.ErrInvalidArgument)
@@ -179,6 +187,49 @@ func ExtractExtension(filename string) string {
 
 	ext := filepath.Ext(filename)
 	return ext
+}
+
+// maxExtensionLength caps the length of an extension that may become part of a
+// physical file name. Real-world extensions are a handful of characters; the
+// cap is generous enough for compound forms such as .tar.gz while keeping a
+// caller-supplied name from turning into an unusable physical segment.
+const maxExtensionLength = 64
+
+// SanitizeExtension validates an extension extracted from a caller-supplied
+// file name before it becomes part of a physical path or is persisted as
+// metadata.
+//
+// It cannot traverse (filepath.Ext never keeps a separator), but a raw
+// extension can still carry control characters, trailing dots or spaces (which
+// vanish from the name on Windows and would leave the physical file
+// unaddressable), or an absurd length. Separators, NUL bytes, control
+// characters and extensions beyond the length cap are rejected with a wrapped
+// core.ErrInvalidArgument; trailing dots and spaces are trimmed, and a
+// remainder that is only a dot carries no extension and yields "".
+func SanitizeExtension(ext string) (string, error) {
+	if ext == "" {
+		return "", nil
+	}
+	if strings.ContainsAny(ext, "/\\") {
+		return "", fmt.Errorf("file extension must not contain path separators: %q: %w", ext, core.ErrInvalidArgument)
+	}
+	if strings.Contains(ext, "\x00") {
+		return "", fmt.Errorf("file extension contains null byte: %w", core.ErrInvalidArgument)
+	}
+	for _, r := range ext {
+		if r < 32 {
+			return "", fmt.Errorf("file extension contains control character: %q: %w", ext, core.ErrInvalidArgument)
+		}
+	}
+	if len(ext) > maxExtensionLength {
+		return "", fmt.Errorf("file extension exceeds %d characters: %w", maxExtensionLength, core.ErrInvalidArgument)
+	}
+
+	trimmed := strings.TrimRight(ext, ". ")
+	if trimmed == "" || trimmed == "." {
+		return "", nil
+	}
+	return trimmed, nil
 }
 
 // BuildShardedPath builds a sharded path from a file key.

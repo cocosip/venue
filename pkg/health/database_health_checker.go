@@ -136,7 +136,11 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 
 	tenantIDs, err := GetTenantIDsFromMetadata(c.metadataDataPath)
 	if err != nil {
+		// Enumeration failure must not read as health: an unreadable metadata
+		// root means zero databases were inspected, and reporting AllHealthy
+		// would hide every potentially corrupted database behind a green flag.
 		c.emit(ctx, slog.LevelWarn, "metadata_tenant_enumeration_failed", "Error enumerating tenants from the metadata root", errorTypeAttr(err))
+		report.AllHealthy = false
 	}
 
 	metadataDatabases := tenantDatabasePaths(c.metadataDataPath, metadataDatabaseFileName, tenantIDs)
@@ -415,11 +419,18 @@ func (c *databaseHealthChecker) DetectOrphanedFiles(ctx context.Context) ([]stri
 			}
 
 			tenantID := entry.Name()
+			// Only a name that is a valid tenant identifier can belong to a
+			// tenant directory. This keeps system directories (the dot-prefixed
+			// dead-letter root among them) and stray names out of the orphan
+			// report instead of reporting them as orphaned tenants forever.
+			if err := core.ValidateTenantID(tenantID); err != nil {
+				continue
+			}
 			if existingTenants[tenantID] {
 				continue
 			}
 
-			if hasFiles(filepath.Join(volumePath, tenantID)) {
+			if hasFiles(ctx, filepath.Join(volumePath, tenantID)) {
 				orphanedTenants = append(orphanedTenants, tenantID)
 			}
 		}
@@ -438,11 +449,15 @@ func errorTypeAttr(err error) slog.Attr {
 	return slog.String("error_type", fmt.Sprintf("%T", err))
 }
 
-// hasFiles checks if a directory has any files (recursively).
-func hasFiles(dirPath string) bool {
+// hasFiles checks if a directory has any files (recursively). The walk honours
+// ctx so a shutdown does not wait out the traversal of a large volume tree.
+func hasFiles(ctx context.Context, dirPath string) bool {
 	hasAnyFile := false
 
 	_ = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return nil
 		}

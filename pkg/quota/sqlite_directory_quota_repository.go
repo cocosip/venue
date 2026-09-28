@@ -237,9 +237,20 @@ type sqliteDirectoryQuotaRepository struct {
 	mu        sync.RWMutex
 	closed    bool
 	databases map[string]*sqliteQuotaTenantDatabase
+	// openings tracks the first opens that are in flight. The repository lock
+	// is released while the open itself runs, so one tenant's cold open
+	// (MkdirAll, quarantine prune, pragma setup, DDL) no longer blocks every
+	// other tenant's quota operations.
+	openings map[string]*quotaTenantOpening
 
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// quotaTenantOpening is one in-flight first open of a tenant quota database.
+type quotaTenantOpening struct {
+	done chan struct{}
+	err  error
 }
 
 // sqliteQuotaTenantDatabase is one tenant's database handle and the bookkeeping
@@ -327,6 +338,7 @@ func NewSQLiteDirectoryQuotaRepository(opts *SQLiteDirectoryQuotaRepositoryOptio
 		onCorruptedDatabase: opts.OnCorruptedDatabase,
 		now:                 now,
 		databases:           make(map[string]*sqliteQuotaTenantDatabase),
+		openings:            make(map[string]*quotaTenantOpening),
 	}, nil
 }
 
@@ -626,10 +638,11 @@ func (r *sqliteDirectoryQuotaRepository) closeHandle(handle *sqliteQuotaTenantDa
 
 // acquire resolves one tenant's handle and registers one reference on it.
 //
-// The handle table is held across a first open, so every handle in the table
-// always has a usable connection and two concurrent first accesses to the same
-// tenant cannot each open the database. Tenant opens are rare (once per tenant
-// until a handle is evicted), which is what makes that serialization cheap.
+// The open itself runs outside the repository lock: a first open does MkdirAll,
+// a quarantine prune, pragma setup and schema DDL, and holding the table lock
+// across that I/O would serialize every tenant's quota work behind one cold
+// open. A per-tenant opening reservation keeps two concurrent first accesses
+// from each opening the database, mirroring the metadata repository's pattern.
 //
 // The handle bound and the idle timeout are applied on every acquisition. A
 // handle that is in use is never reclaimed, so the bound applies to idle handles
@@ -642,42 +655,70 @@ func (r *sqliteDirectoryQuotaRepository) acquire(ctx context.Context, tenantID s
 		return nil, fmt.Errorf("invalid tenant ID: %w", err)
 	}
 
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil, errSQLiteQuotaRepositoryClosed()
-	}
-	if handle, ok := r.databases[tenantID]; ok {
-		r.touchLocked(handle)
-		evicted := r.evictLocked(tenantID)
-		r.mu.Unlock()
-		r.closeEvicted(evicted)
-		return handle, nil
-	}
+	for {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, errSQLiteQuotaRepositoryClosed()
+		}
+		if handle, ok := r.databases[tenantID]; ok {
+			r.touchLocked(handle)
+			evicted := r.evictLocked(tenantID)
+			r.mu.Unlock()
+			r.closeEvicted(evicted)
+			return handle, nil
+		}
+		if pending, ok := r.openings[tenantID]; ok {
+			// Another caller is opening this tenant. Wait for it instead of
+			// publishing a second handle or observing a half-built one.
+			r.mu.Unlock()
+			select {
+			case <-pending.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			if pending.err != nil {
+				return nil, pending.err
+			}
+			continue
+		}
 
-	db, path, quarantined, err := r.openTenantDatabase(ctx, tenantID)
-	if err != nil {
+		// Reserve the open before releasing the lock.
+		pending := &quotaTenantOpening{done: make(chan struct{})}
+		r.openings[tenantID] = pending
 		r.mu.Unlock()
-		r.notifyQuarantined(quarantined)
-		return nil, err
-	}
-	if r.closed {
-		r.mu.Unlock()
-		r.notifyQuarantined(quarantined)
-		_ = db.Close()
-		return nil, errSQLiteQuotaRepositoryClosed()
-	}
 
-	handle := &sqliteQuotaTenantDatabase{tenantID: tenantID, path: path, db: db}
-	r.touchLocked(handle)
-	r.databases[tenantID] = handle
-	// The bound is applied after the handle joined the table, so the acquisition
-	// that created the excess is the one that reclaims it.
-	evicted := r.evictLocked(tenantID)
-	r.mu.Unlock()
-	r.closeEvicted(evicted)
-	r.notifyQuarantined(quarantined)
-	return handle, nil
+		db, path, quarantined, err := r.openTenantDatabase(ctx, tenantID)
+
+		r.mu.Lock()
+		delete(r.openings, tenantID)
+		switch {
+		case err != nil:
+			pending.err = err
+		case r.closed:
+			pending.err = errSQLiteQuotaRepositoryClosed()
+		default:
+			handle := &sqliteQuotaTenantDatabase{tenantID: tenantID, path: path, db: db}
+			r.touchLocked(handle)
+			r.databases[tenantID] = handle
+			// The bound is applied after the handle joined the table, so the
+			// acquisition that created the excess is the one that reclaims it.
+			evicted := r.evictLocked(tenantID)
+			r.mu.Unlock()
+			r.closeEvicted(evicted)
+			r.notifyQuarantined(quarantined)
+			close(pending.done)
+			return handle, nil
+		}
+		r.mu.Unlock()
+
+		if db != nil {
+			_ = db.Close()
+		}
+		r.notifyQuarantined(quarantined)
+		close(pending.done)
+		return nil, pending.err
+	}
 }
 
 // notifyQuarantined reports every quarantine of one open to the caller's hook.
@@ -906,7 +947,7 @@ func (r *sqliteDirectoryQuotaRepository) openDatabaseWithRecovery(ctx context.Co
 // structurally readable and still hold a malformed b-tree, and that state is
 // exactly what the quarantine path is for.
 func (r *sqliteDirectoryQuotaRepository) openTenantDatabaseOnce(ctx context.Context, path string) (*sql.DB, error) {
-	db, err := sqlite.Open(path, r.sqlite)
+	db, err := sqlite.Open(ctx, path, r.sqlite)
 	if err != nil {
 		return nil, err
 	}

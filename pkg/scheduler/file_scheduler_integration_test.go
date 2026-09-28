@@ -38,7 +38,7 @@ func TestIntegration_FileLifecycle(t *testing.T) {
 		}
 
 		// 3. Mark as completed
-		err = scheduler.MarkAsCompleted(ctx, requireProcessingLease(t, location))
+		_, err = scheduler.MarkAsCompleted(ctx, requireProcessingLease(t, location))
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -187,7 +187,7 @@ func TestIntegration_ConcurrentProcessing(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 
 				// Mark as completed
-				_ = scheduler.MarkAsCompleted(ctx, requireProcessingLease(t, location))
+				_, _ = scheduler.MarkAsCompleted(ctx, requireProcessingLease(t, location))
 			}
 		}(workerID)
 	}

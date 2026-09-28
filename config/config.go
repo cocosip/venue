@@ -568,6 +568,15 @@ type OrphanRecoveryConfig struct {
 
 	// InitialDelay delays the first scan so storage volumes can finish mounting.
 	InitialDelay time.Duration `json:"initialDelay" yaml:"initialDelay" mapstructure:"initialDelay"`
+
+	// MinimumFileAge skips files modified more recently than this window.
+	//
+	// The storage pool writes the physical file before it persists the metadata,
+	// so a fully written file whose metadata commit is still in flight looks
+	// exactly like an orphan. The size/mtime stability check alone cannot
+	// distinguish that window from a real orphan; the age floor can. A zero
+	// value selects the default; a negative value disables the guard.
+	MinimumFileAge time.Duration `json:"minimumFileAge" yaml:"minimumFileAge" mapstructure:"minimumFileAge"`
 }
 
 // New returns a Config initialized with Venue defaults.
@@ -691,6 +700,7 @@ func DefaultConfig() *Config {
 			RunOnStartup:     false,
 			RecoveryInterval: 6 * time.Hour,
 			InitialDelay:     10 * time.Second,
+			MinimumFileAge:   time.Minute,
 		},
 		Statistics: StatisticsConfig{
 			// Statistics stay off unless a caller opts in.
@@ -723,9 +733,11 @@ func (c *Config) ApplyDefaults() {
 		return
 	}
 	d := DefaultConfig()
-	if c.SourceCleanup == (SourceCleanupConfig{}) {
-		c.SourceCleanup = d.SourceCleanup
-	} else {
+	// Every SourceCleanup field defaults individually. The whole-struct
+	// equality is the wrong tool here: Enabled == false is also the zero
+	// value, so treating the zero struct as "unset" silently re-enabled an
+	// explicitly disabled source cleanup.
+	{
 		if c.SourceCleanup.DatabasePath == "" && c.SourceCleanup.Enabled {
 			c.SourceCleanup.DatabasePath = d.SourceCleanup.DatabasePath
 		}
@@ -876,6 +888,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.OrphanRecovery.InitialDelay == 0 {
 		c.OrphanRecovery.InitialDelay = d.OrphanRecovery.InitialDelay
+	}
+	if c.OrphanRecovery.MinimumFileAge == 0 {
+		c.OrphanRecovery.MinimumFileAge = d.OrphanRecovery.MinimumFileAge
 	}
 	if c.FileWatcherService.DefaultPollingInterval == 0 {
 		c.FileWatcherService.DefaultPollingInterval = d.FileWatcherService.DefaultPollingInterval
@@ -1373,6 +1388,9 @@ func validateOrphanRecovery(recovery *OrphanRecoveryConfig) error {
 	if recovery.InitialDelay < 0 {
 		return fmt.Errorf("OrphanRecovery.InitialDelay cannot be negative")
 	}
+	// MinimumFileAge deliberately accepts negative values: a negative value is
+	// the explicit "no age guard" choice, while zero means "use the default
+	// floor" and is filled by ApplyDefaults.
 	return nil
 }
 
@@ -1432,7 +1450,12 @@ func validateFileWatcherService(service *FileWatcherServiceConfig) error {
 }
 
 func validateSourceCleanup(cleanup *SourceCleanupConfig) error {
-	if cleanup.Enabled && strings.TrimSpace(cleanup.DatabasePath) == "" {
+	if !cleanup.Enabled {
+		// A disabled component never runs, so its tuning knobs carry no
+		// constraint: zero values are legal, ApplyDefaults keeps them zero.
+		return nil
+	}
+	if strings.TrimSpace(cleanup.DatabasePath) == "" {
 		return fmt.Errorf("SourceCleanup.DatabasePath is required when enabled")
 	}
 	if cleanup.PollingInterval <= 0 {
@@ -1547,6 +1570,7 @@ func (c *Config) Clone() *Config {
 	}
 	clone := *c
 	clone.Volumes = append([]VolumeConfig(nil), c.Volumes...)
+	clone.Cleanup.RetiredVolumes = append([]RetiredVolumeConfig(nil), c.Cleanup.RetiredVolumes...)
 	clone.Tenants = make([]TenantConfig, len(c.Tenants))
 	for i, tenant := range c.Tenants {
 		clone.Tenants[i] = tenant

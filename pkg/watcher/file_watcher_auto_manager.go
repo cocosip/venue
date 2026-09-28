@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -468,8 +469,8 @@ func (m *fileWatcherAutoManager) dropRemovedRoots(removed map[string]bool) {
 }
 
 // anyGeneratedWatcherRemoved reports whether any removed watcher ID belongs to
-// the given root. Generated IDs are "auto-<root base name>-<tenant>", so a
-// prefix match on the root segment identifies the root without needing the
+// the given root. Generated IDs are "auto-<root base name>-<path hash>-<tenant>",
+// so a prefix match on the root segment identifies the root without needing the
 // tenant list that may since have changed on disk.
 func anyGeneratedWatcherRemoved(rootPath string, removed map[string]bool) bool {
 	prefix := generatedWatcherIDPrefix + rootIDBaseName(rootPath) + "-"
@@ -578,8 +579,23 @@ func loadRootConfigurations(configRootDir string) []core.FileWatcherRootConfigur
 
 // generatedWatcherID returns the deterministic ID of the watcher generated for
 // one tenant directory of a root.
+//
+// The ID carries a hash of the cleaned root path between the readable base name
+// and the tenant: two roots whose paths share the same base directory name
+// (C:\incoming and D:\incoming) must never collide, or the second root
+// would silently repoint the first root's watcher.
 func generatedWatcherID(rootPath string, tenantID string) string {
-	return generatedWatcherIDPrefix + rootIDBaseName(rootPath) + "-" + tenantID
+	return generatedWatcherIDPrefix + rootIDBaseName(rootPath) + "-" + rootPathHashSegment(rootPath) + "-" + tenantID
+}
+
+// rootPathHashSegment renders the first eight hex digits of the FNV-1a hash of
+// the cleaned root path. It is deterministic, so a root keeps its watcher IDs
+// across restarts, and it keeps the ID readable while making cross-drive or
+// cross-tree base-name collisions practically impossible.
+func rootPathHashSegment(rootPath string) string {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(filepath.Clean(rootPath)))
+	return fmt.Sprintf("%08x", hasher.Sum64())
 }
 
 // rootIDBaseName returns the root path segment used in a generated watcher ID.

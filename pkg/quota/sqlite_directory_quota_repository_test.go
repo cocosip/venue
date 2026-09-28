@@ -580,7 +580,7 @@ func TestSQLiteDirectoryQuotaRepositorySchemaMatchesDesign(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	db, err := sqlite.Open(sqliteQuotaDatabasePath(dataPath, sqliteQuotaTenant), sqlite.DefaultOptions())
+	db, err := sqlite.Open(context.Background(), sqliteQuotaDatabasePath(dataPath, sqliteQuotaTenant), sqlite.DefaultOptions())
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}
@@ -668,7 +668,7 @@ func TestSQLiteDirectoryQuotaRepositoryOperatorInsertedRowStaysDisabled(t *testi
 	}
 
 	path := sqliteQuotaDatabasePath(dataPath, sqliteQuotaTenant)
-	db, err := sqlite.Open(path, sqlite.DefaultOptions())
+	db, err := sqlite.Open(context.Background(), path, sqlite.DefaultOptions())
 	if err != nil {
 		t.Fatalf("sqlite.Open(%s) error = %v", path, err)
 	}

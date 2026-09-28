@@ -94,12 +94,15 @@ var synchronousModes = map[string]bool{
 // result code. "malformed", "not a database" and "corrupt" are the canonical
 // SQLite messages and are never produced by a lock, a constraint violation, or
 // a permission failure.
+//
+// The patterns stay long on purpose: a short fragment such as "error code 11"
+// would also match unrelated verdicts like "...error code 110", and a false
+// positive here can send a healthy database into quarantine.
 var corruptionTextPatterns = []string{
 	"database disk image is malformed",
 	"file is not a database",
 	"database corrupt",
 	"btreeinitpage() returns error code",
-	"error code 11",
 	"sqlite_corrupt",
 }
 
@@ -244,6 +247,10 @@ func isWindowsDrivePath(name string) bool {
 // Open opens (creating it if needed) the SQLite database at path with the
 // shared connection policy and verifies that the file can actually be used.
 //
+// ctx governs the verification ping: a caller whose context expires no longer
+// waits out a contended busy_timeout before observing the cancellation. Every
+// later statement on the returned handle takes its own context.
+//
 // The returned handle is pinned to exactly one connection
 // (SetMaxOpenConns(1), SetMaxIdleConns(1), no lifetime limit), matching Locus's
 // Pooling=False single long-lived connection per tenant. That policy is what
@@ -259,7 +266,7 @@ func isWindowsDrivePath(name string) bool {
 // that fact in the message and, through the wrapped chain, satisfies
 // [IsCorruptionError], so the caller can tell "damaged" from "locked" before
 // deciding whether to quarantine.
-func Open(path string, opts Options) (*sql.DB, error) {
+func Open(ctx context.Context, path string, opts Options) (*sql.DB, error) {
 	dsn, err := opts.DSN(path)
 	if err != nil {
 		return nil, err
@@ -276,7 +283,7 @@ func Open(path string, opts Options) (*sql.DB, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	if err := db.PingContext(context.Background()); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		// Best effort: the handle is unusable, and the caller receives the
 		// original open failure rather than a close failure.
 		_ = db.Close()

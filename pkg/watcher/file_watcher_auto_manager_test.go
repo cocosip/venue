@@ -117,7 +117,7 @@ func TestFileWatcherAutoManager_ApplyMultiTenantRootCreatesOneWatcherPerDirector
 
 	wantIDs := make([]string, 0, len(tenants))
 	for _, tenant := range tenants {
-		wantIDs = append(wantIDs, "auto-"+filepath.Base(rootPath)+"-"+tenant)
+		wantIDs = append(wantIDs, generatedWatcherID(rootPath, tenant))
 	}
 
 	all, err := watcher.GetAllWatchers(context.Background())
@@ -142,7 +142,7 @@ func TestFileWatcherAutoManager_ApplyMultiTenantRootCreatesOneWatcherPerDirector
 	}
 
 	for _, tenant := range tenants {
-		watcherID := "auto-" + filepath.Base(rootPath) + "-" + tenant
+		watcherID := generatedWatcherID(rootPath, tenant)
 
 		config, err := watcher.GetWatcher(context.Background(), watcherID)
 		if err != nil {
@@ -199,7 +199,7 @@ func TestFileWatcherAutoManager_PropagatesAdvancedKnobs(t *testing.T) {
 		t.Fatalf("ApplyRootConfiguration() error = %v", err)
 	}
 
-	config, err := watcher.GetWatcher(context.Background(), "auto-"+filepath.Base(rootPath)+"-tenant-a")
+	config, err := watcher.GetWatcher(context.Background(), generatedWatcherID(rootPath, "tenant-a"))
 	if err != nil {
 		t.Fatalf("GetWatcher() error = %v", err)
 	}
@@ -285,7 +285,7 @@ func TestFileWatcherAutoManager_ReapplyDoesNotResetOperatorDisable(t *testing.T)
 		t.Fatalf("ApplyRootConfiguration() error = %v", err)
 	}
 
-	watcherID := "auto-" + filepath.Base(rootPath) + "-tenant-a"
+	watcherID := generatedWatcherID(rootPath, "tenant-a")
 
 	if err := watcher.DisableWatcher(context.Background(), watcherID); err != nil {
 		t.Fatalf("DisableWatcher() error = %v", err)
@@ -336,7 +336,7 @@ func TestFileWatcherAutoManager_ApplyPicksUpNewTenantDirectory(t *testing.T) {
 		t.Fatalf("ApplyRootConfiguration() #2 = %d, want 2", created)
 	}
 
-	if _, err := watcher.GetWatcher(context.Background(), "auto-"+filepath.Base(rootPath)+"-tenant-b"); err != nil {
+	if _, err := watcher.GetWatcher(context.Background(), generatedWatcherID(rootPath, "tenant-b")); err != nil {
 		t.Fatalf("GetWatcher(tenant-b) error = %v, want the new tenant watcher", err)
 	}
 }
@@ -409,7 +409,7 @@ func TestFileWatcherAutoManager_DiscoverAndCreateWatchersReappliesHeldRoots(t *t
 		t.Fatalf("DiscoverAndCreateWatchers() #2 = %d, want 3", created)
 	}
 
-	if _, err := watcher.GetWatcher(context.Background(), "auto-"+filepath.Base(rootPath)+"-tenant-c"); err != nil {
+	if _, err := watcher.GetWatcher(context.Background(), generatedWatcherID(rootPath, "tenant-c")); err != nil {
 		t.Fatalf("GetWatcher(tenant-c) error = %v", err)
 	}
 }
@@ -486,7 +486,7 @@ func TestFileWatcherAutoManager_DiscoverAndCreateWatchersReturnsPersistedRootsAf
 		t.Fatalf("DiscoverAndCreateWatchers() after restart = %d, want 2", created)
 	}
 
-	if _, err := secondWatcher.GetWatcher(context.Background(), "auto-"+filepath.Base(rootPath)+"-tenant-a"); err != nil {
+	if _, err := secondWatcher.GetWatcher(context.Background(), generatedWatcherID(rootPath, "tenant-a")); err != nil {
 		t.Fatalf("GetWatcher(tenant-a) error = %v, want the persisted root to re-create watchers", err)
 	}
 }
@@ -547,7 +547,7 @@ func TestFileWatcherAutoManager_RemoveAllWatchersLeavesManualWatchers(t *testing
 		t.Fatalf("RemoveAllWatchers() error = %v", err)
 	}
 
-	autoID := "auto-" + filepath.Base(rootPath) + "-tenant-a"
+	autoID := generatedWatcherID(rootPath, "tenant-a")
 	if _, err := watcher.GetWatcher(context.Background(), autoID); !errors.Is(err, core.ErrWatcherNotFound) {
 		t.Fatalf("GetWatcher(%q) error = %v, want core.ErrWatcherNotFound after RemoveAllWatchers", autoID, err)
 	}

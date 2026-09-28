@@ -238,7 +238,7 @@ func TestMarkAsCompleted(t *testing.T) {
 		_ = repo.AddOrUpdate(ctx, file)
 
 		// Mark as completed
-		err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
+		_, err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
 			TenantID:               "test-tenant",
 			FileKey:                "file1",
 			ProcessingStartTimeUTC: leaseStart,
@@ -261,14 +261,14 @@ func TestMarkAsCompleted(t *testing.T) {
 	})
 
 	t.Run("Empty file key", func(t *testing.T) {
-		err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{TenantID: "test-tenant"})
+		_, err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{TenantID: "test-tenant"})
 		if err == nil {
 			t.Fatal("Expected error for empty file key")
 		}
 	})
 
 	t.Run("Non-existent file", func(t *testing.T) {
-		err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
+		_, err := scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
 			TenantID:               "test-tenant",
 			FileKey:                "non-existent",
 			ProcessingStartTimeUTC: time.Now().UTC(),
@@ -300,7 +300,7 @@ func TestMarkAsCompletedRejectsStaleLeaseBeforeDeletingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new scheduler: %v", err)
 	}
-	err = scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
+	_, err = scheduler.MarkAsCompleted(ctx, core.FileProcessingLease{
 		TenantID:               "test-tenant",
 		FileKey:                file.FileKey,
 		ProcessingStartTimeUTC: activeStart.Add(-time.Minute),
@@ -707,8 +707,9 @@ func (r *replacementLeaseRepository) GetTimedOutProcessingFiles(
 	ctx context.Context,
 	tenantID string,
 	timeout time.Duration,
+	limit int,
 ) ([]*core.FileMetadata, error) {
-	timedOut, err := r.MetadataRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout)
+	timedOut, err := r.MetadataRepository.GetTimedOutProcessingFiles(ctx, tenantID, timeout, limit)
 	if err != nil || len(timedOut) == 0 {
 		return timedOut, err
 	}

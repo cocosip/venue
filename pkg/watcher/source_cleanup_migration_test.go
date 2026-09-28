@@ -29,7 +29,7 @@ func TestNewFileWatcherMigratesLegacyPendingSourceCleanup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, importedFilesHistoryFileName), historyBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	store, err := OpenSourceCleanupStore(filepath.Join(root, "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	store, err := OpenSourceCleanupStore(context.Background(), filepath.Join(root, "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

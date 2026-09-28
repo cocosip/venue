@@ -182,8 +182,17 @@ func (v *LocalFileSystemVolume) ShardingDepth() int {
 // The probe (mount-path stat plus a small write/delete round trip) is cached
 // for HealthCheckCacheTTL, and a negative TTL disables the cache. Failed probes
 // are cached for the same window. Concurrent callers share a single probe.
+//
+// A cancelled or expired context never poisons the cache: a context failure
+// says nothing about the volume, and caching it would make one cancelled
+// request reject every write for the whole TTL. The verdict is returned
+// uncached, so the next caller with a live context probes for real.
 func (v *LocalFileSystemVolume) IsHealthy(ctx context.Context) bool {
 	if v.healthCacheTTL < 0 {
+		return v.probeHealth(ctx)
+	}
+
+	if contextFailure(ctx) != nil {
 		return v.probeHealth(ctx)
 	}
 

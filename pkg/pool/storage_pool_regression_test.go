@@ -303,6 +303,25 @@ func (r *fakeMetadataRepo) addCount() int {
 	return r.addCalls
 }
 
+// UpdatePhysicalPath is the core.PhysicalPathUpdater capability. The guarded
+// update is the only way the pool may correct a drifted path, so the fake
+// mirrors the repository contract: only physical_path and updated_at move, and
+// a stale expectation updates nothing.
+func (r *fakeMetadataRepo) UpdatePhysicalPath(_ context.Context, tenantID string, fileKey string, expectedPhysicalPath string, newPhysicalPath string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	metadata, ok := r.files[fakeMetadataKey(tenantID, fileKey)]
+	if !ok || metadata.PhysicalPath != expectedPhysicalPath {
+		return false, nil
+	}
+	updated := *metadata
+	updated.PhysicalPath = newPhysicalPath
+	updated.UpdatedAt = time.Now()
+	r.files[fakeMetadataKey(tenantID, fileKey)] = &updated
+	return true, nil
+}
+
 func (r *fakeMetadataRepo) fileCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -238,7 +238,7 @@ func newRegressionCleanupService(
 	t *testing.T,
 	tenantIDs []string,
 	customize func(opts *CleanupServiceOptions),
-) (core.CleanupService, core.MetadataRepository, map[string]core.StorageVolume) {
+) (*cleanupService, core.MetadataRepository, map[string]core.StorageVolume) {
 	t.Helper()
 
 	repo, repoDir := createTestRepository(t)
@@ -272,8 +272,22 @@ func newRegressionCleanupService(
 	if err != nil {
 		t.Fatalf("NewCleanupService() error = %v", err)
 	}
+	concrete, ok := service.(*cleanupService)
+	if !ok {
+		t.Fatalf("NewCleanupService() returned %T, want *cleanupService", service)
+	}
 
-	return service, repo, volumes
+	return concrete, repo, volumes
+}
+
+// replaceCleanupVolume swaps one volume in the service's own registry under the
+// same lock the sweep snapshots use. The service copies its input map at
+// construction, so post-construction injection must go through the service —
+// mutating the caller's map can no longer reach a running sweep.
+func replaceCleanupVolume(service *cleanupService, volume core.StorageVolume) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.volumes[volume.VolumeID()] = volume
 }
 
 // TestCleanupEmptyDirectories_HonoursContext verifies that a cancelled context
@@ -439,6 +453,12 @@ func TestCleanupOrphanedMetadata_SkipsOnUncertainty(t *testing.T) {
 
 			if tc.customize != nil {
 				_ = tc.customize(t, volumes)
+				// Push the injected volume into the service as well: the
+				// service owns a defensive copy of the map, so the table's
+				// map mutation alone cannot reach a sweep.
+				if injected, ok := volumes["test-volume"].(*injectingVolume); ok {
+					replaceCleanupVolume(service, injected)
+				}
 			}
 
 			file := tc.file(t, volumes["test-volume"])
@@ -591,7 +611,7 @@ func TestCleanupPermanentlyFailedFiles_DeleteFailureCompensates(t *testing.T) {
 
 	base := volumes["test-volume"]
 	injected := &injectingVolume{StorageVolume: base, deleteFileErr: errors.New("delete failed")}
-	volumes["test-volume"] = injected
+	replaceCleanupVolume(service, injected)
 
 	file := createTestFileMetadata("failed-delete-error", core.FileStatusPermanentlyFailed)
 	file.PhysicalPath = filepath.Join("tenant-001", "failed.txt")

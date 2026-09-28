@@ -22,9 +22,9 @@ func testDatabase(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "metadata.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := Open(context.Background(), path, DefaultOptions())
 	if err != nil {
-		t.Fatalf("Open(%q) = %v, want nil", path, err)
+		t.Fatalf("Open(context.Background(), %q) = %v, want nil", path, err)
 	}
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
@@ -58,9 +58,9 @@ func TestOpenCreatesConfiguredDatabase(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.BusyTimeoutMs = 750
-	db, err := Open(path, opts)
+	db, err := Open(context.Background(), path, opts)
 	if err != nil {
-		t.Fatalf("Open() = %v, want nil", err)
+		t.Fatalf("Open(context.Background(), ) = %v, want nil", err)
 	}
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
@@ -109,9 +109,9 @@ func TestOpenCreatesConfiguredDatabase(t *testing.T) {
 
 	// A second handle on the same file must work: one long-lived connection per
 	// handle is the policy, not a single-process limit.
-	second, err := Open(path, DefaultOptions())
+	second, err := Open(context.Background(), path, DefaultOptions())
 	if err != nil {
-		t.Fatalf("second Open() = %v, want nil", err)
+		t.Fatalf("second Open(context.Background(), ) = %v, want nil", err)
 	}
 	t.Cleanup(func() {
 		if err := second.Close(); err != nil {
@@ -134,16 +134,16 @@ func TestOpenDoesNotCreateParentDirectory(t *testing.T) {
 	t.Parallel()
 
 	missing := filepath.Join(t.TempDir(), "tenant-1", "metadata.db")
-	db, err := Open(missing, DefaultOptions())
+	db, err := Open(context.Background(), missing, DefaultOptions())
 	if db != nil {
 		_ = db.Close()
-		t.Fatal("Open() returned a handle for a missing parent directory")
+		t.Fatal("Open(context.Background(), ) returned a handle for a missing parent directory")
 	}
 	if err == nil {
-		t.Fatal("Open() = nil, want an error for a missing parent directory")
+		t.Fatal("Open(context.Background(), ) = nil, want an error for a missing parent directory")
 	}
 	if !errors.Is(err, core.ErrDatabaseError) {
-		t.Errorf("Open() = %v, want a wrapped core.ErrDatabaseError", err)
+		t.Errorf("Open(context.Background(), ) = %v, want a wrapped core.ErrDatabaseError", err)
 	}
 	if _, statErr := os.Stat(filepath.Dir(missing)); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("parent directory %q was created (stat error %v), want it to stay absent", filepath.Dir(missing), statErr)
@@ -174,16 +174,16 @@ func TestOpenRejectsUnusablePath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			db, err := Open(tc.path, DefaultOptions())
+			db, err := Open(context.Background(), tc.path, DefaultOptions())
 			if db != nil {
 				_ = db.Close()
-				t.Fatalf("Open(%q) returned a handle, want nil", tc.path)
+				t.Fatalf("Open(context.Background(), %q) returned a handle, want nil", tc.path)
 			}
 			if err == nil {
-				t.Fatalf("Open(%q) = nil, want an error", tc.path)
+				t.Fatalf("Open(context.Background(), %q) = nil, want an error", tc.path)
 			}
 			if !errors.Is(err, tc.target) {
-				t.Fatalf("Open(%q) = %v, want a wrapped %v", tc.path, err, tc.target)
+				t.Fatalf("Open(context.Background(), %q) = %v, want a wrapped %v", tc.path, err, tc.target)
 			}
 			if IsCorruptionError(err) {
 				t.Errorf("IsCorruptionError(%v) = true, want false: a path defect is not corruption", err)
@@ -204,22 +204,22 @@ func TestOpenClassifiesCorruptFile(t *testing.T) {
 		t.Fatalf("write garbage: %v", err)
 	}
 
-	db, err := Open(path, DefaultOptions())
+	db, err := Open(context.Background(), path, DefaultOptions())
 	if db != nil {
 		_ = db.Close()
-		t.Fatal("Open() returned a handle for a corrupt file, want nil")
+		t.Fatal("Open(context.Background(), ) returned a handle for a corrupt file, want nil")
 	}
 	if err == nil {
-		t.Fatal("Open() = nil, want an error for a corrupt file")
+		t.Fatal("Open(context.Background(), ) = nil, want an error for a corrupt file")
 	}
 	if !errors.Is(err, core.ErrDatabaseError) {
-		t.Errorf("Open() = %v, want a wrapped core.ErrDatabaseError", err)
+		t.Errorf("Open(context.Background(), ) = %v, want a wrapped core.ErrDatabaseError", err)
 	}
 	if !IsCorruptionError(err) {
 		t.Errorf("IsCorruptionError(%v) = false, want true", err)
 	}
 	if !strings.Contains(err.Error(), "corrupt") {
-		t.Errorf("Open() = %v, want the message to name corruption", err)
+		t.Errorf("Open(context.Background(), ) = %v, want the message to name corruption", err)
 	}
 }
 
@@ -230,9 +230,9 @@ func TestOpenReopensDatabaseFile(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "metadata.db")
 
-	first, err := Open(path, DefaultOptions())
+	first, err := Open(context.Background(), path, DefaultOptions())
 	if err != nil {
-		t.Fatalf("first Open() = %v, want nil", err)
+		t.Fatalf("first Open(context.Background(), ) = %v, want nil", err)
 	}
 	createTestTable(t, first)
 	if _, err := first.Exec("INSERT INTO files (file_key, tenant_id) VALUES ('k1', 't1')"); err != nil {
@@ -245,9 +245,9 @@ func TestOpenReopensDatabaseFile(t *testing.T) {
 		t.Fatalf("first.Close() = %v, want nil", err)
 	}
 
-	second, err := Open(path, DefaultOptions())
+	second, err := Open(context.Background(), path, DefaultOptions())
 	if err != nil {
-		t.Fatalf("second Open() = %v, want nil", err)
+		t.Fatalf("second Open(context.Background(), ) = %v, want nil", err)
 	}
 	t.Cleanup(func() {
 		if err := second.Close(); err != nil {
@@ -285,9 +285,9 @@ func TestIntegrityCheckDetectsDamagedDatabase(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "metadata.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := Open(context.Background(), path, DefaultOptions())
 	if err != nil {
-		t.Fatalf("Open() = %v, want nil", err)
+		t.Fatalf("Open(context.Background(), ) = %v, want nil", err)
 	}
 	if _, err := db.Exec("CREATE TABLE files (file_key TEXT PRIMARY KEY NOT NULL, pad BLOB)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -324,11 +324,11 @@ func TestIntegrityCheckDetectsDamagedDatabase(t *testing.T) {
 		t.Fatalf("write damaged database: %v", err)
 	}
 
-	damaged, err := Open(path, DefaultOptions())
+	damaged, err := Open(context.Background(), path, DefaultOptions())
 	if err != nil {
 		// Some damage is caught while connecting.
 		if !errors.Is(err, core.ErrDatabaseError) {
-			t.Fatalf("Open() = %v, want a wrapped core.ErrDatabaseError", err)
+			t.Fatalf("Open(context.Background(), ) = %v, want a wrapped core.ErrDatabaseError", err)
 		}
 		if !IsCorruptionError(err) {
 			t.Fatalf("IsCorruptionError(%v) = false, want true", err)
@@ -358,10 +358,10 @@ func TestIntegrityCheckDetectsDamagedDatabase(t *testing.T) {
 	if err := os.WriteFile(notADatabase, []byte("SQLite format 3\x00 but nothing else that makes sense"), 0o600); err != nil {
 		t.Fatalf("write not-a-database: %v", err)
 	}
-	other, err := Open(notADatabase, DefaultOptions())
+	other, err := Open(context.Background(), notADatabase, DefaultOptions())
 	if other != nil {
 		_ = other.Close()
-		t.Fatal("Open() returned a handle for a file that is not a database")
+		t.Fatal("Open(context.Background(), ) returned a handle for a file that is not a database")
 	}
 	if !IsCorruptionError(err) {
 		t.Errorf("IsCorruptionError(%v) = false, want true", err)
@@ -446,9 +446,9 @@ func TestVacuumIntoProducesConsistentCopy(t *testing.T) {
 		t.Fatalf("backup file was not created: %v", err)
 	}
 
-	copyDB, err := Open(target, DefaultOptions())
+	copyDB, err := Open(context.Background(), target, DefaultOptions())
 	if err != nil {
-		t.Fatalf("Open(backup) = %v, want nil", err)
+		t.Fatalf("Open(context.Background(), backup) = %v, want nil", err)
 	}
 	t.Cleanup(func() {
 		if err := copyDB.Close(); err != nil {
@@ -605,9 +605,9 @@ func TestVacuumIntoWhileReading(t *testing.T) {
 		t.Fatalf("VacuumInto() = %v, want nil", vacuumErr)
 	}
 
-	copyDB, err := Open(target, DefaultOptions())
+	copyDB, err := Open(context.Background(), target, DefaultOptions())
 	if err != nil {
-		t.Fatalf("Open(backup) = %v, want nil", err)
+		t.Fatalf("Open(context.Background(), backup) = %v, want nil", err)
 	}
 	t.Cleanup(func() {
 		if err := copyDB.Close(); err != nil {
@@ -671,9 +671,9 @@ func TestCheckpointAfterBatchIsCallerOwned(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.CheckpointAfterBatch = true
-	db, err := Open(path, opts)
+	db, err := Open(context.Background(), path, opts)
 	if err != nil {
-		t.Fatalf("Open() = %v, want nil", err)
+		t.Fatalf("Open(context.Background(), ) = %v, want nil", err)
 	}
 	createTestTable(t, db)
 

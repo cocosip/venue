@@ -54,7 +54,7 @@ func TestCleanupJunkFiles_RemovesOnlyJunkFilesAndKeepsManagedPayloads(t *testing
 
 	first := volumes["test-volume"]
 	second := newAdditionalTestVolume(t, "second-volume")
-	volumes[second.VolumeID()] = second
+	replaceCleanupVolume(service, second)
 
 	junkFiles := []string{
 		filepath.Join("tenant-001", "Thumbs.db"),

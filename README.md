@@ -601,7 +601,8 @@ cfg := config.New().
         config.NewOrphanRecoveryConfig().
             WithEnabled(true).
             WithRunOnStartup(true).
-            WithRecoveryInterval(6 * time.Hour),
+            WithRecoveryInterval(6 * time.Hour).
+            WithMinimumFileAge(time.Minute),
     )
 ```
 
@@ -612,6 +613,12 @@ venue:
     runOnStartup: true
     recoveryInterval: 6h
     initialDelay: 10s
+    # Age floor below which a file is not treated as an orphan yet. The storage
+    # pool writes the physical file before it persists the metadata, so a file
+    # whose metadata commit is still in flight looks exactly like an orphan;
+    # the floor is what keeps recovery from registering it. Zero selects the
+    # default (1m); a negative value disables the guard.
+    minimumFileAge: 1m
 ```
 
 When enabled, `Venue.Start` runs a periodic scan; `Venue.OrphanRecovery()

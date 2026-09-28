@@ -146,7 +146,7 @@ func (r *memoryMetadataRepository) CompareAndUpdateProcessing(
 	return nil, core.ErrProcessingLeaseMismatch
 }
 
-func (r *memoryMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration) ([]*core.FileMetadata, error) {
+func (r *memoryMetadataRepository) GetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration, limit int) ([]*core.FileMetadata, error) {
 	return nil, nil
 }
 

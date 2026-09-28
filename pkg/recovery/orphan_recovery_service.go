@@ -23,6 +23,16 @@ import (
 // backlog is drained gradually instead of in one unbounded pass.
 const defaultBatchSize = 1000
 
+// errorTypeName reduces an error to its Go type. Recovery report errors are
+// part of the public report surface, and filesystem errors carry full paths,
+// so the raw text must never be copied into the report.
+func errorTypeName(err error) string {
+	if err == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%T", err)
+}
+
 // Optional core capabilities implemented by this service. Callers type-assert
 // them, so an implementation drift must fail the build here rather than silently
 // degrade a caller to its fallback path.
@@ -104,6 +114,12 @@ type OrphanRecoveryService struct {
 	wg      sync.WaitGroup
 	mu      sync.RWMutex
 	running bool
+
+	// lifecycleMu serializes Start against the cancel-and-join sequence of
+	// Stop. Without it, a Start concurrent with Stop could add to the WaitGroup
+	// while Wait is in flight and overwrite the context the old loop watches,
+	// leaving an unstoppable second loop behind.
+	lifecycleMu sync.Mutex
 }
 
 // NewOrphanRecoveryService creates an orphan recovery service.
@@ -155,26 +171,40 @@ func NewOrphanRecoveryService(opts *OrphanRecoveryServiceOptions) (*OrphanRecove
 
 // Start starts the periodic recovery loop.
 func (s *OrphanRecoveryService) Start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
+	s.mu.Lock()
 	if s.running {
+		s.mu.Unlock()
 		return fmt.Errorf("orphan recovery service is already running")
 	}
-
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx = ctx
+	s.cancel = cancel
 	s.running = true
+	s.mu.Unlock()
 
 	s.wg.Add(1)
-	go s.run()
+	go func() {
+		defer s.wg.Done()
+		s.run(ctx)
+	}()
 
-	s.emit(s.ctx, slog.LevelInfo, "started", "Orphan recovery service started")
+	s.emit(ctx, slog.LevelInfo, "started", "Orphan recovery service started")
 	return nil
 }
 
-// Stop stops the recovery loop. Stop does not hold the service mutex while
-// waiting, so it cannot deadlock against a scan that needs the same lock.
+// Stop stops the recovery loop and joins it before returning.
+//
+// Stop does not hold the service mutex while waiting, so it cannot deadlock
+// against a scan that needs the same lock; the lifecycle mutex instead delays a
+// concurrent Start until the join has finished, which is what keeps the
+// WaitGroup and the context handoff race-free.
 func (s *OrphanRecoveryService) Stop() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
@@ -202,24 +232,18 @@ func (s *OrphanRecoveryService) IsRunning() bool {
 	return s.running
 }
 
-// run executes the recovery loop.
-func (s *OrphanRecoveryService) run() {
-	defer s.wg.Done()
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			s.emit(context.Background(), slog.LevelError, "panic", "Orphan recovery loop panicked",
-				slog.String("error_type", fmt.Sprintf("%T", recovered)))
-		}
-	}()
-
+// run executes the recovery loop. The context is captured by the caller and
+// never re-read from the service, so a Start/Stop/Start cycle cannot leave an
+// old loop watching a newer context.
+func (s *OrphanRecoveryService) run(ctx context.Context) {
 	ticker := time.NewTicker(s.recoveryInterval)
 	defer ticker.Stop()
 
 	if s.runOnStartup {
 		select {
 		case <-time.After(s.initialDelay):
-			s.recoverSafely()
-		case <-s.ctx.Done():
+			s.recoverSafely(ctx)
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -227,23 +251,36 @@ func (s *OrphanRecoveryService) run() {
 	for {
 		select {
 		case <-ticker.C:
-			s.recoverSafely()
-		case <-s.ctx.Done():
+			s.recoverSafely(ctx)
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// recoverSafely runs one scan without letting an error stop the loop.
-func (s *OrphanRecoveryService) recoverSafely() {
-	report, err := s.RecoverNow(s.ctx)
+// recoverSafely runs one scan without letting an error or a panic stop the
+// loop: the containment is per scan, so one panicking scan costs only that
+// scan and the schedule keeps ticking.
+func (s *OrphanRecoveryService) recoverSafely(ctx context.Context) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.emit(context.Background(), slog.LevelError, "panic", "Orphan recovery scan panicked",
+				slog.String("error_type", fmt.Sprintf("%T", recovered)))
+		}
+	}()
+
+	report, err := s.RecoverNow(ctx)
 	if err != nil {
-		s.emit(s.ctx, slog.LevelError, "scan_failed", "Orphan recovery scan failed",
+		if errors.Is(err, context.Canceled) {
+			s.emit(context.Background(), slog.LevelInfo, "scan_cancelled", "Orphan recovery scan cancelled")
+			return
+		}
+		s.emit(ctx, slog.LevelError, "scan_failed", "Orphan recovery scan failed",
 			slog.String("error_type", fmt.Sprintf("%T", err)))
 		return
 	}
 	if report.FilesRecovered > 0 || report.FilesFailed > 0 {
-		s.emit(s.ctx, slog.LevelInfo, "scan_completed", "Orphan recovery scan completed",
+		s.emit(ctx, slog.LevelInfo, "scan_completed", "Orphan recovery scan completed",
 			slog.Int("scanned", report.FilesScanned),
 			slog.Int("recovered", report.FilesRecovered),
 			slog.Int("skipped", report.FilesSkipped),
@@ -369,11 +406,19 @@ func (s *OrphanRecoveryService) recoverVolume(
 
 	limit := s.batchSize
 	return filepath.Walk(walkRoot, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return nil // Skip unreadable entries; the next scan retries.
+		// Cancellation outranks entry errors: a cancelled scan must stop
+		// immediately instead of being recorded as skipped entries.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if walkErr != nil {
+			// An unreadable walk root means the scan saw nothing at all, which
+			// must not look like a clean pass; deeper unreadable entries are
+			// skipped, and the next scan retries them.
+			if path == walkRoot {
+				return fmt.Errorf("the scan root is not readable: %s", errorTypeName(walkErr))
+			}
+			return nil
 		}
 		if info.IsDir() {
 			return nil
