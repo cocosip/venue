@@ -1095,7 +1095,7 @@ func (s *BackgroundFileWatcherService) persistOptions(options *core.FileWatcherS
 		return fmt.Errorf("failed to close watcher options staging file: %w", err)
 	}
 
-	if err := os.Rename(tempPath, filepath.Join(s.configRootDir, fileWatcherOptionsFileName)); err != nil {
+	if err := replaceFile(tempPath, filepath.Join(s.configRootDir, fileWatcherOptionsFileName)); err != nil {
 		_ = os.Remove(tempPath)
 
 		return fmt.Errorf("failed to publish watcher service options: %w", err)
