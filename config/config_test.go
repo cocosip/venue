@@ -388,13 +388,26 @@ func TestApplyDefaultsRestoresSourceCleanupAndDeadLetterDefaults(t *testing.T) {
 	if !enabled.SourceCleanup.Enabled || enabled.SourceCleanup.DatabasePath != defaults.SourceCleanup.DatabasePath {
 		t.Fatalf("enabled SourceCleanup defaults = %#v, want the default database path", enabled.SourceCleanup)
 	}
-	if cfg.Cleanup.DeadLetter.IncludeTenantInPath != defaults.Cleanup.DeadLetter.IncludeTenantInPath ||
-		cfg.Cleanup.DeadLetter.IncludeDatePartition != defaults.Cleanup.DeadLetter.IncludeDatePartition {
-		t.Fatalf("dead-letter boolean defaults = {%v %v}, want {%v %v}",
-			cfg.Cleanup.DeadLetter.IncludeTenantInPath,
-			cfg.Cleanup.DeadLetter.IncludeDatePartition,
-			defaults.Cleanup.DeadLetter.IncludeTenantInPath,
-			defaults.Cleanup.DeadLetter.IncludeDatePartition)
+	if cfg.Cleanup.DeadLetter.ExcludeTenantFromPath || cfg.Cleanup.DeadLetter.ExcludeDatePartition {
+		t.Fatalf("dead-letter exclusions = {%v %v}, want both false so the tenant and date segments are kept",
+			cfg.Cleanup.DeadLetter.ExcludeTenantFromPath,
+			cfg.Cleanup.DeadLetter.ExcludeDatePartition)
+	}
+
+	// A partially configured dead-letter area must keep the layout defaults: the
+	// bug this covers was that setting only RootPath discarded the tenant segment,
+	// co-locating every tenant's dead letters in one flat directory.
+	partial := &Config{Cleanup: CleanupConfig{DeadLetter: DeadLetterConfig{RootPath: "custom-dead"}}}
+	partial.ApplyDefaults()
+	if partial.Cleanup.DeadLetter.RootPath != "custom-dead" {
+		t.Fatalf("DeadLetter.RootPath = %q, want the configured custom-dead", partial.Cleanup.DeadLetter.RootPath)
+	}
+	if partial.Cleanup.DeadLetter.ExcludeTenantFromPath || partial.Cleanup.DeadLetter.ExcludeDatePartition {
+		t.Fatalf("a partial DeadLetter config dropped the default layout: %#v", partial.Cleanup.DeadLetter)
+	}
+	if partial.Cleanup.DeadLetter.ShardingDepth != defaults.Cleanup.DeadLetter.ShardingDepth {
+		t.Fatalf("DeadLetter.ShardingDepth = %d, want the default %d",
+			partial.Cleanup.DeadLetter.ShardingDepth, defaults.Cleanup.DeadLetter.ShardingDepth)
 	}
 }
 

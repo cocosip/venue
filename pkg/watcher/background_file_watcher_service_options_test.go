@@ -534,7 +534,7 @@ func TestBackgroundFileWatcherService_BoundsParallelScans(t *testing.T) {
 	}
 
 	for attempt := 0; attempt < cycleAttempts; attempt++ {
-		service.executeScanCycleAt(context.Background(), time.Unix(0, 0))
+		runScanCycle(t, service, time.Unix(0, 0))
 	}
 
 	if scanned := len(watcher.scannedIDs()); scanned < watcherCount {
@@ -592,7 +592,7 @@ func TestBackgroundFileWatcherService_SequentialScanWhenLimitNotPositive(t *test
 		t.Fatalf("UpdateOptions() error = %v", err)
 	}
 
-	service.executeScanCycleAt(context.Background(), time.Unix(0, 0))
+	runScanCycle(t, service, time.Unix(0, 0))
 
 	if observed := peak.Load(); observed > 1 {
 		t.Fatalf("peak concurrent scans = %d, want sequential scanning for a non-positive limit", observed)
@@ -641,7 +641,7 @@ func TestBackgroundFileWatcherService_AppliesUpdatedScheduleOnNextCycle(t *testi
 	service := newBackgroundService(t, w, nil)
 
 	// First cycle: the watcher is new, so it is due immediately.
-	service.executeScanCycleAt(context.Background(), time.Unix(0, 0))
+	runScanCycle(t, service, time.Unix(0, 0))
 
 	// The operator shortens the schedule without unregistering.
 	if err := w.UpdateWatcher(context.Background(), newConfig("w1", watchPath, func(config *core.FileWatcherConfiguration) {
@@ -652,10 +652,10 @@ func TestBackgroundFileWatcherService_AppliesUpdatedScheduleOnNextCycle(t *testi
 
 	// The new schedule must be respected: one full new interval after the update
 	// was observed, not the stale 90s due time and not immediately.
-	if delay := service.executeScanCycleAt(context.Background(), time.Unix(0, 0).Add(5*time.Second)); delay != 10*time.Second {
+	if delay := runScanCycle(t, service, time.Unix(0, 0).Add(5*time.Second)); delay != 10*time.Second {
 		t.Fatalf("second cycle delay = %v, want the updated 10s schedule to be due in 5s", delay)
 	}
-	service.executeScanCycleAt(context.Background(), time.Unix(0, 0).Add(10*time.Second))
+	runScanCycle(t, service, time.Unix(0, 0).Add(10*time.Second))
 
 	updated, err := w.GetWatcher(context.Background(), "w1")
 	if err != nil {
@@ -705,10 +705,13 @@ func TestScanNow_ParallelScansImportOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			service.executeScanCycleAt(context.Background(), time.Unix(0, 0))
+			service.dispatchScanCycleAt(context.Background(), time.Unix(0, 0))
 		}()
 	}
 	wg.Wait()
+
+	// The cycle only dispatches, so wait for the scans it started.
+	service.wg.Wait()
 
 	if got := pool.writeCount(); got != watcherCount {
 		t.Fatalf("WriteFile calls = %d, want %d (one per watcher, no duplicate imports)", got, watcherCount)

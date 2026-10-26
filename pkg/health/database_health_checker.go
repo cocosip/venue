@@ -146,7 +146,12 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 	metadataDatabases := tenantDatabasePaths(c.metadataDataPath, metadataDatabaseFileName, tenantIDs)
 
 	checkedDatabases := make([]string, 0, len(metadataDatabases))
-	checkedDatabases = append(checkedDatabases, c.checkMetadataDatabases(ctx, metadataDatabases, report)...)
+	metadataChecked, metadataErr := c.checkMetadataDatabases(ctx, metadataDatabases, report)
+	checkedDatabases = append(checkedDatabases, metadataChecked...)
+	// A cancelled or timed-out check inspected only part of the tenant set. That
+	// is not health: without this the report would read as a clean pass over
+	// databases that were never opened.
+	c.markIncomplete(ctx, report, "metadata", metadataErr)
 
 	if c.directoryQuotaDataPath != "" {
 		quotaDatabases := tenantDatabasePaths(c.directoryQuotaDataPath, directoryQuotaDatabaseFileName, tenantIDs)
@@ -154,6 +159,9 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 		healthy, corrupted, quotaErr := c.checkDirectoryQuotaDatabases(ctx, quotaDatabases)
 		if quotaErr != nil {
 			c.emit(ctx, slog.LevelWarn, "quota_check_failed", "Error checking directory quota databases", errorTypeAttr(quotaErr))
+			// A quota scan that could not run says nothing about the databases
+			// it never inspected, so it must not be reported as healthy either.
+			report.AllHealthy = false
 			healthy, corrupted = 0, nil
 		}
 
@@ -164,6 +172,7 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 		}
 
 		checkedDatabases = append(checkedDatabases, quotaDatabases...)
+		c.markIncomplete(ctx, report, "directory quota", quotaErr)
 	}
 
 	// Orphan detection is independent from the database counts: a deployment can
@@ -171,6 +180,10 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 	orphaned, err := c.DetectOrphanedFiles(ctx)
 	if err != nil {
 		c.emit(ctx, slog.LevelWarn, "orphan_detection_failed", "Error detecting orphaned files", errorTypeAttr(err))
+		// A phase that did not run leaves the report incomplete, so it must not
+		// read as an all-clear. Cancellation in particular surfaces here rather
+		// than in the database loops.
+		report.AllHealthy = false
 	} else {
 		report.OrphanedTenants = orphaned
 	}
@@ -180,23 +193,55 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 	return report, nil
 }
 
+// markIncomplete records that a scan phase stopped before it inspected every
+// database, so the report never presents a partial pass as health.
+//
+// The verdict is taken from the phase's own result rather than from a later
+// ctx.Err(): the context may still be live when the phase stops, and a check
+// that ran after the phase could also observe a cancellation that had nothing to
+// do with it. Callers pass the error the phase actually returned.
+//
+// The check is deliberately log-and-flag rather than an error return: the report
+// is still the most useful answer available (it carries what was inspected), and
+// the health service decides what to do with an unhealthy report.
+func (c *databaseHealthChecker) markIncomplete(ctx context.Context, report *core.DatabaseHealthReport, phase string, phaseErr error) {
+	if phaseErr == nil {
+		return
+	}
+
+	report.AllHealthy = false
+
+	c.emit(ctx, slog.LevelWarn, "database_check_incomplete",
+		"Database health check did not inspect every database",
+		slog.String("phase", phase),
+		errorTypeAttr(phaseErr))
+}
+
 // checkMetadataDatabases checks every tenant metadata database and returns the
 // database paths that were inspected (present or not), in enumeration order.
+//
+// A non-nil error means the phase stopped before every database was inspected,
+// so the caller can mark the report incomplete instead of presenting a partial
+// pass as health.
 func (c *databaseHealthChecker) checkMetadataDatabases(
 	ctx context.Context,
 	databases []string,
 	report *core.DatabaseHealthReport,
-) []string {
+) ([]string, error) {
 	checked := make([]string, 0, len(databases))
 
 	for _, dbPath := range databases {
 		if err := ctx.Err(); err != nil {
-			return checked
+			return checked, err
 		}
 
 		checked = append(checked, dbPath)
 
 		status := c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantIDFromDatabasePath(c.metadataDataPath, dbPath), dbPath)
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return checked, ctxErr
+		}
 
 		switch {
 		case status.IsHealthy:
@@ -207,7 +252,7 @@ func (c *databaseHealthChecker) checkMetadataDatabases(
 		}
 	}
 
-	return checked
+	return checked, nil
 }
 
 // CheckMetadataDatabase checks one tenant's metadata database.
@@ -308,12 +353,27 @@ func (c *databaseHealthChecker) checkDirectoryQuotaDatabases(
 
 		status := c.checkDatabase(ctx, core.DatabaseTypeDirectoryQuota, tenantIDFromDatabasePath(c.directoryQuotaDataPath, dbPath), dbPath)
 
+		// A cancellation that landed during the inspection is reported as the
+		// phase error rather than as corruption, so the caller marks the report
+		// incomplete instead of listing a healthy database as damaged.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return healthy, corrupted, ctxErr
+		}
+
 		switch {
 		case status.IsHealthy:
 			healthy++
 		case status.Error != "":
 			corrupted = append(corrupted, status)
 		}
+	}
+
+	// The pre-iteration check cannot catch a cancellation that lands while the
+	// last database is being inspected: the loop then exits normally and the
+	// phase would look complete. Re-checking after the loop turns that case into
+	// the same explicit truncation the caller already handles.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return healthy, corrupted, ctxErr
 	}
 
 	return healthy, corrupted, nil
@@ -349,6 +409,12 @@ func (c *databaseHealthChecker) checkDatabase(
 		// The file is absent: no database has been created yet. This is a
 		// normal state for a new deployment or a tenant without data, and is
 		// not corruption.
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		// A cancelled inspection says nothing about the file, so it must not be
+		// recorded as corruption. Leaving both flags false marks the database
+		// as neither healthy nor corrupted; the phase reports the cancellation
+		// through its own error so the report is marked incomplete.
+		status.Error = ""
 	default:
 		status.Error = err.Error()
 	}

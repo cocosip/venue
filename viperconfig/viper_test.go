@@ -1,17 +1,19 @@
 package viperconfig
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cocosip/venue/config"
 	"github.com/spf13/viper"
 )
 
 func TestLoadSectionProducesConfig(t *testing.T) {
-	source := NewWithDefaults()
+	source := viper.New()
 	source.SetConfigType("yaml")
 	if err := source.ReadConfig(strings.NewReader(`
 venue:
@@ -42,14 +44,53 @@ venue:
 	}
 }
 
-func TestNewWithDefaultsBindsSourceCleanupDefaults(t *testing.T) {
-	cfg, err := Load(NewWithDefaults())
+// TestLoadOnAnEmptySourceProducesTheDocumentedDefaults pins the reason
+// NewWithDefaults is unnecessary: Load seeds the result from
+// config.DefaultConfig(), so an empty source already yields every documented
+// default, including the sections that a hand-maintained SetDefault list used to
+// drift away from.
+func TestLoadOnAnEmptySourceProducesTheDocumentedDefaults(t *testing.T) {
+	cfg, err := Load(viper.New())
 	if err != nil {
-		t.Fatalf("Load(NewWithDefaults()) error = %v", err)
+		t.Fatalf("Load(empty source) error = %v", err)
 	}
-	if !cfg.SourceCleanup.Enabled || cfg.SourceCleanup.DatabasePath != "source-cleanup.db" ||
-		cfg.SourceCleanup.MaxActiveJobs != 10000 || cfg.SourceCleanup.TerminalPruneBatchSize != 5000 {
-		t.Fatalf("source cleanup defaults = %#v", cfg.SourceCleanup)
+
+	defaults := config.DefaultConfig()
+	if cfg.SourceCleanup.Enabled != defaults.SourceCleanup.Enabled ||
+		cfg.SourceCleanup.DatabasePath != defaults.SourceCleanup.DatabasePath ||
+		cfg.SourceCleanup.MaxActiveJobs != defaults.SourceCleanup.MaxActiveJobs ||
+		cfg.SourceCleanup.TerminalPruneBatchSize != defaults.SourceCleanup.TerminalPruneBatchSize {
+		t.Fatalf("source cleanup defaults = %#v, want %#v", cfg.SourceCleanup, defaults.SourceCleanup)
+	}
+	if cfg.Cleanup.ProcessingTimeout != defaults.Cleanup.ProcessingTimeout {
+		t.Fatalf("processing timeout = %s, want the default %s", cfg.Cleanup.ProcessingTimeout, defaults.Cleanup.ProcessingTimeout)
+	}
+	if cfg.Sqlite.JournalMode != defaults.Sqlite.JournalMode {
+		t.Fatalf("journal mode = %q, want the default %q", cfg.Sqlite.JournalMode, defaults.Sqlite.JournalMode)
+	}
+}
+
+// TestLoadFromFileSectionRejectsAMissingSection covers the silent-fallback bug:
+// an absent section used to bind the whole document, so an unrelated application
+// config became Venue configuration and surfaced as a confusing validation error.
+func TestLoadFromFileSectionRejectsAMissingSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.yaml")
+	content := []byte("app:\n  name: MyApp\n  port: 8080\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	if _, err := LoadFromFile(path); !errors.Is(err, ErrSectionNotFound) {
+		t.Fatalf("LoadFromFile() error = %v, want it to wrap ErrSectionNotFound", err)
+	}
+	if _, err := LoadFromFileSection(path, "venue"); !errors.Is(err, ErrSectionNotFound) {
+		t.Fatalf("LoadFromFileSection() error = %v, want it to wrap ErrSectionNotFound", err)
+	}
+
+	// An explicitly empty section name still reads the root document, which is
+	// how a caller loads a file whose keys sit at the top level.
+	if _, err := LoadFromFileSection(path, ""); err != nil {
+		t.Fatalf("LoadFromFileSection(\"\") error = %v, want the root document to load", err)
 	}
 }
 

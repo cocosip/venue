@@ -44,9 +44,13 @@ func main() {
 	}
 	fmt.Println()
 
-	// Method 3: Manual configuration using Viper
+	// Method 3: Build a Viper source in code.
+	//
+	// A plain viper.New() is enough: Load seeds the result from
+	// config.DefaultConfig(), so the defaults do not have to be registered on the
+	// source first.
 	fmt.Println("Method 3: Manual Viper configuration")
-	v := viperconfig.NewWithDefaults()
+	v := viper.New()
 
 	// Override some settings
 	v.Set("metadataDirectory", dataDir+"/metadata")
@@ -74,12 +78,14 @@ func main() {
 		},
 	})
 
-	// Bind environment variables (optional)
-	// Example: VENUE_METADATADIRECTORY will override metadataDirectory
+	// Environment variables are application-owned policy. Binding them requires a
+	// key replacer so VENUE_METADATADIRECTORY maps onto metadataDirectory; without
+	// one, AutomaticEnv cannot match a nested key and silently binds nothing.
 	v.SetEnvPrefix("VENUE")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
-	_, err = viperconfig.Load(v)
+	cfg3, err := viperconfig.Load(v)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
@@ -196,16 +202,23 @@ venue:
 	fmt.Printf("   - EnableDatabaseHealthCheck: %v\n", cfg4.EnableDatabaseHealthCheck)
 	fmt.Println()
 
+	// Methods 1 and 2 load the same document from a file; report what they
+	// produced so the example does not discard the work it just did.
+	fmt.Println("File-based loads:")
+	fmt.Printf("   - YAML metadata directory: %s\n", cfg1.MetadataDirectory)
+	fmt.Printf("   - JSON metadata directory: %s\n", cfg2.MetadataDirectory)
+	fmt.Printf("   - In-code metadata directory: %s\n", cfg3.MetadataDirectory)
+	fmt.Println()
+
 	fmt.Println("✨ Viper configuration example completed!")
 	fmt.Println()
 	fmt.Println("Advantages:")
 	fmt.Println("  ✓ Multiple config formats (JSON, YAML, TOML, HCL, etc.)")
-	fmt.Println("  ✓ Environment variable overrides")
-	fmt.Println("  ✓ Configuration hot-reload support")
 	fmt.Println("  ✓ Embedded config section support")
 	fmt.Println("  ✓ Missing config nodes use defaults automatically")
 	fmt.Println("  ✓ Produces the public config.Config model")
-
-	_ = cfg1
-	_ = cfg2
+	fmt.Println()
+	fmt.Println("Application-owned policy (not provided by this package):")
+	fmt.Println("  - environment-variable overrides: bind them on your own Viper source")
+	fmt.Println("  - configuration reload: watch the file and call Load again")
 }

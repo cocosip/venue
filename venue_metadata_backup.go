@@ -321,12 +321,30 @@ func (s *MetadataBackupService) prune(ctx context.Context) {
 
 // run performs the periodic backup cycles until the stop channel is closed.
 //
-// Each cycle runs under a context derived from the stop channel, so closing it
+// The whole loop shares one context derived from the stop channel, so closing it
 // interrupts an in-flight backup pass instead of making Stop wait out a whole
 // cycle of VACUUM INTO copies on slow storage. RunOnce observes that context
 // through its per-tenant cancellation checks.
+//
+// Exactly one context and one watcher goroutine exist for the lifetime of the
+// loop: an earlier version derived a context per tick, which leaked one goroutine
+// parked on stopCh for every backup cycle a long-lived runtime performed.
 func (s *MetadataBackupService) run(stopCh <-chan struct{}) {
 	defer s.wg.Done()
+
+	cycleCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The watcher is joined before run returns, so a cycle cannot be observed
+	// running after Stop has reported completion.
+	var watcher sync.WaitGroup
+	watcher.Add(1)
+	go func() {
+		defer watcher.Done()
+		<-stopCh
+		cancel()
+	}()
+	defer watcher.Wait()
 
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -336,15 +354,9 @@ func (s *MetadataBackupService) run(stopCh <-chan struct{}) {
 		case <-stopCh:
 			return
 		case <-ticker.C:
-			cycleCtx, cancel := context.WithCancel(context.Background())
-			go func() {
-				<-stopCh
-				cancel()
-			}()
-			if err := s.RunOnce(cycleCtx); err != nil {
+			if err := s.RunOnce(cycleCtx); err != nil && cycleCtx.Err() == nil {
 				s.warn(context.Background(), "backup_cycle_failed", err)
 			}
-			cancel()
 		}
 	}
 }

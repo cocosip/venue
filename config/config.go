@@ -124,11 +124,6 @@ type SqliteConfig struct {
 	// committed write batch. It bounds WAL growth at the cost of extra I/O.
 	CheckpointAfterBatch bool `json:"checkpointAfterBatch" yaml:"checkpointAfterBatch" mapstructure:"checkpointAfterBatch"`
 
-	// MaxOpenConns is the connection limit of each tenant's pool. Keep it at 1:
-	// the repository serializes every statement of a tenant on one connection,
-	// mirroring Locus's single long-lived connection per tenant.
-	MaxOpenConns int `json:"maxOpenConns" yaml:"maxOpenConns" mapstructure:"maxOpenConns"`
-
 	// MaxOpenDatabases bounds how many tenant database handles stay open at the
 	// same time. Zero means unlimited: every tenant that was touched keeps its
 	// handle until Close.
@@ -520,11 +515,19 @@ type DeadLetterConfig struct {
 	// RootPath is the dead-letter root, relative to the volume mount path.
 	RootPath string `json:"rootPath" yaml:"rootPath" mapstructure:"rootPath"`
 
-	// IncludeTenantInPath inserts the tenant ID below the root.
-	IncludeTenantInPath bool `json:"includeTenantInPath" yaml:"includeTenantInPath" mapstructure:"includeTenantInPath"`
+	// ExcludeTenantFromPath drops the tenant ID segment from the dead-letter
+	// path. The zero value keeps the segment, because a shared dead-letter area
+	// without the tenant segment would co-locate every tenant's payloads.
+	//
+	// The switch is expressed in negative form so that its zero value means
+	// "keep the default behaviour": a plain bool that defaults to true cannot
+	// distinguish "not set" from "explicitly false", which is the defect class
+	// that silently disabled this segment when only RootPath was configured.
+	ExcludeTenantFromPath bool `json:"excludeTenantFromPath" yaml:"excludeTenantFromPath" mapstructure:"excludeTenantFromPath"`
 
-	// IncludeDatePartition inserts a yyyyMMdd partition directory.
-	IncludeDatePartition bool `json:"includeDatePartition" yaml:"includeDatePartition" mapstructure:"includeDatePartition"`
+	// ExcludeDatePartition drops the yyyyMMdd partition directory. The zero value
+	// keeps the partition; see ExcludeTenantFromPath for the naming rationale.
+	ExcludeDatePartition bool `json:"excludeDatePartition" yaml:"excludeDatePartition" mapstructure:"excludeDatePartition"`
 
 	// ShardingDepth is the number of two-character hexadecimal shard segments
 	// inserted below the (optional) partition directory.
@@ -611,7 +614,6 @@ func DefaultConfig() *Config {
 			CacheSizeKb:          -4000,
 			BusyTimeoutMs:        5000,
 			CheckpointAfterBatch: false,
-			MaxOpenConns:         1,
 			// Zero keeps every touched tenant handle open, as Locus does.
 			MaxOpenDatabases:            0,
 			OpenDatabaseIdleTimeout:     0,
@@ -664,10 +666,8 @@ func DefaultConfig() *Config {
 			CleanupPermanentlyFailedFiles: true,
 			PermanentlyFailedDisposition:  "MoveToDeadLetter",
 			DeadLetter: DeadLetterConfig{
-				RootPath:             ".deadletter",
-				IncludeTenantInPath:  true,
-				IncludeDatePartition: true,
-				ShardingDepth:        2,
+				RootPath:      ".deadletter",
+				ShardingDepth: 2,
 			},
 			FailedFileRetentionPeriod:      3 * 24 * time.Hour,
 			CleanupCompletedRecords:        true,
@@ -763,8 +763,15 @@ func (c *Config) ApplyDefaults() {
 			c.SourceCleanup.TerminalPruneBatchSize = d.SourceCleanup.TerminalPruneBatchSize
 		}
 	}
-	if c.Cleanup.DeadLetter == (DeadLetterConfig{}) {
-		c.Cleanup.DeadLetter = d.Cleanup.DeadLetter
+	// DeadLetter is defaulted field by field. The booleans are negative-form, so
+	// their zero value already means "keep the default layout"; a whole-struct
+	// equality sentinel would discard that and silently drop the tenant segment
+	// as soon as an operator set only RootPath.
+	if c.Cleanup.DeadLetter.RootPath == "" {
+		c.Cleanup.DeadLetter.RootPath = d.Cleanup.DeadLetter.RootPath
+	}
+	if c.Cleanup.DeadLetter.ShardingDepth == 0 {
+		c.Cleanup.DeadLetter.ShardingDepth = d.Cleanup.DeadLetter.ShardingDepth
 	}
 	if c.MetadataDirectory == "" {
 		c.MetadataDirectory = d.MetadataDirectory
@@ -840,9 +847,6 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Sqlite.BusyTimeoutMs == 0 {
 		c.Sqlite.BusyTimeoutMs = d.Sqlite.BusyTimeoutMs
-	}
-	if c.Sqlite.MaxOpenConns == 0 {
-		c.Sqlite.MaxOpenConns = d.Sqlite.MaxOpenConns
 	}
 	if c.Sqlite.CorruptedDatabaseRetention == 0 {
 		c.Sqlite.CorruptedDatabaseRetention = d.Sqlite.CorruptedDatabaseRetention
@@ -1117,6 +1121,13 @@ func (c *Config) Validate() error {
 		if watcher.WatcherID == "" {
 			return fmt.Errorf("fileWatcher[%d]: WatcherID is required", i)
 		}
+		// Validate the charset here, not only inside RegisterWatcher: an unsafe ID
+		// used to pass Validate and fail inside NewVenue after the tenant manager,
+		// the metadata repository, the quota repository and the volume roots were
+		// already opened.
+		if err := core.ValidateWatcherID(watcher.WatcherID); err != nil {
+			return fmt.Errorf("fileWatcher[%d]: %w", i, err)
+		}
 		if watcherIDs[watcher.WatcherID] {
 			return fmt.Errorf("fileWatcher[%d]: duplicate WatcherID: %s", i, watcher.WatcherID)
 		}
@@ -1217,9 +1228,6 @@ func validateSqlite(sqlite *SqliteConfig) error {
 	}
 	if sqlite.BusyTimeoutMs < 0 {
 		return fmt.Errorf("Sqlite.BusyTimeoutMs cannot be negative")
-	}
-	if sqlite.MaxOpenConns < 1 {
-		return fmt.Errorf("Sqlite.MaxOpenConns must be at least 1")
 	}
 	if sqlite.MaxOpenDatabases < 0 {
 		return fmt.Errorf("Sqlite.MaxOpenDatabases cannot be negative")

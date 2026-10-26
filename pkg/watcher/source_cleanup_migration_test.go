@@ -73,4 +73,15 @@ func TestNewFileWatcherMigratesLegacyPendingSourceCleanup(t *testing.T) {
 	if len(remaining) != 0 {
 		t.Fatalf("legacy history after migration = %#v, want empty", remaining)
 	}
+
+	// The migrated entry left the in-memory history, so the entry counter must
+	// follow it. A delete that skips the decrement drifts permanently upward and
+	// silently disables the history cap.
+	concrete, ok := watcher.(*fileWatcher)
+	if !ok {
+		t.Fatalf("NewFileWatcher() returned %T, want *fileWatcher", watcher)
+	}
+	if got := concrete.importedEntryCount(); got != 0 {
+		t.Fatalf("importedEntryCount() = %d after migrating the only legacy record, want 0", got)
+	}
 }

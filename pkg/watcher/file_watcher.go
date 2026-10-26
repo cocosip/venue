@@ -31,8 +31,14 @@ const (
 	// temp-file + rename history write.
 	importedFilesHistoryTempFileName = "imported-files.json.tmp"
 
-	// maxImportedFilesHistory caps the persisted history so it cannot grow
-	// without bound. Oldest entries are dropped first.
+	// maxImportedFilesHistory caps the import history, in memory and on disk,
+	// so it cannot grow without bound. The oldest entries are dropped first.
+	//
+	// The cap is enforced where an entry is stored (see evictOldestImportedRecords)
+	// and not only when the history is written, so the in-memory view and the
+	// persisted document always describe the same set: trimming only the file
+	// would make a restart drop records this process still trusts, and the next
+	// scan would re-import those files.
 	maxImportedFilesHistory = 10000
 
 	// maxRecordedErrorsPerScanResult caps the errors carried by one scan result.
@@ -181,6 +187,11 @@ type fileWatcher struct {
 	// before recovering a stale reservation, so an import that legitimately
 	// outlives the reservation timeout is not torn down mid-write.
 	inFlightImports sync.Map // map[string]struct{}
+
+	// warnedIdempotentFallback records the watcher IDs for which the missing
+	// core.IdempotentStoragePool capability was already reported, so the warning
+	// stays a one-time capability statement instead of a per-file event.
+	warnedIdempotentFallback sync.Map // map[string]struct{}
 
 	// historyFlushDirty marks history changes that are not persisted yet.
 	historyFlushDirty bool
@@ -354,7 +365,7 @@ func (w *fileWatcher) migrateLegacySourceCleanup() error {
 				}
 			}
 		}
-		w.importedFiles.Delete(filePath)
+		w.deleteImportedRecord(filePath, value)
 		migrated++
 		return true
 	})
@@ -364,6 +375,28 @@ func (w *fileWatcher) migrateLegacySourceCleanup() error {
 		}
 	}
 	return migrationErr
+}
+
+// deleteImportedRecord removes one history entry and keeps the entry counter in
+// step with the map. Every deletion path must go through it: a map delete that
+// skips the decrement leaves importedCount permanently high, which silently
+// disables the history cap.
+//
+// value is the entry the caller inspected. The removal is a CompareAndDelete on
+// it, so a concurrent scan that already replaced the entry keeps its newer
+// record. It reports whether the entry was removed.
+func (w *fileWatcher) deleteImportedRecord(filePath string, value any) bool {
+	if !w.importedFiles.CompareAndDelete(filePath, value) {
+		return false
+	}
+
+	w.importedFilesMu.Lock()
+	if w.importedCount > 0 {
+		w.importedCount--
+	}
+	w.importedFilesMu.Unlock()
+
+	return true
 }
 
 // Close persists the import de-duplication history.
@@ -829,13 +862,14 @@ func (w *fileWatcher) recordScanStatistics(config *core.FileWatcherConfiguration
 }
 
 // scanSingleTenant scans files in single-tenant mode.
+//
+// Discovery runs before the tenant is resolved, and an empty watch directory
+// never resolves it at all: GetTenant auto-creates the tenant when the tenant
+// manager has auto-create enabled, so resolving before discovery would let a
+// stray or not-yet-used watch directory silently materialize tenant metadata on
+// every scan. The tenant is created at most when a discovered file is actually
+// about to be imported.
 func (w *fileWatcher) scanSingleTenant(ctx context.Context, config *core.FileWatcherConfiguration, result *core.FileWatcherScanResult, startTime time.Time) (*core.FileWatcherScanResult, error) {
-	// Get tenant context
-	tenant, err := w.tenantMgr.GetTenant(ctx, config.TenantID)
-	if err != nil {
-		return result, fmt.Errorf("failed to get tenant: %w", err)
-	}
-
 	// Discover files
 	files, err := w.discoverFiles(ctx, config.WatchPath, config)
 	if err != nil {
@@ -845,8 +879,15 @@ func (w *fileWatcher) scanSingleTenant(ctx context.Context, config *core.FileWat
 	result.FilesDiscovered = len(files)
 
 	discovered := make([]discoveredFile, 0, len(files))
-	for _, filePath := range files {
-		discovered = append(discovered, discoveredFile{path: filePath, tenant: tenant})
+	if len(files) > 0 {
+		tenant, err := w.tenantMgr.GetTenant(ctx, config.TenantID)
+		if err != nil {
+			return result, fmt.Errorf("failed to get tenant: %w", err)
+		}
+
+		for _, filePath := range files {
+			discovered = append(discovered, discoveredFile{path: filePath, tenant: tenant})
+		}
 	}
 
 	w.importDiscoveredFiles(ctx, config, result, discovered)
@@ -885,17 +926,23 @@ func (w *fileWatcher) scanMultiTenant(ctx context.Context, config *core.FileWatc
 		tenantID := entry.Name()
 		tenantPath := filepath.Join(config.WatchPath, tenantID)
 
-		// Resolve the tenant up front so a per-tenant failure is reported once
-		// instead of once per file.
-		tenant, err := w.tenantMgr.GetTenant(ctx, tenantID)
-		if err != nil {
-			w.addResultError(result, fmt.Sprintf("watcher %s tenant resolution failed: %s", config.WatcherID, errorTypeText(err)))
-			continue
-		}
-
 		files, err := w.discoverFiles(ctx, tenantPath, config)
 		if err != nil {
 			w.addResultError(result, fmt.Sprintf("watcher %s discovery failed: %s", config.WatcherID, errorTypeText(err)))
+			continue
+		}
+
+		// A subdirectory without candidates never resolves its tenant: that
+		// would auto-create tenant metadata for a stray or empty directory.
+		if len(files) == 0 {
+			continue
+		}
+
+		// Resolve the tenant once a file is actually about to be imported, so a
+		// per-tenant failure is reported once instead of once per file.
+		tenant, err := w.tenantMgr.GetTenant(ctx, tenantID)
+		if err != nil {
+			w.addResultError(result, fmt.Sprintf("watcher %s tenant resolution failed: %s", config.WatcherID, errorTypeText(err)))
 			continue
 		}
 
@@ -1215,6 +1262,13 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 		fileKey, err = idempotent.WriteFileIdempotently(
 			ctx, tenant, file, &originalFileName, operationID)
 	} else {
+		// The pool cannot deduplicate by operation ID, so this import is at-most-
+		// once instead of exactly-once: a crash between the storage write and
+		// MarkImported re-imports the file, because the computed operationID is
+		// discarded. The degradation is a property of the injected pool, not of
+		// this file, so it is reported once per watcher lifetime rather than once
+		// per import.
+		w.warnIdempotentImportUnavailable(config)
 		fileKey, err = w.storagePool.WriteFile(ctx, tenant, file, &originalFileName)
 	}
 	if err != nil {
@@ -1283,6 +1337,20 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	return outcome, nil
 }
 
+// warnIdempotentImportUnavailable reports, once per watcher, that the injected
+// storage pool cannot make an import exactly-once.
+func (w *fileWatcher) warnIdempotentImportUnavailable(config *core.FileWatcherConfiguration) {
+	if _, loaded := w.warnedIdempotentFallback.LoadOrStore(config.WatcherID, struct{}{}); loaded {
+		return
+	}
+
+	w.emit(context.Background(), slog.LevelWarn, "idempotent_import_unavailable",
+		"Storage pool does not support idempotent writes; a crash between the storage write and the import record can re-import a watched file",
+		slog.String("watcher_id", config.WatcherID))
+}
+
+// sourceCleanupAction converts a configured post-import action to its durable
+// cleanup action.
 func sourceCleanupAction(action core.PostImportAction) SourceCleanupAction {
 	switch action {
 	case core.PostImportActionMove:
@@ -2074,6 +2142,7 @@ func (w *fileWatcher) storeImportedStateLoaded(filePath string, record importedF
 	record.InFlightToken = ""
 	w.importedFiles.Store(filePath, record)
 	w.importedCount++
+	w.evictOldestImportedRecordsLocked()
 }
 
 // storeImportedRecordSync is retained for focused history tests and simple
@@ -2237,11 +2306,7 @@ func (w *fileWatcher) releaseImportSlot(filePath, token string) {
 		return
 	}
 
-	if w.importedFiles.CompareAndDelete(filePath, value) {
-		w.importedFilesMu.Lock()
-		w.importedCount--
-		w.importedFilesMu.Unlock()
-	}
+	w.deleteImportedRecord(filePath, value)
 }
 
 // reservationSequence disambiguates claims made within the same clock tick.
@@ -2258,6 +2323,9 @@ func nextReservationSequence() uint64 {
 // The in-memory entry is published before persistence is scheduled, so a
 // deferred (debounced) write never widens the de-duplication window: a second
 // scan already sees the record.
+//
+// The history cap is applied here, under the same lock, so the in-memory view
+// and the persisted document agree: see evictOldestImportedRecordsLocked.
 func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, importedAt time.Time, config *core.FileWatcherConfiguration) {
 	if importedAt.IsZero() {
 		importedAt = time.Now()
@@ -2271,9 +2339,97 @@ func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, imported
 		Fingerprint:    fingerprint,
 		ImportedAtUnix: importedAt.Unix(),
 	})
+	w.evictOldestImportedRecordsLocked()
 	w.importedFilesMu.Unlock()
 
 	w.persistHistory(config)
+}
+
+// evictOldestImportedRecordsLocked drops the oldest history entries until the
+// cap holds. The caller must hold importedFilesMu.
+//
+// Eviction is bounded by maxImportedFilesHistory and ordered by ImportedAtUnix,
+// with the path as a deterministic tie-break, so the entries that survive the
+// cap are always the newest ones. An in-flight claim is never evicted: its
+// import is still running, and dropping the claim would let a concurrent scan
+// import the same revision twice.
+func (w *fileWatcher) evictOldestImportedRecordsLocked() {
+	for w.importedCount > maxImportedFilesHistory {
+		if !w.evictOldestImportedRecordLocked() {
+			return
+		}
+	}
+}
+
+// evictOldestImportedRecordLocked drops exactly one oldest entry and reports
+// whether it removed anything. The caller must hold importedFilesMu.
+//
+// A record that still owes a post-import Delete/Move is only evicted when no
+// plain de-duplication record is left: it is the in-memory half of a durable
+// retry, and dropping it would re-import a file whose source action never ran.
+func (w *fileWatcher) evictOldestImportedRecordLocked() bool {
+	var (
+		plainPath string
+		plain     importedFileRecord
+		plainOK   bool
+
+		pendingPath string
+		pending     importedFileRecord
+		pendingOK   bool
+	)
+
+	w.importedFiles.Range(func(key, value interface{}) bool {
+		record, ok := value.(importedFileRecord)
+		if !ok || record.InFlightToken != "" {
+			return true
+		}
+
+		path, ok := key.(string)
+		if !ok {
+			return true
+		}
+
+		if record.PendingPostImportAction {
+			if !pendingOK || olderImportedRecord(record, path, pending, pendingPath) {
+				pendingPath, pending, pendingOK = path, record, true
+			}
+
+			return true
+		}
+
+		if !plainOK || olderImportedRecord(record, path, plain, plainPath) {
+			plainPath, plain, plainOK = path, record, true
+		}
+
+		return true
+	})
+
+	switch {
+	case plainOK:
+		if !w.importedFiles.CompareAndDelete(plainPath, plain) {
+			return false
+		}
+	case pendingOK:
+		if !w.importedFiles.CompareAndDelete(pendingPath, pending) {
+			return false
+		}
+	default:
+		return false
+	}
+
+	w.importedCount--
+
+	return true
+}
+
+// olderImportedRecord orders two history entries: oldest ImportedAtUnix first,
+// with the source path as a deterministic tie-break so eviction is stable.
+func olderImportedRecord(record importedFileRecord, path string, than importedFileRecord, thanPath string) bool {
+	if record.ImportedAtUnix != than.ImportedAtUnix {
+		return record.ImportedAtUnix < than.ImportedAtUnix
+	}
+
+	return path < thanPath
 }
 
 // storeImportedStateSync persists pending post-import work before the action is
@@ -2293,11 +2449,10 @@ func (w *fileWatcher) storeImportedStateSync(filePath string, record importedFil
 }
 
 func (w *fileWatcher) removeImportedStateSync(filePath string) error {
-	w.importedFilesMu.Lock()
-	if _, loaded := w.importedFiles.LoadAndDelete(filePath); loaded {
-		w.importedCount--
+	value, exists := w.importedFiles.Load(filePath)
+	if exists {
+		w.deleteImportedRecord(filePath, value)
 	}
-	w.importedFilesMu.Unlock()
 	return w.saveImportedFilesHistory()
 }
 
@@ -2354,7 +2509,7 @@ func (w *fileWatcher) pruneStaleImportedRecords(ctx context.Context, config *cor
 			return true
 		}
 
-		if w.importedFiles.CompareAndDelete(key, value) {
+		if w.deleteImportedRecord(filePath, value) {
 			pruned++
 		}
 
@@ -2364,10 +2519,6 @@ func (w *fileWatcher) pruneStaleImportedRecords(ctx context.Context, config *cor
 	if pruned == 0 {
 		return 0
 	}
-
-	w.importedFilesMu.Lock()
-	w.importedCount -= pruned
-	w.importedFilesMu.Unlock()
 
 	w.persistHistory(config)
 

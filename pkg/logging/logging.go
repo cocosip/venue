@@ -3,9 +3,11 @@ package logging
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
+
+	"github.com/cocosip/venue/pkg/core"
 )
 
 // Config configures a Venue logging runtime. The caller owns the handler and
@@ -37,9 +39,13 @@ type Runtime struct {
 }
 
 // New creates an enabled logging runtime.
+//
+// A nil handler is rejected with an error wrapping core.ErrInvalidArgument, so a
+// caller of NewVenue can classify the failure like every other public
+// configuration error instead of matching on message text.
 func New(config Config) (*Runtime, error) {
 	if config.Handler == nil {
-		return nil, errors.New("logging handler cannot be nil")
+		return nil, fmt.Errorf("logging handler cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
 	runtime := &Runtime{}

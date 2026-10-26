@@ -23,7 +23,6 @@ func TestSqliteDefaults(t *testing.T) {
 		{"CacheSizeKb", sqlite.CacheSizeKb, -4000},
 		{"BusyTimeoutMs", sqlite.BusyTimeoutMs, 5000},
 		{"CheckpointAfterBatch", sqlite.CheckpointAfterBatch, false},
-		{"MaxOpenConns", sqlite.MaxOpenConns, 1},
 		{"MaxOpenDatabases", sqlite.MaxOpenDatabases, 0},
 		{"OpenDatabaseIdleTimeout", sqlite.OpenDatabaseIdleTimeout, time.Duration(0)},
 		{"RecoverCorruptedDatabase", sqlite.RecoverCorruptedDatabase, false},
@@ -95,7 +94,6 @@ func TestValidateSqliteNumericBounds(t *testing.T) {
 	}{
 		{name: "zero cache size is rejected", mutate: func(s *config.SqliteConfig) { s.CacheSizeKb = 0 }, wantError: true},
 		{name: "negative busy timeout", mutate: func(s *config.SqliteConfig) { s.BusyTimeoutMs = -1 }, wantError: true},
-		{name: "zero max open conns", mutate: func(s *config.SqliteConfig) { s.MaxOpenConns = 0 }, wantError: true},
 		{name: "negative max open databases", mutate: func(s *config.SqliteConfig) { s.MaxOpenDatabases = -1 }, wantError: true},
 		{name: "negative idle timeout", mutate: func(s *config.SqliteConfig) { s.OpenDatabaseIdleTimeout = -time.Second }, wantError: true},
 		{name: "negative corrupted retention", mutate: func(s *config.SqliteConfig) { s.CorruptedDatabaseRetention = -time.Second }, wantError: true},
@@ -153,8 +151,8 @@ func TestApplyDefaultsRestoresSqliteDefaults(t *testing.T) {
 		t.Errorf("CacheSizeKb = %d, want %d", cfg.Sqlite.CacheSizeKb, defaults.CacheSizeKb)
 	case cfg.Sqlite.BusyTimeoutMs != defaults.BusyTimeoutMs:
 		t.Errorf("BusyTimeoutMs = %d, want %d", cfg.Sqlite.BusyTimeoutMs, defaults.BusyTimeoutMs)
-	case cfg.Sqlite.MaxOpenConns != defaults.MaxOpenConns:
-		t.Errorf("MaxOpenConns = %d, want %d", cfg.Sqlite.MaxOpenConns, defaults.MaxOpenConns)
+	case cfg.Sqlite.MaxOpenDatabases != defaults.MaxOpenDatabases:
+		t.Errorf("MaxOpenDatabases = %d, want %d", cfg.Sqlite.MaxOpenDatabases, defaults.MaxOpenDatabases)
 	case cfg.Sqlite.CorruptedDatabaseRetention != defaults.CorruptedDatabaseRetention:
 		t.Errorf("CorruptedDatabaseRetention = %s, want %s", cfg.Sqlite.CorruptedDatabaseRetention, defaults.CorruptedDatabaseRetention)
 	case cfg.Sqlite.BackupInterval != defaults.BackupInterval:
@@ -173,7 +171,6 @@ func TestSqliteConfigFluentConstruction(t *testing.T) {
 			WithCacheSizeKb(-8000).
 			WithBusyTimeout(2*time.Second).
 			WithCheckpointAfterBatch(true).
-			WithMaxOpenConns(2).
 			WithMaxOpenDatabases(64).
 			WithOpenDatabaseIdleTimeout(5*time.Minute).
 			WithCorruptedDatabaseRecovery(true).
@@ -200,8 +197,6 @@ func TestSqliteConfigFluentConstruction(t *testing.T) {
 		t.Errorf("BusyTimeoutMs = %d, want 2000", sqlite.BusyTimeoutMs)
 	case !sqlite.CheckpointAfterBatch:
 		t.Error("CheckpointAfterBatch = false, want true")
-	case sqlite.MaxOpenConns != 2:
-		t.Errorf("MaxOpenConns = %d, want 2", sqlite.MaxOpenConns)
 	case sqlite.MaxOpenDatabases != 64:
 		t.Errorf("MaxOpenDatabases = %d, want 64", sqlite.MaxOpenDatabases)
 	case sqlite.OpenDatabaseIdleTimeout != 5*time.Minute:

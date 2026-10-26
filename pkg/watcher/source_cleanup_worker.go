@@ -145,6 +145,15 @@ func (w *SourceCleanupWorker) run(ctx context.Context) {
 	ticker := time.NewTicker(w.options.PollingInterval)
 	defer ticker.Stop()
 	for {
+		// Check cancellation before the pass, not after it: a Stop that lands
+		// between Start and the first tick must not run a full maintenance pass
+		// (stale-import recovery, terminal prune and Optimize, i.e. a WAL
+		// checkpoint plus VACUUM) against a cancelled context, which would only
+		// log spurious failures for a shutdown that was already requested.
+		if err := ctx.Err(); err != nil {
+			return
+		}
+
 		w.processPass(ctx)
 		select {
 		case <-ctx.Done():

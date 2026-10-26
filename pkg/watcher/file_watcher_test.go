@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -522,8 +523,26 @@ func TestSaveImportedFilesHistory_CapsHistorySize(t *testing.T) {
 		w.storeImportedRecordSync(path, fmt.Sprintf("%d:%d", i, i), time.Unix(int64(i), 0))
 	}
 
-	if got := w.importedEntryCount(); got != maxImportedFilesHistory+25 {
-		t.Fatalf("pre-save entries = %d, want %d", got, maxImportedFilesHistory+25)
+	// The cap is enforced in memory, not only in the copy written to disk. This
+	// assertion used to demand maxImportedFilesHistory+25 live entries, which
+	// encoded the unbounded-growth defect: the in-process history then grew for
+	// the whole process lifetime while only the persisted copy was trimmed.
+	if got := w.importedEntryCount(); got != maxImportedFilesHistory {
+		t.Fatalf("in-memory entries = %d, want the cap %d", got, maxImportedFilesHistory)
+	}
+
+	// The entries retained by the cap are the newest ones: the oldest 25 are
+	// evicted, so a restart cannot silently re-import them.
+	for i := 0; i < 25; i++ {
+		if _, ok := w.importedFiles.Load(filepath.Join(root, fmt.Sprintf("file-%05d.csv", i))); ok {
+			t.Fatalf("oldest entry %d survived the cap, want the oldest entries evicted", i)
+		}
+	}
+	if _, ok := w.importedFiles.Load(filepath.Join(root, "file-00025.csv")); !ok {
+		t.Fatalf("entry 25 was evicted, want only the oldest 25 dropped by the cap")
+	}
+	if _, ok := w.importedFiles.Load(filepath.Join(root, fmt.Sprintf("file-%05d.csv", maxImportedFilesHistory+24))); !ok {
+		t.Fatalf("newest entry was dropped by the cap")
 	}
 
 	if err := w.saveImportedFilesHistory(); err != nil {
@@ -1284,6 +1303,126 @@ func TestScanNow_MaxFileSizeSkipsLargeFiles(t *testing.T) {
 
 	if len(files) != 1 || filepath.Base(files[0]) != "small.csv" {
 		t.Fatalf("discoverFiles() = %v, want [small.csv]", namesOf(files))
+	}
+}
+
+// TestScanNow_DoesNotMaterializeTenantsWithoutFiles proves discovery never
+// creates tenant state. The tenant manager auto-creates on GetTenant, so
+// resolving every watch subdirectory before discovery would let a stray empty
+// directory silently materialize tenant metadata.
+func TestScanNow_DoesNotMaterializeTenantsWithoutFiles(t *testing.T) {
+	w, _ := newTestWatcher(t)
+	manager := w.tenantMgr.(*fakeTenantManager)
+
+	multiRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(multiRoot, "stray-tenant"), 0o755); err != nil {
+		t.Fatalf("mkdir stray tenant: %v", err)
+	}
+
+	registerWatcher(t, w, newConfig("multi", multiRoot, func(config *core.FileWatcherConfiguration) {
+		config.MultiTenantMode = true
+		config.TenantID = ""
+	}))
+
+	singleRoot := t.TempDir()
+	registerWatcher(t, w, newConfig("single", singleRoot, nil))
+
+	for _, watcherID := range []string{"multi", "single"} {
+		if _, err := w.ScanNow(context.Background(), watcherID); err != nil {
+			t.Fatalf("ScanNow(%s) error = %v", watcherID, err)
+		}
+	}
+
+	for _, tenantID := range []string{"stray-tenant", "tenant-a"} {
+		if _, ok, err := manager.TryGetTenant(context.Background(), tenantID); err != nil {
+			t.Fatalf("TryGetTenant(%s) error = %v", tenantID, err)
+		} else if ok {
+			t.Fatalf("scan materialized tenant %q from an empty directory", tenantID)
+		}
+	}
+
+	// A directory that does hold a candidate still resolves (and may create) the
+	// tenant, so the fix cannot have disabled imports.
+	writeAgedFile(t, filepath.Join(multiRoot, "real-tenant", "a.csv"), "a")
+	if _, err := w.ScanNow(context.Background(), "multi"); err != nil {
+		t.Fatalf("ScanNow(multi) error = %v", err)
+	}
+	if _, ok, err := manager.TryGetTenant(context.Background(), "real-tenant"); err != nil {
+		t.Fatalf("TryGetTenant(real-tenant) error = %v", err)
+	} else if !ok {
+		t.Fatalf("a directory with a candidate did not resolve its tenant")
+	}
+}
+
+// plainStoragePool is a core.StoragePool that deliberately does NOT implement
+// core.IdempotentStoragePool, so the import has to fall back to a plain write.
+//
+// It embeds the core.StoragePool interface rather than the concrete fake: an
+// embedded concrete type would promote the fake's WriteFileIdempotently method
+// and hide the very capability gap this test exercises.
+type plainStoragePool struct {
+	core.StoragePool
+}
+
+// TestScanNow_WarnsOnceWhenExactlyOnceImportIsUnavailable proves the degraded
+// path is visible exactly once.
+//
+// When the pool does not implement core.IdempotentStoragePool the import falls
+// back to a plain WriteFile and the computed operationID is discarded, so a
+// crash between the storage write and MarkImported re-imports the file. That is
+// a real durability trade-off, and it must be reported instead of silently
+// degrading the durability contract.
+func TestScanNow_WarnsOnceWhenExactlyOnceImportIsUnavailable(t *testing.T) {
+	handler := &recordingHandler{}
+	logRuntime, err := logging.New(logging.Config{Handler: handler})
+	if err != nil {
+		t.Fatalf("logging.New() error = %v", err)
+	}
+
+	pool := &plainStoragePool{StoragePool: &fakeStoragePool{}}
+	w, err := NewFileWatcher(&FileWatcherOptions{
+		TenantManager:        newFakeTenantManager(),
+		StoragePool:          pool,
+		ConfigurationRootDir: filepath.Join(t.TempDir(), "watchers"),
+		Logging:              logRuntime,
+	})
+	if err != nil {
+		t.Fatalf("NewFileWatcher() error = %v", err)
+	}
+	concrete := w.(*fileWatcher)
+	t.Cleanup(func() {
+		concrete.awaitPendingHistoryFlush()
+
+		if err := concrete.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	watchPath := t.TempDir()
+	registerWatcher(t, concrete, newConfig("w1", watchPath, nil))
+
+	for i := 0; i < 3; i++ {
+		writeAgedFile(t, filepath.Join(watchPath, fmt.Sprintf("report-%d.csv", i)), "payload")
+	}
+	if _, err := concrete.ScanNow(context.Background(), "w1"); err != nil {
+		t.Fatalf("ScanNow() error = %v", err)
+	}
+
+	// A second scan of a fresh file must not repeat the warning: it is a
+	// capability statement, not a per-file event.
+	writeAgedFile(t, filepath.Join(watchPath, "later.csv"), "later")
+	if _, err := concrete.ScanNow(context.Background(), "w1"); err != nil {
+		t.Fatalf("ScanNow() error = %v", err)
+	}
+
+	warnings := 0
+	for _, record := range handler.snapshot() {
+		if record.level == slog.LevelWarn && record.event == "idempotent_import_unavailable" {
+			warnings++
+		}
+	}
+	if warnings != 1 {
+		t.Fatalf("idempotent_import_unavailable warnings = %d, want exactly 1", warnings)
 	}
 }
 

@@ -940,12 +940,14 @@ func (r *sqliteDirectoryQuotaRepository) openDatabaseWithRecovery(ctx context.Co
 }
 
 // openTenantDatabaseOnce opens one connection through the shared SQLite
-// foundation, re-asserts the pragmas, verifies the file with integrity_check(1),
-// and creates the schema.
+// foundation, re-asserts the pragmas, and creates the schema.
 //
-// The integrity check is the second half of the corruption verdict: a file can be
-// structurally readable and still hold a malformed b-tree, and that state is
-// exactly what the quarantine path is for.
+// The integrity check runs only when the caller asked for corruption recovery.
+// It is the expensive half of the open path — a full b-tree walk of the whole
+// file — and its only consumer is the quarantine decision in
+// openTenantDatabaseWithRecovery. Running it while recovery is disabled would pay
+// that cost to reach a verdict nothing can act on, and would turn a database that
+// SQLite itself opens and reads without trouble into a hard open failure.
 func (r *sqliteDirectoryQuotaRepository) openTenantDatabaseOnce(ctx context.Context, path string) (*sql.DB, error) {
 	db, err := sqlite.Open(ctx, path, r.sqlite)
 	if err != nil {
@@ -957,9 +959,11 @@ func (r *sqliteDirectoryQuotaRepository) openTenantDatabaseOnce(ctx context.Cont
 		return nil, fmt.Errorf("failed to configure the directory quota database: %w: %w", err, core.ErrDatabaseError)
 	}
 
-	if err := verifyQuotaDatabase(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, err
+	if r.corruptRecovery {
+		if err := verifyQuotaDatabase(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 
 	if err := applyQuotaSchema(ctx, db); err != nil {

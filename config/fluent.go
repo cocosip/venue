@@ -69,13 +69,18 @@ func (c *Config) WithSqlite(value *SqliteConfig) *Config {
 }
 
 // WithVolumes replaces configured volumes with copies of values.
+//
+// The slice is rebuilt instead of truncated in place: a shallow copy of a
+// Config shares the backing array, so `c.Volumes = c.Volumes[:0]` followed by
+// appends would overwrite the elements the original Config still points at.
 func (c *Config) WithVolumes(values ...*VolumeConfig) *Config {
-	c.Volumes = c.Volumes[:0]
+	volumes := make([]VolumeConfig, 0, len(values))
 	for _, value := range values {
 		if value != nil {
-			c.Volumes = append(c.Volumes, *value)
+			volumes = append(volumes, *value)
 		}
 	}
+	c.Volumes = volumes
 	return c
 }
 
@@ -88,13 +93,17 @@ func (c *Config) AddVolume(value *VolumeConfig) *Config {
 }
 
 // WithTenants replaces configured tenants with copies of values.
+//
+// The slice is rebuilt so a shallow Config copy cannot be mutated through the
+// shared backing array; see WithVolumes.
 func (c *Config) WithTenants(values ...*TenantConfig) *Config {
-	c.Tenants = c.Tenants[:0]
+	tenants := make([]TenantConfig, 0, len(values))
 	for _, value := range values {
 		if value != nil {
-			c.Tenants = append(c.Tenants, cloneTenantConfig(*value))
+			tenants = append(tenants, cloneTenantConfig(*value))
 		}
 	}
+	c.Tenants = tenants
 	return c
 }
 
@@ -107,24 +116,32 @@ func (c *Config) AddTenant(value *TenantConfig) *Config {
 }
 
 // WithFileWatchers replaces configured file watchers with copies of values.
+//
+// The slice is rebuilt so a shallow Config copy cannot be mutated through the
+// shared backing array; see WithVolumes.
 func (c *Config) WithFileWatchers(values ...*FileWatcherConfig) *Config {
-	c.FileWatchers = c.FileWatchers[:0]
+	watchers := make([]FileWatcherConfig, 0, len(values))
 	for _, value := range values {
 		if value != nil {
-			c.FileWatchers = append(c.FileWatchers, cloneFileWatcherConfig(*value))
+			watchers = append(watchers, cloneFileWatcherConfig(*value))
 		}
 	}
+	c.FileWatchers = watchers
 	return c
 }
 
 // WithFileWatcherRoots replaces the root watcher templates with copies.
+//
+// The slice is rebuilt so a shallow Config copy cannot be mutated through the
+// shared backing array; see WithVolumes.
 func (c *Config) WithFileWatcherRoots(values ...*FileWatcherRootConfig) *Config {
-	c.FileWatcherRoots = c.FileWatcherRoots[:0]
+	roots := make([]FileWatcherRootConfig, 0, len(values))
 	for _, value := range values {
 		if value != nil {
-			c.FileWatcherRoots = append(c.FileWatcherRoots, cloneFileWatcherRootConfig(*value))
+			roots = append(roots, cloneFileWatcherRootConfig(*value))
 		}
 	}
+	c.FileWatcherRoots = roots
 	return c
 }
 
@@ -435,7 +452,19 @@ func (c *Config) WithOrphanRecovery(value *OrphanRecoveryConfig) *Config {
 }
 
 // WithLogging sets instance logging configuration.
-func (c *Config) WithLogging(value *logging.Config) *Config { c.Logging = value; return c }
+//
+// The value is copied, like every other setter: storing the caller's pointer
+// would let a later mutation of the caller's struct change a runtime
+// configuration that NewVenue is supposed to own.
+func (c *Config) WithLogging(value *logging.Config) *Config {
+	if value == nil {
+		c.Logging = nil
+		return c
+	}
+	copied := *value
+	c.Logging = &copied
+	return c
+}
 
 // WithFailFastOnStartupRecoveryFailure makes startup fail when a database had to
 // be quarantined and could not be restored from a backup.
@@ -669,12 +698,6 @@ func (c *SqliteConfig) WithBusyTimeout(value time.Duration) *SqliteConfig {
 // committed write batch.
 func (c *SqliteConfig) WithCheckpointAfterBatch(enabled bool) *SqliteConfig {
 	c.CheckpointAfterBatch = enabled
-	return c
-}
-
-// WithMaxOpenConns sets the connection limit of each tenant's pool.
-func (c *SqliteConfig) WithMaxOpenConns(value int) *SqliteConfig {
-	c.MaxOpenConns = value
 	return c
 }
 
@@ -1115,15 +1138,17 @@ func (c *DeadLetterConfig) WithRootPath(value string) *DeadLetterConfig {
 	return c
 }
 
-// WithTenantInPath controls whether the tenant ID appears in the path.
+// WithTenantInPath controls whether the tenant ID appears in the path. The
+// default (true) keeps it; pass false to co-locate every tenant's dead letters.
 func (c *DeadLetterConfig) WithTenantInPath(enabled bool) *DeadLetterConfig {
-	c.IncludeTenantInPath = enabled
+	c.ExcludeTenantFromPath = !enabled
 	return c
 }
 
 // WithDatePartition controls whether a yyyyMMdd partition appears in the path.
+// The default (true) keeps it; pass false for a flat layout.
 func (c *DeadLetterConfig) WithDatePartition(enabled bool) *DeadLetterConfig {
-	c.IncludeDatePartition = enabled
+	c.ExcludeDatePartition = !enabled
 	return c
 }
 

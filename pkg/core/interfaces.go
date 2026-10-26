@@ -638,24 +638,6 @@ type DirectoryQuotaRepository interface {
 	Close() error
 }
 
-// RetryPolicy defines the retry policy for failed file operations.
-//
-// Deprecated: use FileRetryPolicy. RetryPolicy duplicates it and is not
-// referenced by the runtime.
-type RetryPolicy struct {
-	// MaxRetryCount is the maximum number of retries for failed files.
-	MaxRetryCount int
-
-	// InitialRetryDelay is the initial delay before the first retry.
-	InitialRetryDelay time.Duration
-
-	// UseExponentialBackoff enables exponential backoff for retry delays.
-	UseExponentialBackoff bool
-
-	// MaxRetryDelay is the maximum delay between retries.
-	MaxRetryDelay time.Duration
-}
-
 // PostImportAction defines what to do with files after successful import.
 type PostImportAction int
 

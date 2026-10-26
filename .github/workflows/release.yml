@@ -8,10 +8,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
     - name: Checkout code
@@ -28,37 +33,31 @@ jobs:
     - name: Download dependencies
       run: go mod download
 
+    # CI already gates build, vet, gofmt and whitespace on every push, so a tag
+    # that reaches this workflow has passed them. Only the race suite is re-run
+    # here: a tag can be cut from a commit that was never pushed to a branch.
     - name: Run tests
-      run: go test -race ./...
-
-    - name: Verify the library builds cleanly
-      # Venue is a library and has no main package, so a release publishes no
-      # binaries. Source archives are attached automatically by GitHub.
-      run: |
-        go build ./...
-        go vet ./...
-        gofmt -l . | tee /tmp/gofmt.out
-        test ! -s /tmp/gofmt.out
+      run: go test -race -timeout 15m ./...
 
     - name: Generate changelog
       run: |
-        # Get the previous tag
         PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
 
-        # Generate changelog
-        if [ -z "$PREV_TAG" ]; then
-          CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
-        else
-          CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
-        fi
-
-        # Save to file for GitHub Release
-        echo "## Changes" > CHANGELOG.md
-        echo "" >> CHANGELOG.md
-        echo "$CHANGELOG" >> CHANGELOG.md
+        {
+          echo "## Changes"
+          echo ""
+          if [ -z "$PREV_TAG" ]; then
+            git log --pretty=format:"- %s (%h)" --no-merges
+          else
+            git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges
+          fi
+          echo ""
+        } > CHANGELOG.md
 
         cat CHANGELOG.md
 
+    # Venue is a library with no main package, so a release publishes no
+    # binaries; GitHub attaches the source archives automatically.
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v3
       with:

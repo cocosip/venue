@@ -193,6 +193,22 @@ func newBackgroundService(t *testing.T, watcher core.FileWatcher, mutate func(*B
 	return service
 }
 
+// runScanCycle drives exactly one production scan cycle at a fixed clock and
+// waits for the scans it dispatched.
+//
+// The cycle itself only dispatches: it starts each due watcher's scan in its own
+// goroutine and returns the delay until the next due time. Joining the service's
+// scan group here makes a test observe the completed cycle instead of racing it,
+// without reaching for a second, test-only cycle implementation.
+func runScanCycle(t *testing.T, service *BackgroundFileWatcherService, now time.Time) time.Duration {
+	t.Helper()
+
+	delay := service.dispatchScanCycleAt(context.Background(), now)
+	service.wg.Wait()
+
+	return delay
+}
+
 // --- defect 4/1.4: the service is enabled by default -----------------------
 
 func TestBackgroundFileWatcherService_EnabledByDefault(t *testing.T) {
@@ -278,7 +294,7 @@ func TestBackgroundFileWatcherService_SkipsDisabledWatchers(t *testing.T) {
 	)
 
 	service := newBackgroundService(t, watcher, nil)
-	service.executeScanCycle(context.Background())
+	runScanCycle(t, service, time.Unix(0, 0))
 
 	scanned := watcher.scannedIDs()
 	if len(scanned) != 1 || scanned[0] != "enabled" {
@@ -303,10 +319,10 @@ func TestBackgroundFileWatcherService_HonoursPerWatcherPollingInterval(t *testin
 	}
 
 	// The fastest watcher is due first; the slow one must not be rescanned with it.
-	service.executeScanCycleAt(context.Background(), time.Unix(0, 0))
+	runScanCycle(t, service, time.Unix(0, 0))
 	watcher.resetScans()
 
-	service.executeScanCycleAt(context.Background(), time.Unix(0, 0).Add(10*time.Second))
+	runScanCycle(t, service, time.Unix(0, 0).Add(10*time.Second))
 
 	scanned := watcher.scannedIDs()
 	if len(scanned) != 1 || scanned[0] != "fast" {
@@ -315,7 +331,7 @@ func TestBackgroundFileWatcherService_HonoursPerWatcherPollingInterval(t *testin
 
 	// Ten seconds later only the fast watcher is scanned: the slow watcher keeps
 	// its own 90s schedule instead of being dragged to the minimum interval.
-	service.executeScanCycleAt(context.Background(), time.Unix(0, 0).Add(20*time.Second))
+	runScanCycle(t, service, time.Unix(0, 0).Add(20*time.Second))
 
 	scanned = watcher.scannedIDs()
 	for _, watcherID := range scanned {
@@ -325,7 +341,7 @@ func TestBackgroundFileWatcherService_HonoursPerWatcherPollingInterval(t *testin
 	}
 
 	// At 90s the slow watcher becomes due for the first time.
-	service.executeScanCycleAt(context.Background(), time.Unix(0, 0).Add(90*time.Second))
+	runScanCycle(t, service, time.Unix(0, 0).Add(90*time.Second))
 
 	scanned = watcher.scannedIDs()
 	slowScans := 0
@@ -435,11 +451,11 @@ func TestBackgroundFileWatcherService_WaitsWhenNoWatcherIsDue(t *testing.T) {
 	service := newBackgroundService(t, watcher, nil)
 
 	base := time.Unix(0, 0)
-	service.executeScanCycleAt(context.Background(), base)
+	runScanCycle(t, service, base)
 	watcher.resetScans()
 
 	// Only 1s later: not due yet.
-	service.executeScanCycleAt(context.Background(), base.Add(time.Second))
+	runScanCycle(t, service, base.Add(time.Second))
 
 	if scanned := watcher.scannedIDs(); len(scanned) != 0 {
 		t.Fatalf("scanned = %v, want nothing before the watcher is due", scanned)

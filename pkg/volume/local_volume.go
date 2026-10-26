@@ -20,11 +20,10 @@ import (
 // type-assert them, so an implementation drift must fail the build here rather
 // than silently degrade a caller to its fallback path.
 var (
-	_ core.FileMover                         = (*LocalFileSystemVolume)(nil)
-	_ core.ShardingDepthProvider             = (*LocalFileSystemVolume)(nil)
-	_ core.StorageVolumeHealthProbe          = (*LocalFileSystemVolume)(nil)
-	_ core.StorageVolumeWritePathWarmup      = (*LocalFileSystemVolume)(nil)
-	_ core.StorageVolumeWritePathDiagnostics = (*LocalFileSystemVolume)(nil)
+	_ core.FileMover                    = (*LocalFileSystemVolume)(nil)
+	_ core.ShardingDepthProvider        = (*LocalFileSystemVolume)(nil)
+	_ core.StorageVolumeHealthProbe     = (*LocalFileSystemVolume)(nil)
+	_ core.StorageVolumeWritePathWarmup = (*LocalFileSystemVolume)(nil)
 )
 
 // DefaultHealthCheckCacheTTL is the default lifetime of a cached health probe
@@ -72,9 +71,6 @@ type LocalFileSystemVolumeOptions struct {
 }
 
 // LocalFileSystemVolume implements StorageVolume for local filesystem.
-//
-// A LocalFileSystemVolume must not be copied after first use: it carries the
-// atomic write-path counters reported by WritePathStatistics.
 type LocalFileSystemVolume struct {
 	volumeID    string
 	mountPath   string
@@ -94,6 +90,13 @@ type LocalFileSystemVolume struct {
 	// volume-internal name.
 	warmupName func() string
 
+	// syncFile, syncDirectory and openFileForRead are seams for deterministic
+	// tests: they default to (*os.File).Sync, syncing a directory handle, and
+	// os.Open. Production never replaces them.
+	syncFile        func(*os.File) error
+	syncDirectory   func(string) error
+	openFileForRead func(string) (*os.File, error)
+
 	// healthMu makes the probe single-flight: callers that arrive while a probe
 	// is running wait for it and then reuse its cached result. It guards only the
 	// cached probe state; the write path never takes it.
@@ -101,11 +104,6 @@ type LocalFileSystemVolume struct {
 	healthKnown     bool
 	healthValue     bool
 	healthExpiresAt time.Time
-
-	// writePath aggregates the write-path observations reported by
-	// WritePathStatistics. It is updated through atomics so it never serializes
-	// the write fast path.
-	writePath writePathCounters
 }
 
 // NewLocalFileSystemVolume creates a new local file system volume.
@@ -154,6 +152,9 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 	volume.warmupName = func() string {
 		return writeWarmupFilePrefix + uuid.NewString()
 	}
+	volume.syncFile = func(file *os.File) error { return file.Sync() }
+	volume.syncDirectory = syncDirectory
+	volume.openFileForRead = os.Open
 
 	return volume, nil
 }
@@ -252,8 +253,7 @@ func (v *LocalFileSystemVolume) ProbeHealth(ctx context.Context) bool {
 // retry.
 //
 // A context that is already unusable returns the context error without touching
-// the filesystem, and that skipped warmup is not counted by
-// WritePathStatistics.
+// the filesystem.
 func (v *LocalFileSystemVolume) WarmWritePathCache(ctx context.Context) error {
 	if err := contextFailure(ctx); err != nil {
 		return fmt.Errorf("write path warmup skipped: %w", err)
@@ -283,23 +283,14 @@ func (v *LocalFileSystemVolume) WarmWritePathCache(ctx context.Context) error {
 	return nil
 }
 
-// WritePathStatistics returns a point-in-time copy of this volume's aggregated
-// write-path observations.
-//
-// The counters are updated with atomics by WriteFile, so the snapshot takes no
-// lock and the write fast path is never serialized. The returned value is a copy:
-// later writes do not mutate it. Only work this volume actually performs is
-// counted: a successful write contributes TotalWrites and TotalBytes, a failed
-// write contributes FailedWrites, and the directory-preparation, payload-copy and
-// fsync phases are observed where WriteFile enters them (fsync only when
-// EnableFsync is on). WarmWritePathCache writes through WriteFile and is
-// therefore counted like any other write, while the private health probe is not,
-// because it does not use the volume write path.
-func (v *LocalFileSystemVolume) WritePathStatistics() core.StorageVolumeWritePathStatistics {
-	return v.writePath.snapshot()
-}
-
 // performHealthProbe runs the uncached health probe.
+//
+// The probe file reuses the write-warmup name (writeWarmupFilePrefix), so a probe
+// that dies before its cleanup leaves a file that every other component already
+// recognizes as volume-internal: the dotted single-segment name never matches the
+// managed payload layout, so orphan recovery skips it instead of registering it
+// as a recoverable file. The probe deliberately writes with os.WriteFile rather
+// than through WriteFile, because it is a health check and not a stored payload.
 func (v *LocalFileSystemVolume) performHealthProbe(ctx context.Context) bool {
 	// An unusable context cannot vouch for the volume and must not panic.
 	if contextFailure(ctx) != nil {
@@ -311,9 +302,9 @@ func (v *LocalFileSystemVolume) performHealthProbe(ctx context.Context) bool {
 		return false
 	}
 
-	// Try to write a test file with random GUID to avoid concurrency issues
-	testFileName := fmt.Sprintf(".health_check_%s", uuid.New().String())
-	testPath := filepath.Join(v.mountPath, testFileName)
+	// Try to write a test file with a unique volume-internal name to avoid
+	// concurrency issues
+	testPath := filepath.Join(v.mountPath, v.warmupName())
 	if err := os.WriteFile(testPath, []byte("ok"), 0644); err != nil {
 		return false
 	}
@@ -345,22 +336,14 @@ func contextFailure(ctx context.Context) error {
 // WriteFile writes a file to the specified path within the volume.
 // Returns the number of bytes written.
 //
-// Every call is observed by WritePathStatistics: a successful write adds one to
-// TotalWrites and its payload to TotalBytes, a failed write adds one to
-// FailedWrites, and the directory-preparation, payload-copy and (when enabled)
-// fsync phases are timed exactly where this implementation performs them. The
-// counters are updated with atomics, so this fast path takes no lock.
+// The payload is copied through a context-aware reader, so a request whose
+// context is cancelled mid-copy stops at the next chunk and the partial file is
+// removed instead of being streamed to completion.
+//
+// With EnableFsync the file is synced and then its containing directory is synced
+// best-effort, so the new name survives a crash as reliably as its contents; a
+// failed file sync removes the file rather than leaving an unaccounted payload.
 func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath string, content io.Reader) (written int64, err error) {
-	// Accounting lives in one deferred recorder so no return path can bypass it.
-	defer func() {
-		if err != nil {
-			v.writePath.failedWrites.Add(1)
-			return
-		}
-		v.writePath.totalWrites.Add(1)
-		v.writePath.totalBytes.Add(written)
-	}()
-
 	// Sanitize and get full path
 	fullPath, err := v.sanitizer.SanitizeAndJoin(relativePath)
 	if err != nil {
@@ -369,10 +352,7 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 
 	// Ensure directory exists
 	dir := filepath.Dir(fullPath)
-	directoryStarted := time.Now()
-	mkdirErr := os.MkdirAll(dir, 0755)
-	observeWritePhase(&v.writePath.directoryPreparationCount, &v.writePath.directoryPreparationDuration, directoryStarted)
-	if mkdirErr != nil {
+	if mkdirErr := os.MkdirAll(dir, 0755); mkdirErr != nil {
 		return 0, fmt.Errorf("failed to create directory: %w", mkdirErr)
 	}
 
@@ -381,34 +361,64 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 	if err != nil {
 		return 0, fmt.Errorf("failed to create file: %w", err)
 	}
-	defer func() { _ = file.Close() }()
 
-	// Copy content
-	copyStarted := time.Now()
-	written, copyErr := io.Copy(file, content)
-	observeWritePhase(&v.writePath.copyOperationCount, &v.writePath.copyDuration, copyStarted)
-	if copyErr != nil {
-		// Clean up on error
+	// committed stays false until every step that makes the payload valid has
+	// run. The deferred cleanup then covers paths a plain error check cannot: a
+	// panic in the caller's reader unwinds through here too, and the half-written
+	// file plus its open handle must not survive the unwind.
+	//
+	// The close inside the cleanup is deliberately unconditional and idempotent:
+	// on Windows os.Remove fails with a sharing violation while this process
+	// still holds the handle, so the handle must go before the unlink.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = file.Close()
 		_ = os.Remove(fullPath)
+	}()
+
+	// Copy content through a context-aware reader so a cancelled request stops
+	// at the next chunk instead of streaming the whole payload.
+	written, copyErr := io.Copy(file, &contextReader{ctx: ctx, reader: content})
+	if copyErr != nil {
 		return 0, fmt.Errorf("failed to write file content: %w", copyErr)
 	}
 
 	// Sync to disk if enabled (for durability)
 	// Note: Full sync can be expensive for high-throughput scenarios.
 	if v.enableFsync {
-		fsyncStarted := time.Now()
-		syncErr := file.Sync()
-		observeWritePhase(&v.writePath.fsyncCount, &v.writePath.fsyncDuration, fsyncStarted)
-		if syncErr != nil {
+		if syncErr := v.syncFile(file); syncErr != nil {
+			// The bytes are not durable, so the file must not survive: leaving
+			// it would publish a payload whose metadata write is about to fail.
 			return written, fmt.Errorf("failed to sync file: %w", syncErr)
 		}
+
+		// Syncing the file makes its contents durable, but the directory entry
+		// that names it is separate. Without this the file can be missing after
+		// a crash while its SQLite metadata row is already durable. A failure is
+		// best-effort: the directory cannot be opened for fsync on every
+		// platform (Windows rejects it), and the payload itself is already
+		// synced.
+		_ = v.syncDirectory(dir)
 	}
+
+	if closeErr := file.Close(); closeErr != nil {
+		return written, fmt.Errorf("failed to close file: %w", closeErr)
+	}
+
+	committed = true
 
 	return written, nil
 }
 
 // ReadFile reads a file from the specified path within the volume.
 // Returns an io.ReadCloser that must be closed by the caller.
+//
+// A missing file is reported as core.ErrFileNotFound. The check is the open
+// itself rather than a separate stat: a stat followed by an open would leave a
+// window in which a concurrent delete turns a not-found into a generic error.
 func (v *LocalFileSystemVolume) ReadFile(ctx context.Context, relativePath string) (io.ReadCloser, error) {
 	// Sanitize and get full path
 	fullPath, err := v.sanitizer.SanitizeAndJoin(relativePath)
@@ -416,17 +426,12 @@ func (v *LocalFileSystemVolume) ReadFile(ctx context.Context, relativePath strin
 		return nil, err
 	}
 
-	// Check if file exists
-	if _, err := os.Stat(fullPath); err != nil {
+	// Open file
+	file, err := v.openFileForRead(fullPath)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, core.ErrFileNotFound
 		}
-		return nil, fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	// Open file
-	file, err := os.Open(fullPath)
-	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 
@@ -468,6 +473,17 @@ func (v *LocalFileSystemVolume) DeleteFile(ctx context.Context, relativePath str
 // escaping destination, and a destination that already exists, are rejected with
 // ErrInvalidArgument/ErrPathTraversalAttempt instead of overwriting another
 // payload. A missing source reports ErrFileNotFound.
+//
+// The destination check is a stat followed by the rename, which is not atomic, so
+// a writer that creates the destination between the two is overwritten. That is
+// accepted under the volume's trusted-local-filesystem model (see
+// PathSanitizer.SanitizeAndJoin): within Venue every destination is derived from
+// a system-generated fileKey that no other write targets, so the only way to hit
+// the window is to create the destination out of band, which already requires
+// write access to the volume. A portable no-replace rename does not exist —
+// os.Rename replaces unconditionally and Windows exposes no
+// MoveFileEx-without-replace through the standard library — so an atomic
+// no-replace commit is not implemented.
 func (v *LocalFileSystemVolume) MoveFile(ctx context.Context, fromRelativePath string, toRelativePath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -584,8 +600,15 @@ func (v *LocalFileSystemVolume) copyFileAndRemoveSource(ctx context.Context, sou
 		return fmt.Errorf("failed to close move source: %w", err)
 	}
 
-	if err := staged.Sync(); err != nil {
-		return fmt.Errorf("failed to sync staged move copy: %w", err)
+	// The staging file is only synced when durability is configured: with
+	// EnableFsync off this volume does not promise durability for any write, and
+	// the source file is still intact until the rename below, so an unsynced copy
+	// cannot lose data that a synced one would keep. Gating on the same setting
+	// keeps the move path's cost consistent with the write path's.
+	if v.enableFsync {
+		if err := v.syncFile(staged); err != nil {
+			return fmt.Errorf("failed to sync staged move copy: %w", err)
+		}
 	}
 	if err := staged.Close(); err != nil {
 		return fmt.Errorf("failed to close staged move copy: %w", err)
@@ -646,6 +669,12 @@ func (v *LocalFileSystemVolume) FileExists(ctx context.Context, relativePath str
 // BuildFilePath builds a file path with sharding.
 // fileKey: the file key (UUID without dashes)
 // extension: optional file extension (including the dot, e.g., ".pdf")
+//
+// The extension is validated through SanitizeExtension before it is concatenated
+// into the path, so a caller-supplied value cannot introduce a separator, a null
+// byte, a control character, or an unusable length. Trailing dots and spaces are
+// trimmed, and a remainder that carries no extension is dropped. A rejected
+// extension returns the SanitizeExtension error and an empty path.
 func (v *LocalFileSystemVolume) BuildFilePath(fileKey string, extension string) (string, error) {
 	// Build sharded path
 	shardedPath, err := BuildShardedPath(fileKey, v.shardDepth)
@@ -653,9 +682,14 @@ func (v *LocalFileSystemVolume) BuildFilePath(fileKey string, extension string) 
 		return "", err
 	}
 
+	sanitizedExtension, err := SanitizeExtension(extension)
+	if err != nil {
+		return "", err
+	}
+
 	// Add extension if provided
-	if extension != "" {
-		shardedPath += extension
+	if sanitizedExtension != "" {
+		shardedPath += sanitizedExtension
 	}
 
 	return shardedPath, nil

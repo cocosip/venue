@@ -388,14 +388,15 @@ func TestMarkAsFailed(t *testing.T) {
 	})
 
 	t.Run("Exceed max retries - permanently failed", func(t *testing.T) {
-		// Add a processing file with max retry count
+		// MaxRetryCount is the number of retries, so a file that already used
+		// all three configured retries fails permanently on the next failure.
 		leaseStart := time.Now().UTC()
 		file := createTestFileMetadata("file2", core.FileStatusProcessing)
-		file.RetryCount = 2 // Third failure reaches the configured maximum
+		file.RetryCount = 3 // Every configured retry was already used
 		file.ProcessingStartTime = &leaseStart
 		_ = repo.AddOrUpdate(ctx, file)
 
-		// Mark as failed (this reaches max)
+		// Mark as failed (this exceeds the configured retry budget)
 		err := scheduler.MarkAsFailed(ctx, core.FileProcessingLease{
 			TenantID:               "test-tenant",
 			FileKey:                "file2",
@@ -411,12 +412,40 @@ func TestMarkAsFailed(t *testing.T) {
 			t.Errorf("Expected status PermanentlyFailed, got %v", updated.Status)
 		}
 
-		if updated.RetryCount != 3 {
-			t.Errorf("Expected RetryCount 3, got %d", updated.RetryCount)
+		if updated.RetryCount != 4 {
+			t.Errorf("Expected RetryCount 4, got %d", updated.RetryCount)
 		}
 
 		if updated.AvailableForProcessingAt != nil {
 			t.Error("Expected AvailableForProcessingAt to be nil for permanently failed")
+		}
+	})
+
+	t.Run("Last configured retry still schedules a retry", func(t *testing.T) {
+		leaseStart := time.Now().UTC()
+		file := createTestFileMetadata("file3", core.FileStatusProcessing)
+		file.RetryCount = 2 // One retry left in the budget
+		file.ProcessingStartTime = &leaseStart
+		_ = repo.AddOrUpdate(ctx, file)
+
+		err := scheduler.MarkAsFailed(ctx, core.FileProcessingLease{
+			TenantID:               "test-tenant",
+			FileKey:                "file3",
+			ProcessingStartTimeUTC: leaseStart,
+		}, "Retry error")
+		if err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		updated, _ := repo.Get(ctx, "test-tenant", "file3")
+		if updated.Status != core.FileStatusPending {
+			t.Errorf("Expected status Pending while the retry budget is not exhausted, got %v", updated.Status)
+		}
+		if updated.RetryCount != 3 {
+			t.Errorf("Expected RetryCount 3, got %d", updated.RetryCount)
+		}
+		if updated.AvailableForProcessingAt == nil {
+			t.Error("Expected AvailableForProcessingAt to be set for the last retry")
 		}
 	})
 

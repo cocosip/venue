@@ -104,15 +104,25 @@ func TestCleanupInvalidDatabaseBackups_RemovesOnlyExpiredQuarantineDirectories(t
 
 // TestCleanupInvalidDatabaseBackups_ZeroRetentionSelectsDefaultRetention pins the
 // documented 72h runtime default for a zero retention.
+//
+// The fixtures age by their name stamp, which is the age of the rescue copy, and
+// their modification time is set to the opposite of what the name says: the
+// stamp must decide, so a quarantine created now from a long-lived database is
+// never swept immediately.
 func TestCleanupInvalidDatabaseBackups_ZeroRetentionSelectsDefaultRetention(t *testing.T) {
 	ctx := context.Background()
 
 	service, metadataRoot, _ := newQuarantineSweepService(t, 0)
 
-	olderThanDefault := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200101T000000Z")
-	newerThanDefault := filepath.Join(metadataRoot, "shared", "metadata.db.corrupted.20200102T000000Z")
-	writeAgedQuarantine(t, olderThanDefault, 10, time.Now().Add(-100*time.Hour))
-	writeAgedQuarantine(t, newerThanDefault, 10, time.Now().Add(-1*time.Hour))
+	now := time.Now().UTC()
+	olderThanDefault := filepath.Join(metadataRoot, "shared",
+		"metadata.db.corrupted."+now.Add(-100*time.Hour).Format(quarantineStampLayout))
+	newerThanDefault := filepath.Join(metadataRoot, "shared",
+		"metadata.db.corrupted."+now.Add(-1*time.Hour).Format(quarantineStampLayout))
+	// The stale quarantine carries a fresh modification time and the fresh one
+	// an old one: only the stamp may be consulted.
+	writeAgedQuarantine(t, olderThanDefault, 10, now)
+	writeAgedQuarantine(t, newerThanDefault, 10, now.Add(-100*time.Hour))
 
 	stats, err := service.CleanupInvalidDatabaseBackups(ctx)
 	if err != nil {
@@ -174,6 +184,113 @@ func TestCleanupInvalidDatabaseBackups_MissingRootIsBestEffort(t *testing.T) {
 	}
 	if stats.InvalidDatabaseBackupsRemoved != 1 {
 		t.Errorf("InvalidDatabaseBackupsRemoved = %d, want 1", stats.InvalidDatabaseBackupsRemoved)
+	}
+}
+
+// TestIsQuarantinedDatabaseName covers the quarantine-name matcher: only a
+// database file of the managed layout plus a parseable quarantine stamp is a
+// quarantine, so a legal tenant directory name that merely contains the marker
+// is never mistaken for one.
+func TestIsQuarantinedDatabaseName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		// Real quarantine names: "<db file>.corrupted.<stamp>", with the
+		// same-second collision suffix and the WAL/SHM sidecars of the file.
+		{name: "metadata.db.corrupted.20200101T000000Z", want: true},
+		{name: "metadata.db.corrupted.20200101T000000Z.1", want: true},
+		{name: "metadata.db.corrupted.20200101T000000Z.100", want: true},
+		{name: "quotas.db.corrupted.20200101T000000Z", want: true},
+		{name: "metadata.db-wal.corrupted.20200101T000000Z", want: true},
+		{name: "metadata.db-shm.corrupted.20200101T000000Z", want: true},
+		{name: "quotas.db-wal.corrupted.20200101T000000Z", want: true},
+		{name: "METADATA.DB.CORRUPTED.20200101T000000Z", want: true},
+
+		// Legal tenant identifiers that contain the marker. Each of these is a
+		// single, valid directory name below the metadata or quota root, so a
+		// match would delete a live tenant.
+		{name: "acme.corrupted.prod", want: false},
+		{name: "corrupted.prod", want: false},
+		{name: "acme.corrupted", want: false},
+		{name: "acme.corrupted.", want: false},
+		{name: "metadata.corrupted.prod", want: false},
+		{name: "metadata.corrupted.20200101T000000Z", want: false},
+		{name: "metadata.db.corrupted.prod", want: false},
+		{name: "metadata.db.corrupted", want: false},
+		{name: "metadata.db.corrupted.", want: false},
+		{name: "metadata.db.corrupted.20200101", want: false},
+		{name: "metadata.db.corrupted.20200101T000000Z.bak", want: false},
+		{name: "acme.corrupted.20200101T000000Z", want: false},
+		{name: "acme.metadata.db.corrupted.20200101T000000Z", want: false},
+		{name: "quotas.db.corrupted.prod", want: false},
+
+		// Live databases and unrelated names.
+		{name: "metadata.db", want: false},
+		{name: "quotas.db", want: false},
+		{name: "acme", want: false},
+		{name: ".corrupted.20200101T000000Z", want: false},
+		{name: "corrupted", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isQuarantinedDatabaseName(test.name); got != test.want {
+				t.Fatalf("isQuarantinedDatabaseName(%q) = %v, want %v", test.name, got, test.want)
+			}
+		})
+	}
+}
+
+// TestCleanupInvalidDatabaseBackups_RetainsTenantDirectoryNamedLikeQuarantine is
+// the regression test for the sweep deleting live tenant data: a tenant ID may
+// contain interior dots, so a tenant directory named "acme.corrupted.prod" is a
+// legal database directory and must survive an expired-retention sweep while a
+// real quarantine in the same tree is removed.
+func TestCleanupInvalidDatabaseBackups_RetainsTenantDirectoryNamedLikeQuarantine(t *testing.T) {
+	ctx := context.Background()
+
+	service, metadataRoot, quotaRoot := newQuarantineSweepService(t, time.Hour)
+
+	stale := time.Now().Add(-100 * time.Hour)
+
+	tenantID := "acme.corrupted.prod"
+	tenantDatabase := filepath.Join(metadataRoot, tenantID, "metadata.db")
+	tenantQuotaDatabase := filepath.Join(quotaRoot, tenantID, "quotas.db")
+	writeAgedQuarantine(t, tenantDatabase, 4096, stale)
+	writeAgedQuarantine(t, tenantQuotaDatabase, 1024, stale)
+
+	// The real quarantine proves the sweep still does its job in this tree.
+	realQuarantine := filepath.Join(metadataRoot, tenantID, "metadata.db.corrupted.20200101T000000Z")
+	writeAgedQuarantine(t, realQuarantine, 256, stale)
+
+	// The aged tenant directories themselves carry the quarantine-shaped name
+	// too, and their modification time is what the sweep evaluates. This is set
+	// last, after the fixtures above touched the directories.
+	for _, directory := range []string{filepath.Join(metadataRoot, tenantID), filepath.Join(quotaRoot, tenantID)} {
+		if err := os.Chtimes(directory, stale, stale); err != nil {
+			t.Fatalf("Chtimes(%s) error = %v", directory, err)
+		}
+	}
+
+	stats, err := service.CleanupInvalidDatabaseBackups(ctx)
+	if err != nil {
+		t.Fatalf("CleanupInvalidDatabaseBackups() error = %v", err)
+	}
+	if stats.InvalidDatabaseBackupsRemoved != 1 {
+		t.Errorf("InvalidDatabaseBackupsRemoved = %d, want 1 (only the real quarantine)", stats.InvalidDatabaseBackupsRemoved)
+	}
+	if wantFreed := int64(256); stats.SpaceFreed != wantFreed {
+		t.Errorf("SpaceFreed = %d, want %d", stats.SpaceFreed, wantFreed)
+	}
+
+	for _, retained := range []string{tenantDatabase, tenantQuotaDatabase, filepath.Join(metadataRoot, tenantID)} {
+		if _, statErr := os.Stat(retained); statErr != nil {
+			t.Errorf("tenant path %s was removed by the sweep, stat error = %v", retained, statErr)
+		}
+	}
+	if _, statErr := os.Stat(realQuarantine); !os.IsNotExist(statErr) {
+		t.Errorf("expired quarantine %s still exists, stat error = %v", realQuarantine, statErr)
 	}
 }
 

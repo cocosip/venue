@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -67,11 +68,13 @@ type SourceCleanupJob struct {
 	AttemptCount      int
 	NextAttemptAt     time.Time
 	State             SourceCleanupJobState
-	LastError         string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	LeaseUntil        time.Time
-	LeaseToken        string
+	// LastError is the recorded failure type, never a raw error message: it is
+	// returned to callers, and a filesystem error embeds full physical paths.
+	LastError  string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	LeaseUntil time.Time
+	LeaseToken string
 }
 
 // SourceCleanupStoreOptions controls the durable source cleanup store.
@@ -98,6 +101,20 @@ type SourceCleanupStore interface {
 type sqliteSourceCleanupStore struct {
 	db            *sql.DB
 	maxActiveJobs int
+
+	// statSource inspects a job's source path before a terminal row is pruned.
+	// It is injectable so the prune's "source is gone" rule can be exercised
+	// with the transient stat failures Windows produces; nil selects os.Stat.
+	statSource func(string) (os.FileInfo, error)
+}
+
+// sourceStat inspects a source path, using the injected stat when one is set.
+func (s *sqliteSourceCleanupStore) sourceStat(path string) (os.FileInfo, error) {
+	if s.statSource != nil {
+		return s.statSource(path)
+	}
+
+	return os.Stat(path)
 }
 
 const sourceCleanupSchema = `
@@ -384,9 +401,12 @@ func (s *sqliteSourceCleanupStore) updateLeaseState(ctx context.Context, job Sou
 	if !next.IsZero() {
 		nextUnix = next.UnixNano()
 	}
+	// last_error records the error type, never its message. SourceCleanupJob is
+	// returned to callers, and a filesystem error embeds the full physical path
+	// and the original file name, which the logging and reporting rules forbid.
 	message := ""
 	if actionErr != nil {
-		message = actionErr.Error()
+		message = fmt.Sprintf("%T", actionErr)
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE source_cleanup_jobs SET state = ?, attempt_count = attempt_count + 1, next_attempt_unix_nano = ?, last_error = ?, lease_until_unix_nano = 0, lease_token = '', updated_unix_nano = ? WHERE id = ? AND lease_token = ?`, state, nextUnix, message, time.Now().UnixNano(), job.JobID, job.LeaseToken)
 	if err != nil {
@@ -501,9 +521,14 @@ func (s *sqliteSourceCleanupStore) PruneTerminal(ctx context.Context, before tim
 	count := 0
 	for _, candidate := range candidates {
 		// A Kept job keeps its source; a Failed job does not necessarily (the
-		// action may have partially completed). Only an existing source file
-		// protects a row from pruning, so the tombstone tracks reality.
-		if _, statErr := os.Stat(candidate.sourcePath); statErr == nil {
+		// action may have partially completed). Only a source file that is
+		// confirmed absent permits pruning, so the tombstone tracks reality.
+		//
+		// Every other stat outcome keeps the row: a stat that failed for another
+		// reason (a transient Windows sharing violation, an unreadable parent)
+		// says nothing about the source, and retiring the tombstone on it would
+		// let the next scan re-import the same file.
+		if _, statErr := s.sourceStat(candidate.sourcePath); !errors.Is(statErr, fs.ErrNotExist) {
 			continue
 		}
 		result, delErr := s.db.ExecContext(ctx, `DELETE FROM source_cleanup_jobs WHERE id = ? AND state IN (?, ?)`, candidate.id, SourceCleanupStateFailed, SourceCleanupStateKept)

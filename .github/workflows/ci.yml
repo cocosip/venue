@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test
@@ -18,16 +22,20 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        go: ['1.27']
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
 
+    # go.mod declares go 1.26.0, which stays the minimum version for library
+    # consumers. CI installs 1.27 here (not 1.26) because golangci-lint v2.14.0
+    # is itself built with go1.27 and cannot analyse the module on an older
+    # toolchain; the test matrix and the lint job must share that toolchain so a
+    # green test run means the same thing in both. See README "Requirements".
     - name: Set up Go
       uses: actions/setup-go@v7
       with:
-        go-version: ${{ matrix.go }}
+        go-version: '1.27'
         cache: true
 
     - name: Download dependencies
@@ -55,29 +63,11 @@ jobs:
         flags: unittests
         name: codecov-umbrella
 
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v7
-
-    - name: Set up Go
-      uses: actions/setup-go@v7
-      with:
-        go-version: '1.27'
-        cache: true
-
-    # golangci-lint v2.14.0 is built with go1.27, so the CI toolchain is 1.27.
-    - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v9
-      with:
-        version: v2.14.0
-        args: --timeout=10m
-
-  build:
-    name: Build
+  # Build, vet, gofmt and whitespace are one job because they share a single
+  # checkout and toolchain; splitting them re-downloads the module cache for
+  # every check that needs nothing but the source tree.
+  verify:
+    name: Verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -93,6 +83,11 @@ jobs:
     - name: Build
       run: go build -v ./...
 
+    # The SQLite driver is pure Go, so the runtime must keep building with CGO
+    # disabled. This is the invariant that makes the prebuilt binaries portable.
+    - name: Build (CGO disabled)
+      run: CGO_ENABLED=0 go build -v ./...
+
     - name: Vet
       run: go vet ./...
 
@@ -103,3 +98,51 @@ jobs:
 
     - name: Check whitespace errors
       run: git diff --check
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.27'
+        cache: true
+
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.14.0
+        args: --timeout=10m
+
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'pull_request'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.27'
+        cache: true
+
+    # setup/teardown is excluded by -run='^$'; the system benchmarks must
+    # initialize through venue.NewVenue, so keep per-benchmark allocations
+    # visible with -benchmem.
+    - name: Run benchmarks
+      run: go test -bench=. -benchmem -run='^$' ./test/benchmark/... > benchmark_results.txt
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v7
+      with:
+        name: benchmark-results
+        path: benchmark_results.txt
+        retention-days: 90

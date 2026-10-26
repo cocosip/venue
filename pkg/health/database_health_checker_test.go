@@ -3,9 +3,11 @@ package health
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -526,6 +528,101 @@ func TestDatabaseHealthChecker_CorruptQuotaDatabaseIsReported(t *testing.T) {
 	}
 	if status.DatabasePath != volume.quotaDatabasePath(tenantID) {
 		t.Fatalf("status.DatabasePath = %q, want the per-tenant quota database path", status.DatabasePath)
+	}
+}
+
+// cancelAfterContext reports context.Canceled from its Err() method once a
+// budget of Err() calls is exhausted, which simulates a check deadline expiring
+// part-way through a scan instead of before it starts.
+type cancelAfterContext struct {
+	context.Context
+
+	budget int
+	mu     sync.Mutex
+	calls  int
+}
+
+func (c *cancelAfterContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.calls++
+	if c.calls > c.budget {
+		return context.Canceled
+	}
+
+	return nil
+}
+
+// TestDatabaseHealthChecker_CancelledScanIsNotHealthy proves a check that was
+// cut short never reports a healthy deployment and never misreports a database
+// as corrupted.
+//
+// checkDirectoryQuotaDatabases and checkMetadataDatabases both stop silently when
+// the context is cancelled, so without an explicit AllHealthy=false a partial
+// scan reads exactly like a clean one — and the health service then logs "No
+// database files found" over databases it never inspected.
+//
+// The cancellation is deterministic rather than budgeted: the context is
+// cancelled from inside the volume's own scan, so it is guaranteed to expire
+// while databases are still being inspected.
+func TestDatabaseHealthChecker_CancelledScanIsNotHealthy(t *testing.T) {
+	const tenants = 6
+
+	volume := newSQLiteVolume(t)
+	for i := 0; i < tenants; i++ {
+		tenantID := fmt.Sprintf("tenant-%d", i)
+		writeValidSQLiteDatabase(t, volume.metadataDatabasePath(tenantID))
+		writeValidSQLiteDatabase(t, volume.quotaDatabasePath(tenantID))
+	}
+
+	checker := newChecker(t, &DatabaseHealthCheckerOptions{
+		MetadataDataPath:       volume.metadataRoot,
+		DirectoryQuotaDataPath: volume.quotaRoot,
+	})
+
+	// Baseline: the same deployment reports healthy when nothing is cancelled,
+	// so the assertions below are about the cancellation, not a broken fixture.
+	complete, err := checker.CheckAllDatabases(context.Background())
+	if err != nil {
+		t.Fatalf("CheckAllDatabases() error = %v", err)
+	}
+	if !complete.AllHealthy {
+		t.Fatalf("baseline AllHealthy = false, want a clean deployment")
+	}
+
+	for _, test := range []struct {
+		name string
+		// cancelAfter is the number of Err() calls answered "not cancelled"
+		// before the context starts reporting cancellation.
+		cancelAfter int
+	}{
+		{name: "cancelled during the metadata scan", cancelAfter: 2},
+		{name: "cancelled during the quota scan", cancelAfter: tenants + 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := &cancelAfterContext{Context: context.Background(), budget: test.cancelAfter}
+
+			report, err := checker.CheckAllDatabases(ctx)
+			if err != nil {
+				t.Fatalf("CheckAllDatabases() error = %v, want a partial report rather than a hard failure", err)
+			}
+			if report == nil {
+				t.Fatal("CheckAllDatabases() = nil report, want a partial report")
+			}
+
+			if report.AllHealthy {
+				t.Fatalf("AllHealthy = true with %d healthy databases after the check was cancelled, want false",
+					report.HealthyDatabases)
+			}
+
+			// A cancellation says nothing about the files, so it must never be
+			// reported as corruption.
+			if len(report.CorruptedDatabases) != 0 {
+				t.Fatalf("CorruptedDatabases = %d entries after a cancellation (%q), want none: a cancelled inspection is not corruption",
+					len(report.CorruptedDatabases), report.CorruptedDatabases[0].Error)
+			}
+		})
 	}
 }
 

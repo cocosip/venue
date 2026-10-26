@@ -1589,11 +1589,6 @@ type SqliteConfig struct {
     // committed write batch. It bounds WAL growth at the cost of extra I/O.
     CheckpointAfterBatch bool `json:"checkpointAfterBatch" yaml:"checkpointAfterBatch" mapstructure:"checkpointAfterBatch"`
 
-    // MaxOpenConns is the connection limit of each tenant's *sql.DB. Keep it at
-    // 1: the repository serializes every statement of a tenant on one
-    // connection, mirroring Locus's single long-lived connection per tenant.
-    MaxOpenConns int `json:"maxOpenConns" yaml:"maxOpenConns" mapstructure:"maxOpenConns"`
-
     // MaxOpenDatabases bounds how many tenant database handles stay open at the
     // same time. Zero means unlimited: every tenant that was touched keeps its
     // handle until Close, which is Locus's behavior.
@@ -1662,7 +1657,6 @@ type SqliteConfig struct {
 | `CacheSizeKb` | `-4000` | `SqliteOptions.CacheSizeKb = -4000` (`:35`) |
 | `BusyTimeoutMs` | `5000` | `SqliteOptions.BusyTimeoutMs = 5000` (`:42`) |
 | `CheckpointAfterBatch` | `false` | `SqliteOptions.CheckpointAfterBatch = false` (`:53`) |
-| `MaxOpenConns` | `1` | `Pooling=False` + a single long-lived connection (`:66-69`) |
 | `MaxOpenDatabases` | `0` (unlimited) | Each tenant's handle stays alive (`:600-676`'s `_databases`) |
 | `OpenDatabaseIdleTimeout` | `0` (no reclamation) | same |
 | `RecoverCorruptedDatabase` | `false` | keeps the current default (`config.go:504`) |
@@ -1702,9 +1696,6 @@ func validateSqlite(s *SqliteConfig) error {
     if s.BusyTimeoutMs < 0 {
         return fmt.Errorf("Sqlite.BusyTimeoutMs cannot be negative")
     }
-    if s.MaxOpenConns < 1 {
-        return fmt.Errorf("Sqlite.MaxOpenConns must be at least 1")
-    }
     if s.MaxOpenDatabases < 0 {
         return fmt.Errorf("Sqlite.MaxOpenDatabases cannot be negative")
     }
@@ -1732,7 +1723,7 @@ func validateSqlite(s *SqliteConfig) error {
 
 Rules inherited from `validateBadgerDB`: non-negative retention, and auto-restore requires a backup directory (`config.go:1015-1026`).
 
-**`ApplyDefaults` changes** (corresponding to `config.go:687-695`): the zero-value fallback logic for `CorruptedDatabaseRetention` / `BackupInterval` / `BackupRetention` is retained; new entries cover the empty-string fallbacks for `JournalMode` / `SynchronousMode`, `MaxOpenConns == 0 → 1`, `CacheSizeKb == 0 → -4000`, and the **explicit handling problem** of the `VerifyBackup` boolean default: a boolean field cannot distinguish "not set" from "explicitly false" through zero-value fallback (the same defect class `config.ApplyDefaults` already has for default-true booleans). **Decision**: give `VerifyBackup` pointer semantics or invert it — this design inverts the semantics to `SkipBackupVerification bool` (default `false`, i.e. "verify by default") to escape the zero-value ambiguity entirely. The example YAML exposes `skipBackupVerification`. This is a deliberate correction of an existing configuration defect.
+**`ApplyDefaults` changes** (corresponding to `config.go:687-695`): the zero-value fallback logic for `CorruptedDatabaseRetention` / `BackupInterval` / `BackupRetention` is retained; new entries cover the empty-string fallbacks for `JournalMode` / `SynchronousMode` and `CacheSizeKb == 0 → -4000`, and the **explicit handling problem** of the `VerifyBackup` boolean default: a boolean field cannot distinguish "not set" from "explicitly false" through zero-value fallback (the same defect class `config.ApplyDefaults` already has for default-true booleans). **Decision**: give `VerifyBackup` pointer semantics or invert it — this design inverts the semantics to `SkipBackupVerification bool` (default `false`, i.e. "verify by default") to escape the zero-value ambiguity entirely. The example YAML exposes `skipBackupVerification`. This is a deliberate correction of an existing configuration defect.
 
 > By the same reasoning, `OptimizeIdleTenantDatabases` defaults to `false`, which coincides with its zero value and has no ambiguity, so it stays a plain `bool`.
 
@@ -1782,7 +1773,6 @@ source.SetDefault("sqliteOptions.synchronousMode", defaults.Sqlite.SynchronousMo
 source.SetDefault("sqliteOptions.cacheSizeKb", defaults.Sqlite.CacheSizeKb)
 source.SetDefault("sqliteOptions.busyTimeoutMs", defaults.Sqlite.BusyTimeoutMs)
 source.SetDefault("sqliteOptions.checkpointAfterBatch", defaults.Sqlite.CheckpointAfterBatch)
-source.SetDefault("sqliteOptions.maxOpenConns", defaults.Sqlite.MaxOpenConns)
 source.SetDefault("sqliteOptions.recoverCorruptedDatabase", defaults.Sqlite.RecoverCorruptedDatabase)
 source.SetDefault("sqliteOptions.corruptedDatabaseRetention", defaults.Sqlite.CorruptedDatabaseRetention)
 source.SetDefault("sqliteOptions.backupDirectory", defaults.Sqlite.BackupDirectory)
@@ -1808,7 +1798,6 @@ func (c *SqliteConfig) WithSynchronousMode(value string) *SqliteConfig
 func (c *SqliteConfig) WithCacheSizeKb(value int) *SqliteConfig
 func (c *SqliteConfig) WithBusyTimeout(value time.Duration) *SqliteConfig
 func (c *SqliteConfig) WithCheckpointAfterBatch(enabled bool) *SqliteConfig
-func (c *SqliteConfig) WithMaxOpenConns(value int) *SqliteConfig
 func (c *SqliteConfig) WithMaxOpenDatabases(value int) *SqliteConfig
 func (c *SqliteConfig) WithOpenDatabaseIdleTimeout(value time.Duration) *SqliteConfig
 func (c *SqliteConfig) WithCorruptedDatabaseRecovery(enabled bool) *SqliteConfig
@@ -1842,9 +1831,6 @@ Replace the `badgerDBOptions` block in `venue-config-example.yaml`:
     # Run PRAGMA wal_checkpoint(PASSIVE) after every committed batch. Bounds WAL growth
     # at the cost of extra I/O.
     checkpointAfterBatch: false
-    # Connection limit of each tenant's *sql.DB. Keep it at 1: every statement runs
-    # serially on the same connection.
-    maxOpenConns: 1
     # Upper bound on simultaneously open tenant database handles. 0 = unlimited
     # (the default: handles live until Close).
     maxOpenDatabases: 0

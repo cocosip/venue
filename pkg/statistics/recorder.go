@@ -512,11 +512,14 @@ func aggregateOrderKey(a aggregateKey) string {
 }
 
 // prune removes every bucket older than now - Retention - WindowSize.
+//
+// The scan runs outside r.mu and deletes with LoadAndDelete, so the only work
+// under the lock is the counter adjustment. Holding r.mu across a full sync.Map
+// range used to stall every new series creation (cell() needs the same lock)
+// behind an O(series) scan on the record path, which is exactly the blocking the
+// package promises never to do.
 func (r *Recorder) prune(now time.Time) {
 	cutoff := now.Add(-r.opts.Retention - r.opts.WindowSize).UnixNano()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	removed := 0
 
@@ -526,13 +529,26 @@ func (r *Recorder) prune(now time.Time) {
 			return true
 		}
 
-		if key.bucket < cutoff {
-			r.series.Delete(rawKey)
+		if key.bucket >= cutoff {
+			return true
+		}
+
+		// LoadAndDelete is the single atomic gate: only the goroutine that
+		// actually removes the entry counts it, so a concurrent prune cannot
+		// decrement the live-series counter twice for one key.
+		if _, loaded := r.series.LoadAndDelete(rawKey); loaded {
 			removed++
 		}
 
 		return true
 	})
+
+	if removed == 0 {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.count -= removed
 	if r.count < 0 {

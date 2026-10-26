@@ -15,6 +15,14 @@ import (
 // FileSchedulerOptions configures the file scheduler.
 type FileSchedulerOptions struct {
 	// RetryPolicy defines the retry behavior for failed files.
+	//
+	// MaxRetryCount is the number of retries allowed after a failure, so a file
+	// is retried MaxRetryCount times and becomes PermanentlyFailed on the
+	// failure that follows the last retry. A nil policy selects
+	// core.DefaultFileRetryPolicy. An individual non-positive
+	// InitialRetryDelay or MaxRetryDelay cannot express a usable backoff, so
+	// NewFileScheduler replaces it with the corresponding default instead of
+	// failing construction; every other field is used verbatim.
 	RetryPolicy *core.FileRetryPolicy
 
 	// ProcessingTimeout is the duration after which a Processing file is considered timed out.
@@ -199,6 +207,22 @@ func NewFileScheduler(
 	if opts.RetryPolicy == nil {
 		opts.RetryPolicy = core.DefaultFileRetryPolicy()
 	}
+
+	// A non-positive delay cannot express a usable backoff: a zero
+	// MaxRetryDelay makes CalculateRetryDelay return zero for every retry (a
+	// tight retry loop) and a negative InitialRetryDelay yields an
+	// availableAt in the past. Both are repaired rather than rejected so a
+	// partially hand-built policy still starts. The policy is copied first so
+	// the caller's value is never mutated.
+	retryDefaults := core.DefaultFileRetryPolicy()
+	clampedPolicy := *opts.RetryPolicy
+	if clampedPolicy.InitialRetryDelay <= 0 {
+		clampedPolicy.InitialRetryDelay = retryDefaults.InitialRetryDelay
+	}
+	if clampedPolicy.MaxRetryDelay <= 0 {
+		clampedPolicy.MaxRetryDelay = retryDefaults.MaxRetryDelay
+	}
+	opts.RetryPolicy = &clampedPolicy
 
 	if opts.ProcessingTimeout == 0 {
 		opts.ProcessingTimeout = 30 * time.Minute
@@ -731,6 +755,13 @@ func (s *fileScheduler) transitionToProcessing(ctx context.Context, file *core.F
 // the completion's volume assignment does not have to read the metadata again
 // (a completed record is uncached by design, so that read would be a fresh
 // transaction).
+//
+// Only a real completion is reported as success. A repository that answers with
+// the stored record and a nil error without applying the update — the
+// released-lease no-op of core.MetadataRepository.CompareAndUpdateProcessing — is
+// surfaced as core.ErrProcessingLeaseMismatch, because the file was not completed
+// and will be processed again. Callers can therefore record completion statistics
+// only when this call returns nil.
 func (s *fileScheduler) MarkAsCompleted(ctx context.Context, lease core.FileProcessingLease) (*core.FileMetadata, error) {
 	if lease.TenantID == "" {
 		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
@@ -753,6 +784,16 @@ func (s *fileScheduler) MarkAsCompleted(ctx context.Context, lease core.FileProc
 		return nil, fmt.Errorf("failed to complete processing lease: %w", err)
 	}
 
+	// A no-op release answers nil with the unchanged record. Reporting it as a
+	// completion would let a stale worker count work it did not do, and the
+	// caller would never learn that the file is still queued.
+	if metadata == nil || metadata.Status != core.FileStatusCompleted {
+		return nil, fmt.Errorf(
+			"completion did not transition the file to Completed: %w",
+			core.ErrProcessingLeaseMismatch,
+		)
+	}
+
 	return metadata, nil
 }
 
@@ -773,7 +814,12 @@ func (s *fileScheduler) MarkAsFailed(ctx context.Context, lease core.FileProcess
 		metadata.UpdatedAt = now
 		metadata.ProcessingStartTime = nil
 
-		if metadata.RetryCount >= s.retryPolicy.MaxRetryCount {
+		// MaxRetryCount is the retry budget, measured as the number of retries
+		// a file may still accrue: a file with RetryCount already at the budget
+		// is not retried again, so MaxRetryCount=3 allows retries 1, 2 and 3 and
+		// makes the fourth failure terminal. Comparing before the increment
+		// keeps that reading exact.
+		if metadata.RetryCount > s.retryPolicy.MaxRetryCount {
 			metadata.Status = core.FileStatusPermanentlyFailed
 			metadata.AvailableForProcessingAt = nil
 			return nil
@@ -827,6 +873,14 @@ func (s *fileScheduler) GetFileStatus(ctx context.Context, tenant core.TenantCon
 // the recovered file invisible. Files whose processing lease was replaced
 // concurrently are skipped, and a request that is canceled mid-loop returns
 // ctx.Err() with the count reached so far.
+//
+// A zero timeout selects the scheduler's configured ProcessingTimeout. A negative
+// timeout is rejected with core.ErrInvalidArgument: it would invert the cutoff
+// into the future and reset files that are actively being processed, which the
+// lease check cannot catch because a live worker's lease still matches.
+//
+// Only an expected per-file lease mismatch is skipped; any other repository
+// failure reaches the caller together with the count reached so far.
 func (s *fileScheduler) ResetTimedOutFiles(ctx context.Context, tenant core.TenantContext, timeout time.Duration) (int, error) {
 	if tenant.ID == "" {
 		return 0, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
@@ -834,6 +888,9 @@ func (s *fileScheduler) ResetTimedOutFiles(ctx context.Context, tenant core.Tena
 	// Use configured timeout if not specified
 	if timeout == 0 {
 		timeout = s.processingTimeout
+	}
+	if timeout < 0 {
+		return 0, fmt.Errorf("timeout cannot be negative: %w", core.ErrInvalidArgument)
 	}
 
 	// Unbounded scan: the cleanup cycle is expected to drain the whole set.
@@ -847,10 +904,18 @@ func (s *fileScheduler) ResetTimedOutFiles(ctx context.Context, tenant core.Tena
 // empty-queue reclaim and the opportunistic background pass use to cap one
 // attempt; the bound is pushed into the repository query so a bounded pass
 // never materializes the whole timed-out set. limit <= 0 examines them all,
-// which is the drain-everything contract of ResetTimedOutFiles. The reset is
-// intentionally best-effort per file so one lease mismatch does not abort the
-// rest of the scan.
+// which is the drain-everything contract of ResetTimedOutFiles.
+//
+// A negative timeout is rejected with core.ErrInvalidArgument for the reason
+// documented on ResetTimedOutFiles. A per-file lease mismatch is skipped, because
+// it is the expected outcome of losing a race against a newer claim; any other
+// failure stops the scan and is returned with the count reached so far, so an
+// infrastructure failure is never reported as a successful partial reset.
 func (s *fileScheduler) resetTimedOutProcessingFiles(ctx context.Context, tenantID string, timeout time.Duration, limit int) (int, error) {
+	if timeout < 0 {
+		return 0, fmt.Errorf("timeout cannot be negative: %w", core.ErrInvalidArgument)
+	}
+
 	// Get timed out files
 	timedOutFiles, err := s.metadataRepo.GetTimedOutProcessingFiles(ctx, tenantID, timeout, limit)
 	if err != nil {
@@ -888,7 +953,12 @@ func (s *fileScheduler) resetTimedOutProcessingFiles(ctx context.Context, tenant
 			return nil
 		})
 		if err != nil {
-			continue
+			if errors.Is(err, core.ErrProcessingLeaseMismatch) {
+				// The candidate was reclaimed by a newer claim after the scan;
+				// that is the expected race, not a failure of this pass.
+				continue
+			}
+			return resetCount, fmt.Errorf("failed to reset timed out file %q: %w", file.FileKey, err)
 		}
 
 		resetCount++

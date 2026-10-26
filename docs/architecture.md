@@ -47,7 +47,7 @@ Dependencies point upward: `config`/`core` → base implementations (`tenant`/`m
 | Package | Responsibility | Key files | Public entry points (constructors/interfaces) | Explicitly not responsible for |
 | --- | --- | --- | --- | --- |
 | `config` | Public, configuration-source-independent runtime model: defaults, validation, cloning, fluent construction | `config/config.go`, `config/fluent.go` | `config.New`/`config.DefaultConfig` (`config/config.go:526`, `config/config.go:531`), `(*Config).Clone` (`config/config.go:1356`), `ApplyDefaults` (`config/config.go:661`), `Validate` (`config/config.go:896`), all `With...`/`Add...` (`config/fluent.go:10`, `config/fluent.go:80`, `config/fluent.go:91`) | It does not import Viper and does not perform file I/O (`AGENTS.md:65`; verified: among non-test files only `viperconfig/viper.go:10` and `examples/viper-config/main.go:13` import `spf13/viper`) |
-| `viperconfig` | Optional Viper → `config.Config` adapter; `NewWithDefaults` seeds every documented key, including the statistics, watcher-service, cleanup-reclaim, startup-fail-fast and metadata-backup keys (`viperconfig/viper.go:78`, `:97-99`, `:108-126`, `:130-132`) | `viperconfig/viper.go` | `Load` (`viperconfig/viper.go:14`), `LoadFromFile` (`:35`), `LoadFromFileSection` (`:41`), `LoadSection` (`:56`), `NewWithDefaults` (`:69-151`) | It does not own environment variables or reload policy, and does not define a second configuration model (`AGENTS.md:67`) |
+| `viperconfig` | Optional Viper → `config.Config` adapter; every load path seeds the result from `config.DefaultConfig()`, so no per-key default list has to be maintained here (`viperconfig/viper.go:22-41`) | `viperconfig/viper.go` | `Load` (`viperconfig/viper.go:22`), `LoadFromFile` (`:43`), `LoadFromFileSection` (`:53`), `LoadSection` (`:71`), `ErrSectionNotFound` (`:15`) | It does not own environment variables or reload policy, and does not define a second configuration model (`AGENTS.md:67`). A named section that is absent is reported as `ErrSectionNotFound` rather than silently binding the whole document. |
 | `pkg/core` | Public interfaces, shared models, status enums, domain errors | `pkg/core/interfaces.go`, `pkg/core/models.go`, `pkg/core/errors.go`, `pkg/core/tenantid.go`, `pkg/core/orphan.go` | Interfaces (from `pkg/core/interfaces.go:12`), `ValidateTenantID` (`pkg/core/tenantid.go:40`), sentinel errors (`pkg/core/errors.go:12-129`), parsers (`pkg/core/models.go:362`, `pkg/core/models.go:404`, `pkg/core/interfaces.go:625`), `DefaultFileRetryPolicy` (`pkg/core/models.go:433`) | It contains no implementation and imports no `pkg/*` (only the stdlib dependencies of `pkg/core/tenantid.go:1-8`) |
 | `pkg/tenant` | Tenant lifecycle, tenant metadata JSON storage, tenant context cache | `pkg/tenant/manager.go`, `pkg/tenant/metadata_store.go` | `tenant.NewTenantManager` (`pkg/tenant/manager.go:79`) | It does not own physical volumes, does not select volumes, and does not count quotas |
 | `pkg/metadata` | Metadata persistence in one SQLite database per tenant, keyset paging, active-record cache, file-level corruption quarantine, and per-tenant backup/restore | `pkg/metadata/sqlite_repository.go`, `sqlite_backup.go`, `sqlite_corruption.go`, `sqlite_paging.go`, `metadata_support.go`, `conflict_retry.go`, `cache.go` | `NewSQLiteMetadataRepository` (`pkg/metadata/sqlite_repository.go:394`, wired at `venue.go:354`); the optional capabilities are asserted at `pkg/metadata/sqlite_repository.go:378-383` (`core.StatusPageReader`, `core.MetadataBackupService`, `SQLiteMetadataTenantBackupService` declared at `:363-374`) | It does not select volumes and does not write physical payloads; it does not do quotas |
@@ -328,7 +328,7 @@ Consequently, `&config.Config{}` + `ApplyDefaults()` cannot restore the followin
 | `Volumes[i].EnableFsync` | true | `config/config.go:572` | No (it only fills Type/InitialDelay/HealthCheckDelay, `:823-833`) |
 | `Cleanup.CleanupEmptyDirectories` / `CleanupTimedOutFiles` / `CleanupPermanentlyFailedFiles` / `CleanupCompletedRecords` / `CleanupJunkFiles` / `CleanupInvalidDatabaseBackups` / `OptimizeDatabases` | all true | `config/config.go:590`, `:591`, `:595`, `:604`, `:609`, `:611`, `:613` | No (it only fills durations/batch sizes/enums/RootPath, `:693-728`) |
 | `Cleanup.EnableBackgroundTimedOutReclaim` | true | `config/config.go:619` | No. The trap is observable at runtime: the zero value reaches the scheduler as `false` and disables the opportunistic background pass (`pkg/scheduler/file_scheduler.go:508-512`, wiring `venue.go:494`) |
-| `Cleanup.DeadLetter.IncludeTenantInPath` / `IncludeDatePartition` | both true | `config/config.go:599`, `:600` | No (it only fills `RootPath` and `ShardingDepth`, `:723-728`) |
+| `Cleanup.DeadLetter.ExcludeTenantFromPath` / `ExcludeDatePartition` | both false | `config/config.go:526`, `:530` | No (it only fills `RootPath` and `ShardingDepth`, `:771-774`, `:834-837`). The fields are phrased as exclusions so the zero value matches the documented full layout instead of silently dropping segments. |
 | `FileWatcherService.Enabled` | true | `config/config.go:579` | No; the constructor itself is default-safe (it starts enabled unless told otherwise) and configuration can now really disable it at construction through `InitialEnabled` (`venue.go:651-657`, `pkg/watcher/background_file_watcher_service.go:269-279`); a persisted document still outranks that input (§6.5) |
 | `FileWatchers[i].Enabled` / `FileWatcherRoots[i].Enabled` | Caller-dependent; the configuration example sets true | `config/config.go:228`, `:283` | No |
 | `Statistics.Dimensions.VolumeID` / `WatcherID` / `Operation` | all true | `config/config.go:644`, `:645`, `:646` | No (it only fills WindowSize/Retention/MaxSeries/Output, `:753-770`) |
@@ -360,21 +360,21 @@ For contrast: the throttling/debounce switches of `config.FileWatcherConfig`/`Fi
 | --- | --- | --- |
 | `ErrTenantNotFound` | `:12` | `pkg/tenant/manager.go:150`, `:198` |
 | `ErrTenantDisabled` | `:15` | `pkg/pool/storage_pool.go:205`, `pkg/scheduler/file_scheduler.go:266`, `:315` |
-| `ErrTenantSuspended` | `:18` | Not returned by any runtime code (definition only) |
+| `ErrTenantSuspended` | `:18` | **Deprecated**: no runtime code returns it (definition only) |
 | `ErrTenantAlreadyExists` | `:21` | `venue.go:328`, `pkg/tenant/manager.go:252` |
 | `ErrTenantQuotaExceeded` | `:26` | `pkg/quota/tenant_quota_manager.go:142` |
 | `ErrDirectoryQuotaExceeded` | `:29` | `pkg/quota/directory_quota_manager.go:66` |
 | `ErrInsufficientStorage` | `:34` | `pkg/pool/storage_pool.go:427`, `pkg/pool/volume_selector.go:55`, `:86`, `:116`, `:131`, `:153`, `:167` |
-| `ErrStorageVolumeUnavailable` / `ErrVolumeAlreadyMounted` | `:37`, `:40` | `ErrStorageVolumeUnavailable` is returned by `venue.waitForVolume` when a volume never answers two consecutive probes (`venue.go:246-251`); `ErrVolumeAlreadyMounted` remains definition only |
+| `ErrStorageVolumeUnavailable` / `ErrVolumeAlreadyMounted` | `:37`, `:40` | `ErrStorageVolumeUnavailable` is returned by `venue.waitForVolume` when a volume never answers two consecutive probes (`venue.go:246-251`); `ErrVolumeAlreadyMounted` is **deprecated**: no runtime return site |
 | `ErrFileNotFound` | `:45` | `pkg/metadata/sqlite_repository.go:597`, `:808`, `:913`; `pkg/volume/local_volume.go:413`, `:494` |
-| `ErrFileAlreadyProcessing` | `:48` | Definition only; no runtime return site |
+| `ErrFileAlreadyProcessing` | `:48` | **Deprecated**: no runtime code returns it |
 | `ErrNoFilesAvailable` | `:55` | **Deprecated**: an empty queue now returns `(nil, nil)` (comment `:50-54`) |
 | `ErrWatcherNotFound` | `:58` | `pkg/watcher/file_watcher.go:1274`, `:1279` |
-| `ErrInvalidFileKey` / `ErrFileAlreadyExists` | `:61`, `:64` | Definition only; no runtime return site |
+| `ErrInvalidFileKey` / `ErrFileAlreadyExists` | `:61`, `:64` | **Deprecated**: no runtime return site |
 | `ErrFileNotClaimable` | `:73` | `pkg/metadata/sqlite_repository.go:920`, `:924`, `:928`; semantic classification in `pkg/scheduler/file_scheduler.go:98-100` |
 | `ErrProcessingLeaseMismatch` | `:76` | Exposed by `FileProcessingLeaseMismatchError.Unwrap` (`:112-115`); constructed by `newLeaseMismatchError` (`pkg/metadata/metadata_support.go:64-80`) |
 | `ErrInvalidArgument` | `:120` | Argument validation across the repository |
-| `ErrOperationCanceled` | `:123` | Definition only; cancellation paths return `ctx.Err()` (for example `pkg/scheduler/file_scheduler.go:366-368`) |
+| `ErrOperationCanceled` | `:123` | **Deprecated**: cancellation paths return `ctx.Err()` (for example `pkg/scheduler/file_scheduler.go:366-368`) |
 | `ErrDatabaseError` | `:126` | `pkg/metadata/sqlite_repository.go:891`, `:1026`, `:1142`, `:1314`; `venue.go:1192` |
 | `ErrPathTraversalAttempt` | `:129` | `pkg/volume/path_sanitizer.go:48`, `:56`, `pkg/core/tenantid.go:87` |
 
@@ -436,7 +436,7 @@ FIFO is the index order of the `files` table, not a separately maintained struct
 | Write-ahead-log growth | `Sqlite.CheckpointAfterBatch` (`config/config.go:110-112`; default false at `:556`) | Not read by the engine layer: the repository that commits a batch is responsible for calling `PRAGMA wal_checkpoint(PASSIVE)` after a successful commit only (`pkg/sqlite/sqlite.go:132-140`, `:315-332`) |
 | Physical files | `VolumeConfig.EnableFsync` (`config/config.go:191`, default true at `config/config.go:572`) | `file.Sync()` after writing (`pkg/volume/local_volume.go:389-391`) |
 | Backup files | No switch | Every per-tenant backup is a complete `VACUUM INTO` copy, verified with `PRAGMA integrity_check(1)` (`pkg/metadata/sqlite_backup.go:87-131`); a restore stages a copy, `Sync`s it and only renames it onto the database path after it verifies (`pkg/metadata/sqlite_corruption.go:199-241`) |
-| Watcher runtime state / global options / root list | No switch | All use temp + `Sync` + rename (`pkg/watcher/watcher_state.go:180-209`, `pkg/watcher/background_file_watcher_service.go:977-1006`, `pkg/watcher/file_watcher_auto_manager.go:505-534`) |
+| Watcher runtime state / global options / root list | No switch | All use temp + `Sync` + rename (`saveWatcherStateLocked` in `pkg/watcher/watcher_state.go`, `persistOptions` in `pkg/watcher/background_file_watcher_service.go`, `persistRoots` in `pkg/watcher/file_watcher_auto_manager.go`) |
 | Import history | No switch | temp + rename only, with **no fsync** (`pkg/watcher/file_watcher.go:1389-1427`) |
 | Intermediate copy for cross-device moves | No switch | staging `Sync()` followed by rename (`pkg/volume/local_volume.go:578`) |
 

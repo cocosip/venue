@@ -135,7 +135,9 @@ func TestIntegration_FailedFileRetry(t *testing.T) {
 	// First attempt
 	location, _ := pool.GetNextFileForProcessing(ctx, tenant)
 
-	// The second failure reaches the configured retry limit.
+	// MaxRetryCount is the retry budget: with MaxRetryCount=2 the file may be
+	// retried twice, and the failure that follows the last retry is terminal.
+	// One retry is spent here; the remaining failure budget is exhausted below.
 	for i := 1; i <= 1; i++ {
 		err := pool.MarkAsFailed(ctx, requirePoolProcessingLease(t, location), "Test failure")
 		if err != nil {
@@ -147,9 +149,22 @@ func TestIntegration_FailedFileRetry(t *testing.T) {
 
 		// Get file again
 		location, _ = pool.GetNextFileForProcessing(ctx, tenant)
+		if location == nil {
+			t.Fatalf("retry %d: file is not available for processing, want a retry within the budget", i)
+		}
 	}
 
-	// Second failure should make it permanently failed.
+	// Spend the remaining retry, then the next failure is terminal.
+	if err := pool.MarkAsFailed(ctx, requirePoolProcessingLease(t, location), "Second failure"); err != nil {
+		t.Fatalf("Failed to mark as failed: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	location, _ = pool.GetNextFileForProcessing(ctx, tenant)
+	if location == nil {
+		t.Fatal("final retry: file is not available for processing, want the last retry to be consumed")
+	}
+
+	// The failure that follows the last retry makes it permanently failed.
 	err := pool.MarkAsFailed(ctx, requirePoolProcessingLease(t, location), "Final failure")
 	if err != nil {
 		t.Fatalf("Failed to mark as failed: %v", err)

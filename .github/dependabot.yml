@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Keep the workflow actions current; a stale major version silently stops
+  # receiving runner and Node runtime updates.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Group every Go module bump into one pull request so a dependency refresh
+  # arrives as a single reviewable change with one CI run.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "go"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"

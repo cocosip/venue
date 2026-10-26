@@ -9,6 +9,81 @@ import (
 	"time"
 )
 
+// countingSourceCleanupStore wraps a real store and counts the maintenance
+// passes that reach it, so a test can prove a cancelled worker runs none.
+type countingSourceCleanupStore struct {
+	SourceCleanupStore
+
+	recoverCalls atomic.Int32
+	pruneCalls   atomic.Int32
+	optimizeCall atomic.Int32
+}
+
+func (c *countingSourceCleanupStore) RecoverStaleImports(ctx context.Context, now time.Time, timeout time.Duration, keep func(SourceCleanupJob) bool) (int, error) {
+	c.recoverCalls.Add(1)
+	return c.SourceCleanupStore.RecoverStaleImports(ctx, now, timeout, keep)
+}
+
+func (c *countingSourceCleanupStore) PruneTerminal(ctx context.Context, before time.Time, limit int) (int, error) {
+	c.pruneCalls.Add(1)
+	return c.SourceCleanupStore.PruneTerminal(ctx, before, limit)
+}
+
+func (c *countingSourceCleanupStore) Optimize(ctx context.Context) error {
+	c.optimizeCall.Add(1)
+	return c.SourceCleanupStore.Optimize(ctx)
+}
+
+// TestSourceCleanupWorkerDoesNotRunAPassAfterCancellation proves a worker that
+// is stopped before its first tick performs no maintenance at all.
+//
+// The loop used to call processPass before its first select, so a Stop right
+// after Start still ran stale-import recovery, the terminal prune and
+// Optimize (a WAL checkpoint plus VACUUM) against an already-cancelled context,
+// which also logged spurious failures for a shutdown nobody asked to fail.
+func TestSourceCleanupWorkerDoesNotRunAPassAfterCancellation(t *testing.T) {
+	store, err := OpenSourceCleanupStore(context.Background(), filepath.Join(t.TempDir(), "cleanup.db"), SourceCleanupStoreOptions{MaxActiveJobs: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	}()
+
+	counting := &countingSourceCleanupStore{SourceCleanupStore: store}
+
+	worker, err := NewSourceCleanupWorker(SourceCleanupWorkerOptions{
+		Store: counting, PollingInterval: time.Hour, MaxConcurrentActions: 1,
+		ImportReservationTimeout: time.Minute, TerminalRetentionPeriod: time.Hour,
+		TerminalPruneBatchSize: 10, DatabaseOptimization: true,
+		DatabaseOptimizationInterval: time.Nanosecond,
+		Execute:                      func(context.Context, SourceCleanupJob) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel before the loop can observe a live context: the pass that ran
+	// before the first select saw exactly this state.
+	cancel()
+
+	worker.Start(ctx)
+	worker.Stop()
+
+	if got := counting.recoverCalls.Load(); got != 0 {
+		t.Fatalf("RecoverStaleImports calls = %d, want 0 for a cancelled worker", got)
+	}
+	if got := counting.pruneCalls.Load(); got != 0 {
+		t.Fatalf("PruneTerminal calls = %d, want 0 for a cancelled worker", got)
+	}
+	if got := counting.optimizeCall.Load(); got != 0 {
+		t.Fatalf("Optimize calls = %d, want 0 for a cancelled worker", got)
+	}
+}
+
 func TestSourceCleanupWorkerRetriesDueJobAndCompletesIt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cleanup.db")
 	store, err := OpenSourceCleanupStore(context.Background(), path, SourceCleanupStoreOptions{MaxActiveJobs: 10})

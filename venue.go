@@ -546,9 +546,12 @@ func (v *Venue) initialize() error {
 		Logging:                      v.logger,
 		PermanentlyFailedDisposition: disposition,
 		DeadLetter: cleanup.DeadLetterOptions{
-			RootPath:             v.config.Cleanup.DeadLetter.RootPath,
-			IncludeTenantInPath:  v.config.Cleanup.DeadLetter.IncludeTenantInPath,
-			IncludeDatePartition: v.config.Cleanup.DeadLetter.IncludeDatePartition,
+			RootPath: v.config.Cleanup.DeadLetter.RootPath,
+			// The configuration keeps the layout switches in negative form so
+			// their zero value means "keep the segment"; the cleanup options use
+			// the positive form, so the mapping is inverted here.
+			IncludeTenantInPath:  !v.config.Cleanup.DeadLetter.ExcludeTenantFromPath,
+			IncludeDatePartition: !v.config.Cleanup.DeadLetter.ExcludeDatePartition,
 			ShardingDepth:        v.config.Cleanup.DeadLetter.ShardingDepth,
 		},
 		RetiredVolumes:             retiredVolumes,

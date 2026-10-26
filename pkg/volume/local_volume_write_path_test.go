@@ -17,7 +17,7 @@ import (
 )
 
 // createWritePathVolume creates a volume with an explicit fsync setting so the
-// write-path observations can be asserted for both durability modes.
+// write-path durability behaviour can be asserted for both modes.
 func createWritePathVolume(t *testing.T, enableFsync bool) (*LocalFileSystemVolume, string) {
 	t.Helper()
 
@@ -67,19 +67,10 @@ func collectVolumeEntries(t *testing.T, root string) []string {
 	return entries
 }
 
-// failingReader fails a payload copy after the destination file was created, so
-// the failure happens inside the write path instead of before it.
-type failingReader struct{}
-
-// Read always reports an injected failure.
-func (failingReader) Read([]byte) (int, error) {
-	return 0, errors.New("injected read failure")
-}
-
-// TestLocalFileSystemVolume_NewOptionalCapabilitiesAreDiscoverable verifies the
-// three newly implemented capabilities are reachable through the
-// core.StorageVolume value that callers actually hold.
-func TestLocalFileSystemVolume_NewOptionalCapabilitiesAreDiscoverable(t *testing.T) {
+// TestLocalFileSystemVolume_WriteCapabilitiesAreDiscoverable verifies the
+// capabilities the runtime actually uses are reachable through the
+// core.StorageVolume value that callers hold.
+func TestLocalFileSystemVolume_WriteCapabilitiesAreDiscoverable(t *testing.T) {
 	volume, _ := createTestVolume(t, 2)
 
 	var storageVolume core.StorageVolume = volume
@@ -89,9 +80,6 @@ func TestLocalFileSystemVolume_NewOptionalCapabilitiesAreDiscoverable(t *testing
 	}
 	if _, ok := storageVolume.(core.StorageVolumeWritePathWarmup); !ok {
 		t.Error("LocalFileSystemVolume does not implement core.StorageVolumeWritePathWarmup")
-	}
-	if _, ok := storageVolume.(core.StorageVolumeWritePathDiagnostics); !ok {
-		t.Error("LocalFileSystemVolume does not implement core.StorageVolumeWritePathDiagnostics")
 	}
 }
 
@@ -208,22 +196,8 @@ func TestProbeHealth_CancelledOrNilContextIsUnsuccessful(t *testing.T) {
 	}
 }
 
-// TestProbeHealth_DoesNotDisturbWritePathStatistics verifies the health probe is
-// not counted as write-path work: it does not go through the volume write path.
-func TestProbeHealth_DoesNotDisturbWritePathStatistics(t *testing.T) {
-	ctx := context.Background()
-	volume, _ := createTestVolume(t, 0)
-
-	volume.ProbeHealth(ctx)
-	volume.IsHealthy(ctx)
-
-	if got := volume.WritePathStatistics(); got != (core.StorageVolumeWritePathStatistics{}) {
-		t.Errorf("write path statistics = %+v, want the zero snapshot after health probes only", got)
-	}
-}
-
-// TestWarmWritePathCache_LeavesNothingBehind verifies exactly one real write
-// happens and neither outcome leaves the throwaway file in the volume.
+// TestWarmWritePathCache_LeavesNothingBehind verifies the warmup write happens
+// and neither outcome leaves the throwaway file in the volume.
 func TestWarmWritePathCache_LeavesNothingBehind(t *testing.T) {
 	ctx := context.Background()
 
@@ -246,34 +220,12 @@ func TestWarmWritePathCache_LeavesNothingBehind(t *testing.T) {
 			if entries := collectVolumeEntries(t, mountDir); len(entries) != 0 {
 				t.Errorf("warmup left %v behind in the volume root, want nothing", entries)
 			}
-
-			stats := volume.WritePathStatistics()
-			if stats.TotalWrites != 1 {
-				t.Errorf("TotalWrites = %d, want 1 for one warmup write", stats.TotalWrites)
-			}
-			if stats.TotalBytes != int64(len(writeWarmupPayload)) {
-				t.Errorf("TotalBytes = %d, want %d", stats.TotalBytes, len(writeWarmupPayload))
-			}
-			if stats.FailedWrites != 0 {
-				t.Errorf("FailedWrites = %d, want 0", stats.FailedWrites)
-			}
-			if stats.CopyOperationCount != 1 {
-				t.Errorf("CopyOperationCount = %d, want 1", stats.CopyOperationCount)
-			}
-
-			wantFsync := int64(0)
-			if tc.enableFsync {
-				wantFsync = 1
-			}
-			if stats.FsyncCount != wantFsync {
-				t.Errorf("FsyncCount = %d, want %d", stats.FsyncCount, wantFsync)
-			}
 		})
 	}
 }
 
 // TestWarmWritePathCache_ReportsWriteFailure verifies a failed warmup write is
-// reported wrapped and is counted as a failed write.
+// reported wrapped.
 func TestWarmWritePathCache_ReportsWriteFailure(t *testing.T) {
 	ctx := context.Background()
 	volume, mountDir := createWritePathVolume(t, false)
@@ -293,14 +245,6 @@ func TestWarmWritePathCache_ReportsWriteFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "warmup write failed") {
 		t.Errorf("error = %v, want it to wrap the failed warmup write", err)
-	}
-
-	stats := volume.WritePathStatistics()
-	if stats.FailedWrites != 1 {
-		t.Errorf("FailedWrites = %d, want 1", stats.FailedWrites)
-	}
-	if stats.TotalWrites != 0 {
-		t.Errorf("TotalWrites = %d, want 0 for a failed warmup", stats.TotalWrites)
 	}
 }
 
@@ -354,149 +298,12 @@ func TestWarmWritePathCache_CancelledContextTouchesNothing(t *testing.T) {
 	if entries := collectVolumeEntries(t, mountDir); len(entries) != 0 {
 		t.Errorf("cancelled warmup created %v, want nothing", entries)
 	}
-
-	stats := volume.WritePathStatistics()
-	if stats.TotalWrites != 0 || stats.FailedWrites != 0 {
-		t.Errorf("statistics = %+v, want a skipped warmup to be uncounted", stats)
-	}
 }
 
-// TestWritePathStatistics_CountsRealWritePathWork verifies the counters that a
-// real successful write must move, including the fsync phase when enabled.
-func TestWritePathStatistics_CountsRealWritePathWork(t *testing.T) {
-	ctx := context.Background()
-	volume, _ := createWritePathVolume(t, true)
-
-	if got := volume.WritePathStatistics(); got != (core.StorageVolumeWritePathStatistics{}) {
-		t.Fatalf("fresh volume statistics = %+v, want the zero snapshot", got)
-	}
-
-	payloads := []struct {
-		relativePath string
-		content      string
-	}{
-		{relativePath: "first.txt", content: "hello"},
-		{relativePath: "nested/second.txt", content: "seventh"},
-	}
-
-	var wantBytes int64
-	for _, payload := range payloads {
-		written, err := volume.WriteFile(ctx, payload.relativePath, strings.NewReader(payload.content))
-		if err != nil {
-			t.Fatalf("WriteFile(%q) error = %v", payload.relativePath, err)
-		}
-		if written != int64(len(payload.content)) {
-			t.Fatalf("WriteFile(%q) = %d bytes, want %d", payload.relativePath, written, len(payload.content))
-		}
-		wantBytes += written
-	}
-
-	got := volume.WritePathStatistics()
-	if got.TotalWrites != int64(len(payloads)) {
-		t.Errorf("TotalWrites = %d, want %d", got.TotalWrites, len(payloads))
-	}
-	if got.TotalBytes != wantBytes {
-		t.Errorf("TotalBytes = %d, want %d", got.TotalBytes, wantBytes)
-	}
-	if got.FailedWrites != 0 {
-		t.Errorf("FailedWrites = %d, want 0", got.FailedWrites)
-	}
-	if got.DirectoryPreparationCount != int64(len(payloads)) {
-		t.Errorf("DirectoryPreparationCount = %d, want %d", got.DirectoryPreparationCount, len(payloads))
-	}
-	if got.CopyOperationCount != int64(len(payloads)) {
-		t.Errorf("CopyOperationCount = %d, want %d", got.CopyOperationCount, len(payloads))
-	}
-	if got.FsyncCount != int64(len(payloads)) {
-		t.Errorf("FsyncCount = %d, want %d while fsync is enabled", got.FsyncCount, len(payloads))
-	}
-	if got.DirectoryPreparationDuration < 0 || got.CopyDuration < 0 || got.FsyncDuration < 0 {
-		t.Errorf("durations must not be negative: %+v", got)
-	}
-}
-
-// TestWritePathStatistics_CountsFailedWrites verifies every failing write is
-// counted once and contributes no success counters.
-func TestWritePathStatistics_CountsFailedWrites(t *testing.T) {
-	ctx := context.Background()
-	volume, _ := createWritePathVolume(t, false)
-
-	if _, err := volume.WriteFile(ctx, "../escape.txt", strings.NewReader("x")); err == nil {
-		t.Fatal("expected the escaping path to be rejected")
-	}
-
-	stats := volume.WritePathStatistics()
-	if stats.FailedWrites != 1 {
-		t.Errorf("FailedWrites = %d, want 1 after a rejected path", stats.FailedWrites)
-	}
-	if stats.TotalWrites != 0 || stats.TotalBytes != 0 {
-		t.Errorf("statistics = %+v, want no successful write to be counted", stats)
-	}
-	if stats.DirectoryPreparationCount != 0 || stats.CopyOperationCount != 0 {
-		t.Errorf("statistics = %+v, want no phase observation for a rejected path", stats)
-	}
-
-	// A failure in the middle of the payload copy is a failed write too, and the
-	// copy phase it did perform is still observed.
-	if _, err := volume.WriteFile(ctx, "partial.txt", failingReader{}); err == nil {
-		t.Fatal("expected the failing reader to be reported")
-	}
-
-	stats = volume.WritePathStatistics()
-	if stats.FailedWrites != 2 {
-		t.Errorf("FailedWrites = %d, want 2 after a failed copy", stats.FailedWrites)
-	}
-	if stats.TotalWrites != 0 || stats.TotalBytes != 0 {
-		t.Errorf("statistics = %+v, want no successful write to be counted", stats)
-	}
-	if stats.CopyOperationCount != 1 {
-		t.Errorf("CopyOperationCount = %d, want 1 for the attempted copy", stats.CopyOperationCount)
-	}
-	if stats.FsyncCount != 0 {
-		t.Errorf("FsyncCount = %d, want 0 while fsync is disabled", stats.FsyncCount)
-	}
-}
-
-// TestWritePathStatistics_ReturnsIndependentCopy verifies a snapshot copy can be
-// mutated without changing the volume's counters.
-func TestWritePathStatistics_ReturnsIndependentCopy(t *testing.T) {
-	ctx := context.Background()
-	volume, _ := createWritePathVolume(t, true)
-
-	if _, err := volume.WriteFile(ctx, "payload.txt", strings.NewReader("abcdef")); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	before := volume.WritePathStatistics()
-	if before.TotalWrites != 1 || before.TotalBytes != 6 {
-		t.Fatalf("statistics = %+v, want one write of six bytes", before)
-	}
-
-	mutated := before
-	mutated.TotalWrites = -1
-	mutated.TotalBytes = -1
-	mutated.FailedWrites = -1
-	mutated.DirectoryPreparationCount = -1
-	mutated.DirectoryPreparationDuration = -1
-	mutated.CopyOperationCount = -1
-	mutated.CopyDuration = -1
-	mutated.FsyncCount = -1
-	mutated.FsyncDuration = -1
-
-	if mutated == before {
-		t.Fatal("the mutation did not change the copy, so the test is vacuous")
-	}
-
-	after := volume.WritePathStatistics()
-	if after != before {
-		t.Errorf("statistics = %+v, want the unchanged %+v", after, before)
-	}
-}
-
-// TestWriteCapabilities_ConcurrentProbeWriteAndStatistics exercises the probe,
-// the write path, the warmup and the diagnostics together so the race detector
-// can prove the counters need no lock and the health cache stays consistent.
-func TestWriteCapabilities_ConcurrentProbeWriteAndStatistics(t *testing.T) {
+// TestWriteCapabilities_ConcurrentProbeWriteAndWarmup exercises the probe, the
+// write path and the warmup together so the race detector can prove the health
+// cache stays consistent under concurrent use.
+func TestWriteCapabilities_ConcurrentProbeWriteAndWarmup(t *testing.T) {
 	ctx := context.Background()
 	volume, mountDir := createWritePathVolume(t, true)
 
@@ -504,7 +311,7 @@ func TestWriteCapabilities_ConcurrentProbeWriteAndStatistics(t *testing.T) {
 		probers   = 4
 		writers   = 4
 		iteration = 8
-		wantBytes = "payload"
+		payload   = "payload"
 	)
 
 	var (
@@ -536,23 +343,14 @@ func TestWriteCapabilities_ConcurrentProbeWriteAndStatistics(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iteration; j++ {
 				relativePath := fmt.Sprintf("concurrent-%d-%d.txt", worker, j)
-				if _, err := volume.WriteFile(ctx, relativePath, strings.NewReader(wantBytes)); err != nil {
+				if _, err := volume.WriteFile(ctx, relativePath, strings.NewReader(payload)); err != nil {
 					t.Errorf("WriteFile(%q) error = %v", relativePath, err)
 					continue
 				}
 				successes.Add(1)
-				_ = volume.WritePathStatistics()
 			}
 		}(i)
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for j := 0; j < iteration*2; j++ {
-			_ = volume.WritePathStatistics()
-		}
-	}()
 
 	wg.Add(1)
 	go func() {
@@ -572,18 +370,11 @@ func TestWriteCapabilities_ConcurrentProbeWriteAndStatistics(t *testing.T) {
 	if got := probeHealthy.Load(); got != probers*iteration {
 		t.Errorf("healthy probe results = %d, want %d", got, probers*iteration)
 	}
-
-	stats := volume.WritePathStatistics()
-	wantWrites := successes.Load() + warmupWrites.Load()
-	if stats.TotalWrites != wantWrites {
-		t.Errorf("TotalWrites = %d, want %d", stats.TotalWrites, wantWrites)
+	if got := successes.Load(); got != writers*iteration {
+		t.Errorf("successful writes = %d, want %d", got, writers*iteration)
 	}
-	wantTotal := successes.Load()*int64(len(wantBytes)) + warmupWrites.Load()*int64(len(writeWarmupPayload))
-	if stats.TotalBytes != wantTotal {
-		t.Errorf("TotalBytes = %d, want %d", stats.TotalBytes, wantTotal)
-	}
-	if stats.FailedWrites != 0 {
-		t.Errorf("FailedWrites = %d, want 0", stats.FailedWrites)
+	if got := warmupWrites.Load(); got != 1 {
+		t.Errorf("warmup writes = %d, want 1", got)
 	}
 
 	for _, entry := range collectVolumeEntries(t, mountDir) {

@@ -21,8 +21,15 @@ paths, queue state, retries, and cleanup.
 
 ## Requirements
 
-- Go 1.26 or newer.
+- Go 1.26 or newer, as declared by `go.mod`. This is the minimum toolchain a
+  consumer needs to build or import Venue.
 - A local or mounted filesystem writable by the application process.
+
+The CI workflows install Go 1.27 rather than 1.26. That is a property of the
+tooling, not a raised requirement for this module: `golangci-lint` v2.14.0 is
+built with go1.27 and refuses to analyse a module on an older toolchain, so the
+lint job needs 1.27. The test and verify jobs are pinned to the same version so a
+green run means the same thing everywhere. Nothing in Venue requires 1.27.
 
 ```powershell
 go get github.com/cocosip/venue
@@ -500,11 +507,12 @@ The dead-letter area is per volume and always stays inside the volume root:
 ```
 
 with `Cleanup.DeadLetter` controlling `RootPath` (default `.deadletter`),
-`IncludeTenantInPath`, `IncludeDatePartition`, and `ShardingDepth` (default `2`).
-Dead-lettered records do not count toward quota and cleanup never reaps them, so
-retention of dead-lettered payloads stays an operator decision. Set
-`permanentlyFailedDisposition: Delete` to restore the previous destructive
-behaviour.
+`ShardingDepth` (default `2`), and the two layout exclusions
+`ExcludeTenantFromPath` and `ExcludeDatePartition` (both default `false`, which
+produces the full layout above). Dead-lettered records do not count toward quota
+and cleanup never reaps them, so retention of dead-lettered payloads stays an
+operator decision. Set `permanentlyFailedDisposition: Delete` to restore the
+previous destructive behaviour.
 
 ### Junk Files, Retired Volumes, Quarantined Databases
 
@@ -1035,6 +1043,10 @@ go vet ./...
 golangci-lint run
 ```
 
+`golangci-lint run` needs a toolchain of Go 1.27 or newer because the pinned
+`golangci-lint` v2.14.0 is built with go1.27. The module itself still declares
+Go 1.26 in `go.mod`; running the linter on 1.27 does not raise that floor.
+
 On a restricted environment where the default Go cache is not writable, point
 the caches at the ignored repository-local cache directory:
 
@@ -1044,6 +1056,15 @@ $env:GOLANGCI_LINT_CACHE="$PWD/.cache/golangci-lint"
 $env:GOTMPDIR="$PWD/.cache/tmp"
 $env:TMP="$PWD/.cache/tmp"
 $env:TEMP="$PWD/.cache/tmp"
+```
+
+Redirecting `TMP`/`TEMP` also relocates every `t.TempDir()` into `.cache/tmp`.
+Those directories are removed when a test returns normally, but a failing or
+interrupted run leaves them behind, and they accumulate silently across runs.
+`.cache/tmp` is ignored by git, so prune it periodically:
+
+```powershell
+Remove-Item "$PWD/.cache/tmp/*" -Recurse -Force
 ```
 
 ## Benchmarks

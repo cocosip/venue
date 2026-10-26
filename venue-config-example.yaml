@@ -63,9 +63,6 @@ venue:
     # Run PRAGMA wal_checkpoint(PASSIVE) after every committed batch. Bounds WAL growth
     # at the cost of extra I/O.
     checkpointAfterBatch: false
-    # Connection limit of each tenant's *sql.DB. Keep it at 1: every statement runs
-    # serially on the same connection.
-    maxOpenConns: 1
     # Upper bound on simultaneously open tenant database handles. 0 = unlimited
     # (the default: handles live until Close).
     maxOpenDatabases: 0
@@ -198,6 +195,18 @@ venue:
       # Minimum delay between import-history persistence writes while the
       # debounce is enabled. 0 selects the default (2s).
       importedFilesHistoryFlushInterval: 2s
+      # How many times the delete/move action after a successful import is
+      # retried before the source cleanup job is considered exhausted.
+      maxPostImportActionRetryCount: 5
+      # First retry delay for the post-import action. Later retries use
+      # exponential backoff. 0 selects the default (5s).
+      postImportActionRetryInitialDelay: 5s
+      # Upper bound for the post-import action backoff. 0 selects the
+      # default (5m).
+      postImportActionRetryMaxDelay: 5m
+      # Directory that receives sources whose cleanup job exhausted its
+      # retries. Empty leaves the source in place after the final failure.
+      sourceCleanupFailureDirectory: ""
 
     # Shared watcher for all regular tenants
     - watcherId: watcher-all-regular-tenants
@@ -246,6 +255,10 @@ venue:
   #     importedFilesPruneInterval: 5m
   #     disableImportedFilesHistoryFlushDebounce: false
   #     importedFilesHistoryFlushInterval: 2s
+  #     maxPostImportActionRetryCount: 5
+  #     postImportActionRetryInitialDelay: 5s
+  #     postImportActionRetryMaxDelay: 5m
+  #     sourceCleanupFailureDirectory: ""
 
   # Global file watcher service options (enablement is persisted across restarts)
   watcherServiceOptions:
@@ -265,6 +278,38 @@ venue:
     # How many watchers one cycle scans in parallel (0 = runtime default,
     # negative = sequential scanning)
     maxParallelWatcherScans: 4
+
+  # The watcher service writes every source cleanup job to its own SQLite
+  # database so a job survives a restart. Jobs are the delete/move actions that
+  # follow a successful import.
+  sourceCleanup:
+    # Run the source cleanup worker at all. With this disabled, imported sources
+    # are left in place and no job is recorded.
+    enabled: true
+    # Cleanup database file. Relative paths resolve under
+    # fileWatcherConfigurationDirectory. Required when enabled.
+    databasePath: source-cleanup.db
+    # How often the worker polls for due jobs.
+    pollingInterval: 5s
+    # Maximum delete/move actions the worker performs concurrently.
+    # Must be positive.
+    maxConcurrentActions: 2
+    # Maximum jobs that may exist at once before new imports are refused.
+    # Must be positive.
+    maxActiveJobs: 10000
+    # How long a finished (succeeded or permanently failed) job row is kept
+    # before the prune pass removes it. Must be positive.
+    terminalJobRetentionPeriod: 24h
+    # How long an import may hold a job reservation before the reservation is
+    # considered abandoned and the job is reclaimed. Must be positive.
+    importReservationTimeout: 10m
+    # Run VACUUM on the cleanup database to reclaim space after prune passes.
+    enableDatabaseOptimization: true
+    # Maintenance interval for the database optimization pass.
+    databaseOptimizationInterval: 24h
+    # How many terminal rows one prune pass deletes. Bounds the write burst so
+    # pruning never holds the writer for a long transaction.
+    terminalPruneBatchSize: 5000
 
   # Enable background cleanup service
   enableBackgroundCleanup: true
@@ -309,10 +354,12 @@ venue:
     #   Delete            - remove the payload and its metadata
     permanentlyFailedDisposition: MoveToDeadLetter
     # Dead-letter layout. Relative paths resolve under the owning volume mount path.
+    # The two exclusion flags default to false, which produces the full
+    # tenant/date-partitioned layout shown above.
     deadLetter:
       rootPath: .deadletter
-      includeTenantInPath: true
-      includeDatePartition: true
+      excludeTenantFromPath: false
+      excludeDatePartition: false
       shardingDepth: 2
     # Retention period for failed files
     failedFileRetentionPeriod: 72h  # 3 days
@@ -332,7 +379,13 @@ venue:
     cleanupInvalidDatabaseBackups: true
     # Volumes that were intentionally retired. Disposition is Keep (default) or
     # PurgeMetadataOnly (drop metadata and quota rows without touching storage).
-    retiredVolumes: []
+    # Volumes that are no longer served but may still hold metadata and
+    # payloads. Each entry names a volumeId and a disposition:
+    #   Keep              - keep both metadata and payloads (default)
+    #   PurgeMetadataOnly - drop the metadata, leave the payloads on disk
+    retiredVolumes:
+      - volumeId: volume-old-001
+        disposition: Keep
     # Optimize databases to reclaim space
     optimizeDatabases: true
     # Database optimization interval
@@ -350,6 +403,11 @@ venue:
     recoveryInterval: 6h
     # Delay before the first scan, so storage volumes can finish mounting
     initialDelay: 10s
+    # Skip files modified more recently than this window. A payload whose
+    # metadata commit is still in flight looks exactly like an orphan, so the
+    # age floor separates that window from a real orphan. 0 selects the
+    # default (1m); a negative value disables the guard.
+    minimumFileAge: 1m
 
   # Database health check options
   databaseHealthCheckOptions:

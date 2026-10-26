@@ -293,6 +293,11 @@ type SQLiteMetadataRepository struct {
 
 	now func() time.Time
 
+	// openTenantDatabase is a seam for deterministic tests. It defaults to the
+	// real open and is never replaced in production; a test uses it to drive the
+	// reservation protocol's failure path without corrupting a real database.
+	openTenantDatabase func(ctx context.Context, tenantID string) (*sql.DB, string, error)
+
 	mu        sync.RWMutex
 	closed    bool
 	databases map[string]*sqliteTenantDatabase
@@ -469,6 +474,8 @@ func NewSQLiteMetadataRepository(opts *SQLiteRepositoryOptions) (core.MetadataRe
 		databases:            make(map[string]*sqliteTenantDatabase),
 		openings:             make(map[string]*sqliteTenantOpening),
 	}
+
+	repository.openTenantDatabase = repository.openTenantDatabaseFile
 
 	return repository, nil
 }
@@ -1529,13 +1536,19 @@ func (r *SQLiteMetadataRepository) begin(ctx context.Context, tenantID string) (
 		}
 		r.mu.Unlock()
 
+		// Every waiter is released before this function returns, on every path:
+		// a waiter that never sees pending.done would block until its own
+		// context expired, turning one failed open into a hang for every
+		// concurrent caller of the same tenant. The close is unconditional and
+		// runs after pending.err is set, so waiters observe the final verdict.
+		defer close(pending.done)
+
 		if pending.err != nil {
 			if db != nil {
 				_ = db.Close()
 			}
 			return nil, pending.err
 		}
-		close(pending.done)
 		return handle, nil
 	}
 }
@@ -1653,9 +1666,13 @@ func (r *SQLiteMetadataRepository) openHandleCount() int {
 	return len(r.databases)
 }
 
-// openTenantDatabase creates the tenant directory, recovers a damaged database
-// when the caller asked for it, and opens the SQLite handle.
-func (r *SQLiteMetadataRepository) openTenantDatabase(ctx context.Context, tenantID string) (*sql.DB, string, error) {
+// openTenantDatabaseFile creates the tenant directory, recovers a damaged
+// database when the caller asked for it, and opens the SQLite handle.
+//
+// It is the production value of the repository's openTenantDatabase seam; the
+// seam exists so a test can drive the reservation protocol's failure path
+// without corrupting a real database.
+func (r *SQLiteMetadataRepository) openTenantDatabaseFile(ctx context.Context, tenantID string) (*sql.DB, string, error) {
 	directory := filepath.Join(r.dataPath, tenantID)
 	if err := os.MkdirAll(directory, metadataDatabaseDirPermissions); err != nil {
 		return nil, "", fmt.Errorf("failed to create the tenant metadata directory: %w: %w", err, core.ErrDatabaseError)

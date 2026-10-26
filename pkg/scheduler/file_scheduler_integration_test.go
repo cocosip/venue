@@ -86,8 +86,9 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 	// First attempt
 	location, _ := scheduler.GetNextFileForProcessing(ctx, tenant)
 
-	// The third failure reaches the configured retry limit.
-	for i := 1; i <= 2; i++ {
+	// MaxRetryCount is the number of retries: three failures are retried and the
+	// fourth failure is permanent.
+	for i := 1; i <= 3; i++ {
 		err := scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Retry test error")
 		if err != nil {
 			t.Fatalf("Attempt %d: Expected no error, got %v", i, err)
@@ -115,7 +116,7 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 		}
 	}
 
-	// 3rd failure should permanently fail.
+	// The failure after the last configured retry is permanent.
 	err := scheduler.MarkAsFailed(ctx, requireProcessingLease(t, location), "Final error")
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
@@ -127,8 +128,8 @@ func TestIntegration_RetryMechanism(t *testing.T) {
 		t.Errorf("Expected status PermanentlyFailed, got %v", metadata.Status)
 	}
 
-	if metadata.RetryCount != 3 {
-		t.Errorf("Expected RetryCount 3, got %d", metadata.RetryCount)
+	if metadata.RetryCount != 4 {
+		t.Errorf("Expected RetryCount 4, got %d", metadata.RetryCount)
 	}
 }
 

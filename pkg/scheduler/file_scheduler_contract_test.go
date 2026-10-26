@@ -18,6 +18,22 @@ type stubMetadataRepository struct {
 	pendingFiles     func(ctx context.Context, tenantID string, limit int) ([]*core.FileMetadata, error)
 	timedOutFiles    func(ctx context.Context, tenantID string, timeout time.Duration) ([]*core.FileMetadata, error)
 	transitionResult func(ctx context.Context, tenantID string, fileKey string) (*core.FileMetadata, error)
+	processingUpdate func(
+		ctx context.Context,
+		lease core.FileProcessingLease,
+		update func(*core.FileMetadata) error,
+	) (*core.FileMetadata, error)
+}
+
+func (s *stubMetadataRepository) CompareAndUpdateProcessing(
+	ctx context.Context,
+	lease core.FileProcessingLease,
+	update func(*core.FileMetadata) error,
+) (*core.FileMetadata, error) {
+	if s.processingUpdate == nil {
+		return nil, errors.New("stubMetadataRepository: unexpected CompareAndUpdateProcessing call")
+	}
+	return s.processingUpdate(ctx, lease, update)
 }
 
 func (s *stubMetadataRepository) GetPendingFiles(ctx context.Context, tenantID string, limit int) ([]*core.FileMetadata, error) {

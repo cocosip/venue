@@ -1,8 +1,10 @@
 package config_test
 
 import (
+	"errors"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -82,21 +84,32 @@ func TestRuntimePackagesDoNotImportViper(t *testing.T) {
 
 	err = filepath.WalkDir(repositoryRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			// A directory that disappeared mid-walk (build caches, scratch state)
+			// is not runtime source, so it cannot violate the boundary.
+			if errors.Is(walkErr, fs.ErrNotExist) {
+				return nil
+			}
 			return walkErr
 		}
 		if entry.IsDir() {
+			// Every dot-prefixed directory holds tool or scratch state (.git,
+			// .cache, .gocache, .gotmp, .lintcache, .kilo, ...). The Go toolchain
+			// writes generated files into them while this test walks, so they must
+			// never be treated as runtime source. The check is by name rather than
+			// by an enumerated list, so a new cache directory cannot break the
+			// walk again.
+			if strings.HasPrefix(entry.Name(), ".") {
+				return filepath.SkipDir
+			}
 			switch entry.Name() {
-			case ".git", ".cache", ".kilo", "tmp":
-				// Build output and scratch state are not runtime source; the Go
-				// toolchain writes generated files there while this test walks.
+			case "tmp", "vendor", "node_modules":
 				return filepath.SkipDir
 			}
 			relative, err := filepath.Rel(repositoryRoot, path)
 			if err != nil {
 				return err
 			}
-			relative = filepath.ToSlash(relative)
-			if relative == ".git" || relative == ".kilo" || relative == "viperconfig" || relative == "examples" {
+			if filepath.ToSlash(relative) == "viperconfig" || filepath.ToSlash(relative) == "examples" {
 				return filepath.SkipDir
 			}
 			return nil
