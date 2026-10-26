@@ -66,6 +66,13 @@ func ValidateTenantID(tenantID string) error {
 	if strings.TrimSpace(tenantID) != tenantID {
 		return fmt.Errorf("tenant ID has leading or trailing whitespace: %w", ErrInvalidArgument)
 	}
+	if strings.Contains(tenantID, "...") {
+		// The path sanitizer rejects any managed path carrying three
+		// consecutive dots, so an identifier with one would create a tenant
+		// that can never be written to. The rule is mirrored here at the
+		// governance layer, with the same error class the sanitizer reports.
+		return tenantIDError(tenantID, "contains three consecutive dots", true)
+	}
 	if strings.HasPrefix(tenantID, ".") {
 		return tenantIDError(tenantID, "starts with a reserved dot prefix", traversal)
 	}

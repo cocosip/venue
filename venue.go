@@ -646,6 +646,14 @@ func (v *Venue) initialize() error {
 				continue
 			}
 
+			// Configuration validation accepts only the documented action
+			// names, so this parse cannot fail for a Venue config; the error
+			// path protects callers that assemble a watcher configuration
+			// directly.
+			postImportAction, err := core.ParsePostImportAction(watcherCfg.PostImportAction)
+			if err != nil {
+				return fmt.Errorf("file watcher %s: %w", watcherCfg.WatcherID, err)
+			}
 			watcherConfig := &core.FileWatcherConfiguration{
 				WatcherID:                         watcherCfg.WatcherID,
 				TenantID:                          watcherCfg.TenantID,
@@ -654,7 +662,7 @@ func (v *Venue) initialize() error {
 				AutoCreateTenantDirectories:       watcherCfg.AutoCreateTenantDirectories,
 				IncludeSubdirectories:             watcherCfg.IncludeSubdirectories,
 				FilePatterns:                      watcherCfg.FilePatterns,
-				PostImportAction:                  core.ParsePostImportAction(watcherCfg.PostImportAction),
+				PostImportAction:                  postImportAction,
 				MoveToDirectory:                   watcherCfg.MoveToDirectory,
 				PollingInterval:                   watcherCfg.PollingInterval,
 				MaxFileSizeBytes:                  watcherCfg.MaxFileSizeBytes,
@@ -713,13 +721,17 @@ func (v *Venue) initialize() error {
 		if len(v.config.FileWatcherRoots) > 0 {
 			roots := make([]core.FileWatcherRootConfiguration, 0, len(v.config.FileWatcherRoots))
 			for _, rootCfg := range v.config.FileWatcherRoots {
+				rootPostImportAction, err := core.ParsePostImportAction(rootCfg.PostImportAction)
+				if err != nil {
+					return fmt.Errorf("file watcher root %s: %w", rootCfg.RootPath, err)
+				}
 				roots = append(roots, core.FileWatcherRootConfiguration{
 					RootPath:                          rootCfg.RootPath,
 					MultiTenantMode:                   rootCfg.MultiTenantMode,
 					Enabled:                           rootCfg.Enabled,
 					IncludeSubdirectories:             rootCfg.IncludeSubdirectories,
 					FilePatterns:                      append([]string(nil), rootCfg.FilePatterns...),
-					PostImportAction:                  core.ParsePostImportAction(rootCfg.PostImportAction),
+					PostImportAction:                  rootPostImportAction,
 					MoveToDirectory:                   rootCfg.MoveToDirectory,
 					PollingInterval:                   rootCfg.PollingInterval,
 					MaxFileSizeBytes:                  rootCfg.MaxFileSizeBytes,

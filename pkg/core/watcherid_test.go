@@ -57,3 +57,28 @@ func TestValidateWatcherID(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateWatcherID_RejectsReservedFilenameCharacters pins the Windows
+// reserved filename characters out of watcher identifiers. A watcher ID names
+// quarantine directories and state files, so a colon or wildcard would make
+// those creations fail on Windows after the watcher was already registered.
+func TestValidateWatcherID_RejectsReservedFilenameCharacters(t *testing.T) {
+	for _, watcherID := range []string{"inbox:eu", "w*d", "w?d", `w"d`, "w<d", "w>d", "w|d"} {
+		if err := core.ValidateWatcherID(watcherID); err == nil {
+			t.Errorf("ValidateWatcherID(%q) = nil, want error", watcherID)
+		} else if !errors.Is(err, core.ErrInvalidArgument) {
+			t.Errorf("ValidateWatcherID(%q) error = %v, want ErrInvalidArgument", watcherID, err)
+		}
+	}
+}
+
+// TestValidateWatcherID_RejectsReservedDeviceNames keeps parity with the tenant
+// validator: "con" and friends cannot be a quarantine directory name on
+// Windows, so they cannot be a watcher ID.
+func TestValidateWatcherID_RejectsReservedDeviceNames(t *testing.T) {
+	for _, watcherID := range []string{"con", "NUL", "lpt1", "com4", "aux"} {
+		if err := core.ValidateWatcherID(watcherID); err == nil {
+			t.Errorf("ValidateWatcherID(%q) = nil, want error", watcherID)
+		}
+	}
+}

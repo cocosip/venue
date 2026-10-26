@@ -451,10 +451,13 @@ func (p *FileRetryPolicy) CalculateRetryDelay(retryCount int) time.Duration {
 	// Exponential backoff: delay = InitialDelay * 2^(retryCount-1)
 	delay := p.InitialRetryDelay
 	for i := 1; i < retryCount; i++ {
-		delay *= 2
-		if delay > p.MaxRetryDelay {
+		// Doubling once delay already covers half the cap can only exceed the
+		// cap (or overflow int64 and go negative, which would schedule the
+		// retry in the past), so the cap is returned instead.
+		if delay > p.MaxRetryDelay/2 {
 			return p.MaxRetryDelay
 		}
+		delay *= 2
 	}
 
 	if delay > p.MaxRetryDelay {
@@ -855,44 +858,4 @@ func (r DatabaseOptimizationResult) PercentageReclaimed() float64 {
 		return 0
 	}
 	return float64(r.SpaceReclaimed) * 100 / float64(r.SizeBefore)
-}
-
-// StorageVolumeWritePathStatistics is a point-in-time snapshot of one volume's
-// write-path observations.
-//
-// Locus reports a .NET-specific mix of source-stream kinds (MemoryStream fast
-// paths, seekable FileStream copies, and so on) that has no Go analogue. Venue
-// reports the mechanism-independent observations of its own write path, so the
-// snapshot answers the same operational question ("where is write time going,
-// and how much did this volume actually write?") without inventing counters for
-// stream types Go does not have.
-type StorageVolumeWritePathStatistics struct {
-	// TotalWrites is the number of successful writes.
-	TotalWrites int64
-
-	// TotalBytes is the number of bytes written successfully.
-	TotalBytes int64
-
-	// FailedWrites is the number of writes that returned an error.
-	FailedWrites int64
-
-	// DirectoryPreparationCount is the number of observed directory-preparation
-	// phases (creating the destination directory tree for a write).
-	DirectoryPreparationCount int64
-
-	// DirectoryPreparationDuration is the total time spent preparing directories.
-	DirectoryPreparationDuration time.Duration
-
-	// CopyOperationCount is the number of observed payload copy operations.
-	CopyOperationCount int64
-
-	// CopyDuration is the total time spent copying payload bytes into the
-	// destination file.
-	CopyDuration time.Duration
-
-	// FsyncCount is the number of observed fsync calls.
-	FsyncCount int64
-
-	// FsyncDuration is the total time spent in fsync calls.
-	FsyncDuration time.Duration
 }

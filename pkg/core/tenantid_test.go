@@ -65,3 +65,21 @@ func TestValidateTenantID(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateTenantID_ConsecutiveDots pins the alignment with the path
+// sanitizer: SanitizeAndJoin rejects any path containing three consecutive
+// dots, so an identifier carrying one would create a tenant that can never be
+// written to. Two consecutive dots stay legal — the sanitizer accepts them.
+func TestValidateTenantID_ConsecutiveDots(t *testing.T) {
+	for _, tenantID := range []string{"a...b", "tenant....x", "..."} {
+		if err := ValidateTenantID(tenantID); err == nil {
+			t.Errorf("ValidateTenantID(%q) = nil, want error", tenantID)
+		} else if !errors.Is(err, ErrPathTraversalAttempt) {
+			t.Errorf("ValidateTenantID(%q) error = %v, want ErrPathTraversalAttempt", tenantID, err)
+		}
+	}
+
+	if err := ValidateTenantID("a..b"); err != nil {
+		t.Errorf("ValidateTenantID(a..b) error = %v, want nil", err)
+	}
+}

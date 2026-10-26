@@ -287,3 +287,25 @@ func TestTenantMetadata_ToTenantContext(t *testing.T) {
 		t.Errorf("CreatedAt mismatch: got %v, want %v", ctx.CreatedAt, metadata.CreatedAt)
 	}
 }
+
+// TestFileRetryPolicy_CalculateRetryDelayNeverOverflows pins the exponential
+// backoff against int64 overflow: an extreme InitialRetryDelay used to double
+// past the int64 range and surface as a negative delay (an availableAt in the
+// past), so the doubling must cap at MaxRetryDelay instead.
+func TestFileRetryPolicy_CalculateRetryDelayNeverOverflows(t *testing.T) {
+	policy := &FileRetryPolicy{
+		InitialRetryDelay:     time.Duration(1) << 62,
+		UseExponentialBackoff: true,
+		MaxRetryDelay:         time.Hour,
+	}
+
+	for retry := 1; retry <= 64; retry++ {
+		got := policy.CalculateRetryDelay(retry)
+		if got <= 0 {
+			t.Fatalf("CalculateRetryDelay(%d) = %v, want a positive delay", retry, got)
+		}
+		if got > policy.MaxRetryDelay {
+			t.Fatalf("CalculateRetryDelay(%d) = %v, want at most %v", retry, got, policy.MaxRetryDelay)
+		}
+	}
+}

@@ -575,6 +575,14 @@ func (v *LocalFileSystemVolume) copyFileAndRemoveSource(ctx context.Context, sou
 	}
 	stagedPath := staged.Name()
 
+	// A same-filesystem rename preserves the source's mode, so the fallback
+	// copy must too: os.CreateTemp hands back a private 0600 file, and renaming
+	// it unmodified would publish the payload with permissions the payload
+	// never had.
+	if err := staged.Chmod(sourceInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("failed to preserve the source mode on the move destination: %w", err)
+	}
+
 	// Best-effort release of the staging file: it only exists to be renamed onto
 	// the destination, so it must not outlive a failed move. Closing twice is
 	// harmless and intentionally ignored for the same reason.

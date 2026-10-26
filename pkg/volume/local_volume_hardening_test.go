@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -279,6 +280,59 @@ func TestMoveFileCopyFallbackHonoursFsyncSetting(t *testing.T) {
 			}
 			if syncs != tc.wantSyncs {
 				t.Errorf("sync calls = %d, want %d", syncs, tc.wantSyncs)
+			}
+		})
+	}
+}
+
+// TestMoveFileCrossDeviceFallbackPreservesSourceMode pins the permission
+// contract of the cross-device move fallback: a same-filesystem rename keeps
+// the source's mode, so the copy fallback must not quietly hand back a
+// 0600-only staging file. The read-only case works on every platform because
+// Windows models the read-only attribute through the mode bits too.
+func TestMoveFileCrossDeviceFallbackPreservesSourceMode(t *testing.T) {
+	testCases := []struct {
+		name         string
+		sourceMode   os.FileMode
+		wantWrite    bool
+		wantPermUnix os.FileMode
+	}{
+		{name: "read-only source", sourceMode: 0o444, wantWrite: false, wantPermUnix: 0o444},
+		{name: "writable source", sourceMode: 0o644, wantWrite: true, wantPermUnix: 0o644},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			volume, mountDir := createWritePathVolume(t, false)
+
+			sourcePath := filepath.Join(mountDir, "src", "payload.bin")
+			destinationPath := filepath.Join(mountDir, "dst", "payload.bin")
+			if err := os.MkdirAll(filepath.Dir(sourcePath), 0o755); err != nil {
+				t.Fatalf("MkdirAll(source) error = %v", err)
+			}
+			if err := os.WriteFile(sourcePath, []byte("move payload"), tc.sourceMode); err != nil {
+				t.Fatalf("WriteFile(source) error = %v", err)
+			}
+			if err := os.Chmod(sourcePath, tc.sourceMode); err != nil {
+				t.Fatalf("Chmod(source) error = %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
+				t.Fatalf("MkdirAll(destination) error = %v", err)
+			}
+
+			if err := volume.copyFileAndRemoveSource(context.Background(), sourcePath, destinationPath); err != nil {
+				t.Fatalf("copyFileAndRemoveSource() error = %v", err)
+			}
+
+			info, err := os.Stat(destinationPath)
+			if err != nil {
+				t.Fatalf("Stat(destination) error = %v", err)
+			}
+			if canWrite := info.Mode().Perm()&0o222 != 0; canWrite != tc.wantWrite {
+				t.Errorf("destination mode = %v, writable = %v, want writable = %v", info.Mode().Perm(), canWrite, tc.wantWrite)
+			}
+			if runtime.GOOS != "windows" && info.Mode().Perm() != tc.wantPermUnix {
+				t.Errorf("destination perm = %o, want %o", info.Mode().Perm(), tc.wantPermUnix)
 			}
 		})
 	}

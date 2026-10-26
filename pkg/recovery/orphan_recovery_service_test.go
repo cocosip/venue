@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/logging"
 	"github.com/cocosip/venue/pkg/metadata"
 	"github.com/cocosip/venue/pkg/sqlite"
 )
@@ -557,5 +559,94 @@ func writeFile(t *testing.T, path string, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile %s: %v", path, err)
+	}
+}
+
+// recordingRecoveryHandler captures emitted events so the compensation-failure
+// log can be asserted without reaching into the runtime. The runtime reports
+// the event name as the "event" attribute of every record.
+type recordingRecoveryHandler struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (h *recordingRecoveryHandler) Handle(_ context.Context, record slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == "event" {
+			h.events = append(h.events, attr.Value.String())
+		}
+		return true
+	})
+	return nil
+}
+
+func (h *recordingRecoveryHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingRecoveryHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *recordingRecoveryHandler) WithGroup(string) slog.Handler { return h }
+
+func (h *recordingRecoveryHandler) hasEvent(message string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, event := range h.events {
+		if event == message {
+			return true
+		}
+	}
+	return false
+}
+
+// dirQuotaWithFailingDecrement drops the tenant reservation on purpose: its
+// own decrement always fails, which is the compensation path Minor 9 covers.
+type dirQuotaWithFailingDecrement struct {
+	*stubDirQuota
+}
+
+func (q *dirQuotaWithFailingDecrement) DecrementFileCount(context.Context, string, string) error {
+	return errors.New("injected decrement failure")
+}
+
+// TestOrphanRecoveryLogsQuotaCompensationFailure is the regression test for the
+// silently discarded quota compensation: when persisting the rebuilt metadata
+// fails and the directory reservation cannot be released either, the lost
+// reservation must be logged, because the startup reconciliation only repairs it
+// on the next restart.
+func TestOrphanRecoveryLogsQuotaCompensationFailure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	volumeRoot := filepath.Join(root, "volume")
+	writeFile(t, filepath.Join(volumeRoot, "tenant-001", "aa", "bb", testFileKey+".txt"), "payload")
+
+	handler := &recordingRecoveryHandler{}
+	logRuntime, err := logging.New(logging.Config{Handler: handler})
+	if err != nil {
+		t.Fatalf("logging.New() error = %v", err)
+	}
+
+	dirQuota := &dirQuotaWithFailingDecrement{stubDirQuota: newStubDirQuota()}
+	service, err := NewOrphanRecoveryService(&OrphanRecoveryServiceOptions{
+		MetadataRepository:    failingRepository{},
+		Volumes:               map[string]core.StorageVolume{"vol-1": &stubVolume{id: "vol-1", mount: volumeRoot}},
+		TenantQuotaManager:    newStubTenantQuota(),
+		DirectoryQuotaManager: dirQuota,
+		Logging:               logRuntime,
+	})
+	if err != nil {
+		t.Fatalf("NewOrphanRecoveryService() error = %v", err)
+	}
+
+	report, err := service.RecoverNow(ctx)
+	if err != nil {
+		t.Fatalf("RecoverNow() error = %v", err)
+	}
+	if report.FilesFailed != 1 {
+		t.Fatalf("FilesFailed = %d, want 1 (%#v)", report.FilesFailed, report)
+	}
+
+	if !handler.hasEvent("orphan_quota_compensation_failed") {
+		t.Errorf("events = %v, want the orphan_quota_compensation_failed event", handler.events)
 	}
 }

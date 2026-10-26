@@ -25,7 +25,10 @@ const MaxWatcherIDLength = 128
 // ErrPathTraversalAttempt.
 //
 // Rejected inputs: empty, invalid UTF-8, longer than MaxWatcherIDLength bytes,
-// path separators, "." and "..", NUL bytes, and control characters.
+// path separators, "." and "..", NUL bytes, control characters, the Windows
+// reserved filename characters :*?"<>| (a watcher ID names quarantine
+// directories and state files, and those characters would make those creations
+// fail on Windows), and Windows device names.
 func ValidateWatcherID(watcherID string) error {
 	if watcherID == "" {
 		return fmt.Errorf("watcher ID cannot be empty: %w", ErrInvalidArgument)
@@ -53,6 +56,14 @@ func ValidateWatcherID(watcherID string) error {
 		if r < 0x20 || r == 0x7f {
 			return fmt.Errorf("watcher ID contains a control character: %w", ErrInvalidArgument)
 		}
+		switch r {
+		case ':', '*', '?', '"', '<', '>', '|':
+			return watcherIDError(watcherID, "contains a reserved filename character", false)
+		}
+	}
+
+	if reservedTenantDeviceNames[reservedDeviceName(watcherID)] {
+		return fmt.Errorf("watcher ID is a reserved device name: %w", ErrInvalidArgument)
 	}
 
 	return nil

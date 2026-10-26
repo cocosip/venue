@@ -20,6 +20,12 @@ import (
 type MetadataStore struct {
 	rootPath string
 	mu       sync.RWMutex
+
+	// syncDirectory flushes a directory's entries so a renamed file name is
+	// durable, not just its contents. It is a seam for deterministic tests and
+	// defaults to the best-effort filesystem implementation; production never
+	// replaces it.
+	syncDirectory func(path string) error
 }
 
 // NewMetadataStore creates a new metadata store.
@@ -30,7 +36,8 @@ func NewMetadataStore(rootPath string) (*MetadataStore, error) {
 	}
 
 	return &MetadataStore{
-		rootPath: rootPath,
+		rootPath:      rootPath,
+		syncDirectory: syncDirectoryForDurability,
 	}, nil
 }
 
@@ -88,7 +95,27 @@ func (s *MetadataStore) Save(metadata *core.TenantMetadata) error {
 		return fmt.Errorf("failed to rename tenant metadata: %w", err)
 	}
 
+	// The contents are durable, but on some filesystems the rename itself is
+	// not: a crash can lose the directory entry that names the fresh record.
+	// The sync is best-effort — the caller observes a committed record either
+	// way, and opening a directory for fsync is not portable (Windows rejects
+	// the fsync) — so a failure is deliberately not surfaced.
+	_ = s.syncDirectory(dir)
+
 	return nil
+}
+
+// syncDirectoryForDurability flushes a directory's entries. It mirrors the
+// volume write path's directory fsync and is best-effort by contract: the
+// caller treats a failure as a lost optimization.
+func syncDirectoryForDurability(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = directory.Close() }()
+
+	return directory.Sync()
 }
 
 // Load loads tenant metadata from disk.

@@ -527,7 +527,17 @@ func (s *OrphanRecoveryService) rebuild(
 	if s.dirQuota != nil {
 		if err := s.dirQuota.IncrementFileCount(ctx, tenantID, recoveredDirectoryPath); err != nil {
 			if tenantQuotaTaken {
-				_ = s.tenantQuota.DecrementFileCount(ctx, tenantID)
+				if decErr := s.tenantQuota.DecrementFileCount(ctx, tenantID); decErr != nil {
+					// The startup reconciliation can repair a leaked count on
+					// the next restart, but only if it is visible. A silently
+					// discarded compensation would leave the tenant quota
+					// over-counted until then.
+					s.emit(context.Background(), slog.LevelWarn, "orphan_quota_compensation_failed",
+						"Failed to release the tenant quota reservation of a failed orphan recovery",
+						slog.String("tenant_id", tenantID),
+						slog.String("quota", "tenant"),
+						slog.String("error_type", errorTypeName(decErr)))
+				}
 			}
 			return false, nil
 		}
@@ -551,10 +561,22 @@ func (s *OrphanRecoveryService) rebuild(
 
 	if err := s.metadataRepo.AddOrUpdate(ctx, metadata); err != nil {
 		if dirQuotaTaken {
-			_ = s.dirQuota.DecrementFileCount(ctx, tenantID, recoveredDirectoryPath)
+			if decErr := s.dirQuota.DecrementFileCount(ctx, tenantID, recoveredDirectoryPath); decErr != nil {
+				s.emit(context.Background(), slog.LevelWarn, "orphan_quota_compensation_failed",
+					"Failed to release the directory quota reservation of a failed orphan recovery",
+					slog.String("tenant_id", tenantID),
+					slog.String("quota", "directory"),
+					slog.String("error_type", errorTypeName(decErr)))
+			}
 		}
 		if tenantQuotaTaken {
-			_ = s.tenantQuota.DecrementFileCount(ctx, tenantID)
+			if decErr := s.tenantQuota.DecrementFileCount(ctx, tenantID); decErr != nil {
+				s.emit(context.Background(), slog.LevelWarn, "orphan_quota_compensation_failed",
+					"Failed to release the tenant quota reservation of a failed orphan recovery",
+					slog.String("tenant_id", tenantID),
+					slog.String("quota", "tenant"),
+					slog.String("error_type", errorTypeName(decErr)))
+			}
 		}
 		return false, err
 	}

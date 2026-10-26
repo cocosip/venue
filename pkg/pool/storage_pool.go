@@ -56,6 +56,25 @@ type StoragePoolOptions struct {
 }
 
 // PathGenerator generates storage paths for files.
+//
+// The contract a custom implementation must hold, because the runtime derives
+// meaning from the layout:
+//
+//   - The first path segment must be the tenantID, verbatim. Orphan recovery
+//     parses a physical path back into (tenantID, fileKey) by reading that
+//     first segment, and cleanup scopes every operation by it; a generator
+//     that places anything else first makes recovered files unattributable.
+//   - The last path segment must be the fileKey (plus the optional extension).
+//     Orphan recovery extracts the key from that segment and validates it
+//     before rebuilding metadata.
+//   - The result must be a relative path built only from the given arguments:
+//     no caller-supplied names, no absolute prefixes, no ".." segments. The
+//     volume sanitizer still verifies every generated path and rejects an
+//     unsafe one, but only a generator that honors this contract produces
+//     paths the runtime can reconstruct.
+//   - The same (tenantID, fileKey, extension) must always produce the same
+//     path: metadata stores the generated path once, and a drifting generator
+//     would orphan the payload on the next lookup.
 type PathGenerator interface {
 	// GeneratePath generates a storage path for a file.
 	// Returns a relative path like "2024/01/22/file.ext"

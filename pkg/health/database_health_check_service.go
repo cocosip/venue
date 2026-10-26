@@ -58,6 +58,12 @@ type DatabaseHealthCheckService struct {
 	// startup-only loop finishes: the flag tracks the goroutine, not just the
 	// Stop call, and Stop must not hold a mutex across wg.Wait.
 	running atomic.Bool
+	// completed records that the run loop ended by itself (startup-only mode).
+	// Stop consults it so stopping a service that finished its documented work
+	// is a no-op instead of a "not running" error that Venue would log as a
+	// stop failure. It is written by the run goroutine before it clears
+	// running, so a Stop that observes running == false always sees it.
+	completed atomic.Bool
 }
 
 // NewDatabaseHealthCheckService creates a new database health check service.
@@ -128,8 +134,17 @@ func (s *DatabaseHealthCheckService) Start() error {
 // Stop does not hold a mutex while joining the run goroutine: in startup-only
 // mode that goroutine clears the running flag itself when its loop ends, so a
 // mutex across wg.Wait could interleave with it.
+//
+// A service whose run loop already ended by itself (CheckOnStartupOnly) stops
+// successfully: the caller performed the documented lifecycle and there is
+// nothing to cancel, so this is a no-op rather than the "not running" error
+// that Venue would otherwise log as a stop failure. Stopping a service that
+// was never started remains an error, because that is a caller mistake.
 func (s *DatabaseHealthCheckService) Stop() error {
 	if !s.running.Swap(false) {
+		if s.completed.Load() {
+			return nil
+		}
 		return fmt.Errorf("database health check service is not running")
 	}
 
@@ -168,8 +183,11 @@ func (s *DatabaseHealthCheckService) run() {
 
 	// If startup-only mode, stop here. The loop ends, so the running flag goes
 	// with it: IsRunning reports a service that is actually executing, and a
-	// later Start is not blocked by a finished goroutine.
+	// later Start is not blocked by a finished goroutine. completed is set
+	// first so a concurrent Stop that observes running == false knows the end
+	// was the documented natural completion.
 	if s.checkOnStartupOnly {
+		s.completed.Store(true)
 		s.running.Store(false)
 		s.emit(s.ctx, slog.LevelInfo, "startup_check_completed", "Database health check completed")
 		return

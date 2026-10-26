@@ -604,3 +604,106 @@ func TestSanitizeAndJoin_WithinRoot(t *testing.T) {
 		}
 	}
 }
+
+// TestSanitizeExtension_RejectsReservedFilenameCharacters pins the Windows
+// reserved filename characters out of caller-supplied extensions. A colon is
+// the NTFS alternate-data-stream separator: letting it through turns a
+// "successful" write into a hidden stream on the main file, so the extension
+// gate must reject it before it reaches a physical path.
+func TestSanitizeExtension_RejectsReservedFilenameCharacters(t *testing.T) {
+	testCases := []struct {
+		name string
+		ext  string
+	}{
+		{name: "colon", ext: ".txt:ads"},
+		{name: "bare colon", ext: ":"},
+		{name: "wildcard", ext: ".txt*"},
+		{name: "question mark", ext: ".tx?"},
+		{name: "quote", ext: `.tx"t`},
+		{name: "less than", ext: ".tx<t"},
+		{name: "greater than", ext: ".tx>t"},
+		{name: "pipe", ext: ".tx|t"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := SanitizeExtension(tc.ext); err == nil {
+				t.Fatalf("SanitizeExtension(%q) = nil error, want rejection", tc.ext)
+			} else if !strings.Contains(err.Error(), core.ErrInvalidArgument.Error()) {
+				t.Errorf("SanitizeExtension(%q) error = %v, want ErrInvalidArgument", tc.ext, err)
+			}
+		})
+	}
+}
+
+// TestSanitizeExtension_RejectsConsecutiveDots keeps the extension gate aligned
+// with the path sanitizer's '...' rule: an extension carrying three consecutive
+// dots would be rejected by SanitizeAndJoin after the physical layout was
+// already built around it, so it must fail here with the extension error.
+func TestSanitizeExtension_RejectsConsecutiveDots(t *testing.T) {
+	for _, ext := range []string{".a...b", ".txt..."} {
+		if _, err := SanitizeExtension(ext); err == nil {
+			t.Errorf("SanitizeExtension(%q) = nil error, want rejection", ext)
+		}
+	}
+}
+
+// TestSanitizeExtension_AcceptsPlainExtensions keeps the reserved-character
+// rejection from over-reaching: ordinary extensions stay usable.
+func TestSanitizeExtension_AcceptsPlainExtensions(t *testing.T) {
+	for _, ext := range []string{".txt", ".tar.gz", ".PDF", ".日志", ".a..b"} {
+		if _, err := SanitizeExtension(ext); err != nil {
+			t.Errorf("SanitizeExtension(%q) error = %v, want nil", ext, err)
+		}
+	}
+}
+
+// TestSanitizeAndJoin_RejectsColon pins the colon rejection of the path
+// sanitizer: a colon in a physical path is an ADS or drive separator on
+// Windows and never appears in a Venue-generated path.
+func TestSanitizeAndJoin_RejectsColon(t *testing.T) {
+	sanitizer := NewPathSanitizer(filepath.Join("tmp", "test"))
+
+	for _, relativePath := range []string{"file:stream.txt", "a/b:c", "C:evil"} {
+		if _, err := sanitizer.SanitizeAndJoin(relativePath); err == nil {
+			t.Errorf("SanitizeAndJoin(%q) = nil error, want rejection", relativePath)
+		}
+	}
+}
+
+// TestSanitizeAndJoin_ParentSegmentPrecision pins the difference between a
+// real parent reference and a name that merely starts with two dots: "..data"
+// is a legal directory name and must be accepted, while a leading ".."
+// segment must keep being rejected.
+func TestSanitizeAndJoin_ParentSegmentPrecision(t *testing.T) {
+	sanitizer := NewPathSanitizer(filepath.Join("tmp", "test"))
+
+	accepted := []string{"..data", "a/..b", "a/..b/c/file.txt"}
+	for _, relativePath := range accepted {
+		if _, err := sanitizer.SanitizeAndJoin(relativePath); err != nil {
+			t.Errorf("SanitizeAndJoin(%q) error = %v, want acceptance", relativePath, err)
+		}
+	}
+
+	rejected := []string{`..\evil`, "../evil", "a/../../b", ".."}
+	for _, relativePath := range rejected {
+		if _, err := sanitizer.SanitizeAndJoin(relativePath); err == nil {
+			t.Errorf("SanitizeAndJoin(%q) = nil error, want rejection", relativePath)
+		}
+	}
+}
+
+// TestValidateRelativePath_ParentSegmentPrecision applies the same precision to
+// the validation-only entry point, which runs the checks without a root join.
+func TestValidateRelativePath_ParentSegmentPrecision(t *testing.T) {
+	sanitizer := NewPathSanitizer(filepath.Join("tmp", "test"))
+
+	if err := sanitizer.ValidateRelativePath("..data"); err != nil {
+		t.Errorf("ValidateRelativePath(..data) error = %v, want acceptance", err)
+	}
+	for _, relativePath := range []string{"../evil", `..\evil`, "a/../../b"} {
+		if err := sanitizer.ValidateRelativePath(relativePath); err == nil {
+			t.Errorf("ValidateRelativePath(%q) = nil error, want rejection", relativePath)
+		}
+	}
+}

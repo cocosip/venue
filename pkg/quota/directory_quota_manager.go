@@ -28,6 +28,9 @@ func NewDirectoryQuotaManager(repository core.DirectoryQuotaRepository) (core.Di
 }
 
 // CanAddFile checks if a file can be added to a directory without exceeding quota.
+//
+// The lookup never persists anything: a directory without a quota row has no
+// limit set, so the answer is read from the domain defaults.
 func (m *directoryQuotaManager) CanAddFile(ctx context.Context, tenantID string, directoryPath string) (bool, error) {
 	normalizedPath, err := validateAndNormalize(tenantID, directoryPath)
 	if err != nil {
@@ -37,7 +40,7 @@ func (m *directoryQuotaManager) CanAddFile(ctx context.Context, tenantID string,
 	defer unlock()
 
 	// Get quota for directory
-	quota, err := m.repository.GetOrCreate(ctx, tenantID, normalizedPath)
+	quota, err := m.quotaForRead(ctx, tenantID, normalizedPath)
 	if err != nil {
 		return false, fmt.Errorf("failed to get quota: %w", err)
 	}
@@ -92,6 +95,9 @@ func (m *directoryQuotaManager) DecrementFileCount(ctx context.Context, tenantID
 }
 
 // GetFileCount returns the current file count for a directory.
+//
+// The lookup never persists anything: a directory without a quota row reports
+// the domain default count of zero.
 func (m *directoryQuotaManager) GetFileCount(ctx context.Context, tenantID string, directoryPath string) (int, error) {
 	normalizedPath, err := validateAndNormalize(tenantID, directoryPath)
 	if err != nil {
@@ -101,7 +107,7 @@ func (m *directoryQuotaManager) GetFileCount(ctx context.Context, tenantID strin
 	defer unlock()
 
 	// Get quota
-	quota, err := m.repository.GetOrCreate(ctx, tenantID, normalizedPath)
+	quota, err := m.quotaForRead(ctx, tenantID, normalizedPath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get quota: %w", err)
 	}
@@ -141,6 +147,9 @@ func (m *directoryQuotaManager) SetQuota(ctx context.Context, tenantID string, d
 }
 
 // GetQuota returns the quota configuration for a directory.
+//
+// The lookup never persists anything: a directory without a quota row yields
+// the unpersisted domain defaults (unlimited, disabled, empty).
 func (m *directoryQuotaManager) GetQuota(ctx context.Context, tenantID string, directoryPath string) (*core.DirectoryQuota, error) {
 	normalizedPath, err := validateAndNormalize(tenantID, directoryPath)
 	if err != nil {
@@ -150,7 +159,7 @@ func (m *directoryQuotaManager) GetQuota(ctx context.Context, tenantID string, d
 	defer unlock()
 
 	// Get quota
-	quota, err := m.repository.GetOrCreate(ctx, tenantID, normalizedPath)
+	quota, err := m.quotaForRead(ctx, tenantID, normalizedPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get quota: %w", err)
 	}
@@ -167,7 +176,7 @@ func (m *directoryQuotaManager) SetFileCount(ctx context.Context, tenantID strin
 	if count < 0 {
 		return fmt.Errorf("count cannot be negative: %w", core.ErrInvalidArgument)
 	}
-	unlock := m.lock(tenantID, normalizedPath)
+	unlock := m.lock(tenantID, directoryPath)
 	defer unlock()
 
 	quota, err := m.repository.GetOrCreate(ctx, tenantID, normalizedPath)
@@ -179,6 +188,28 @@ func (m *directoryQuotaManager) SetFileCount(ctx context.Context, tenantID strin
 		return fmt.Errorf("failed to update quota: %w", err)
 	}
 	return nil
+}
+
+// quotaForRead answers a read-path lookup without persisting anything.
+//
+// A repository that provides core.DirectoryQuotaReader is asked for the stored
+// row; a directory without one is answered with the unpersisted domain
+// defaults, so a monitoring scan never materializes a row per directory.
+// Repositories without the capability keep the historical GetOrCreate behavior,
+// which creates the row it reads.
+func (m *directoryQuotaManager) quotaForRead(ctx context.Context, tenantID string, directoryPath string) (*core.DirectoryQuota, error) {
+	if reader, ok := m.repository.(core.DirectoryQuotaReader); ok {
+		quota, err := reader.Get(ctx, tenantID, directoryPath)
+		if err != nil {
+			return nil, err
+		}
+		if quota == nil {
+			return &core.DirectoryQuota{DirectoryPath: directoryPath}, nil
+		}
+		return quota, nil
+	}
+
+	return m.repository.GetOrCreate(ctx, tenantID, directoryPath)
 }
 
 func validateAndNormalize(tenantID string, directoryPath string) (string, error) {

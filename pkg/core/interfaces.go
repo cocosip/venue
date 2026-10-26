@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 )
@@ -405,14 +406,6 @@ type StorageVolumeWritePathWarmup interface {
 	WarmWritePathCache(ctx context.Context) error
 }
 
-// StorageVolumeWritePathDiagnostics is an optional StorageVolume capability that
-// exposes aggregated write-path observations for operations.
-type StorageVolumeWritePathDiagnostics interface {
-	// WritePathStatistics returns a snapshot of the volume's write-path
-	// observations. The returned value is a copy: later writes do not mutate it.
-	WritePathStatistics() StorageVolumeWritePathStatistics
-}
-
 // DatabaseOptimizationService is an optional CleanupService capability that
 // reports how much space one optimization pass reclaimed.
 //
@@ -638,6 +631,19 @@ type DirectoryQuotaRepository interface {
 	Close() error
 }
 
+// DirectoryQuotaReader is the optional DirectoryQuotaRepository capability that
+// reads a quota row without creating it.
+//
+// The manager's read paths (CanAddFile, GetFileCount, GetQuota) use it when the
+// repository provides it, so a monitoring scan does not persist a default row
+// for every directory it looks at. A repository without the capability keeps
+// the historical GetOrCreate behavior.
+type DirectoryQuotaReader interface {
+	// Get returns the stored quota for a directory, or nil without an error
+	// when the directory has no row.
+	Get(ctx context.Context, tenantID string, directoryPath string) (*DirectoryQuota, error)
+}
+
 // PostImportAction defines what to do with files after successful import.
 type PostImportAction int
 
@@ -653,14 +659,23 @@ const (
 )
 
 // ParsePostImportAction converts a string to PostImportAction.
-func ParsePostImportAction(s string) PostImportAction {
+//
+// Unknown values are an error wrapping ErrInvalidArgument, matching
+// ParsePermanentlyFailedDisposition: a misspelled configured value used to
+// degrade silently to PostImportActionDelete, the most destructive possible
+// default for a typo. Configuration validation rejects the same values before
+// the runtime is built, so the error protects callers that wire a watcher
+// configuration directly.
+func ParsePostImportAction(s string) (PostImportAction, error) {
 	switch s {
 	case "Move":
-		return PostImportActionMove
+		return PostImportActionMove, nil
 	case "Keep":
-		return PostImportActionKeep
+		return PostImportActionKeep, nil
+	case "Delete":
+		return PostImportActionDelete, nil
 	default:
-		return PostImportActionDelete
+		return 0, fmt.Errorf("unknown post-import action %q: %w", s, ErrInvalidArgument)
 	}
 }
 

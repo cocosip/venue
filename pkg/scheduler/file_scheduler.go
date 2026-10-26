@@ -817,8 +817,8 @@ func (s *fileScheduler) MarkAsFailed(ctx context.Context, lease core.FileProcess
 		// MaxRetryCount is the retry budget, measured as the number of retries
 		// a file may still accrue: a file with RetryCount already at the budget
 		// is not retried again, so MaxRetryCount=3 allows retries 1, 2 and 3 and
-		// makes the fourth failure terminal. Comparing before the increment
-		// keeps that reading exact.
+		// makes the fourth failure terminal. The comparison runs against the
+		// incremented count, which is the number of retries already consumed.
 		if metadata.RetryCount > s.retryPolicy.MaxRetryCount {
 			metadata.Status = core.FileStatusPermanentlyFailed
 			metadata.AvailableForProcessingAt = nil

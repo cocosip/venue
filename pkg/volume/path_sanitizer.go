@@ -2,6 +2,7 @@ package volume
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -51,8 +52,10 @@ func (s *PathSanitizer) SanitizeAndJoin(relativePath string) (string, error) {
 		return "", fmt.Errorf("path must be relative, not absolute: %s: %w", relativePath, core.ErrInvalidArgument)
 	}
 
-	// Must not start with ..
-	if strings.HasPrefix(cleanRelative, "..") {
+	// Must not start with a parent segment. The check is segment-precise: a
+	// name that merely starts with two dots ("..data") is a legal segment and
+	// stays acceptable, while a leading ".." escapes the parent.
+	if isParentReference(cleanRelative) {
 		return "", fmt.Errorf("path must not escape parent directory: %s: %w", relativePath, core.ErrPathTraversalAttempt)
 	}
 
@@ -86,8 +89,8 @@ func (s *PathSanitizer) ValidateRelativePath(relativePath string) error {
 		return fmt.Errorf("path must be relative, not absolute: %s: %w", relativePath, core.ErrInvalidArgument)
 	}
 
-	// Must not start with ..
-	if strings.HasPrefix(cleanPath, "..") {
+	// Must not start with a parent segment; see SanitizeAndJoin.
+	if isParentReference(cleanPath) {
 		return fmt.Errorf("path must not escape parent directory: %s: %w", relativePath, core.ErrPathTraversalAttempt)
 	}
 
@@ -102,8 +105,10 @@ func (s *PathSanitizer) isWithinRoot(fullPath string) bool {
 		return false
 	}
 
-	// Check if relative path escapes (starts with ..)
-	if strings.HasPrefix(rel, "..") {
+	// The relative path escapes only through a real parent segment: a segment
+	// that merely starts with two dots ("..data") is a name inside the root,
+	// not a parent reference.
+	if isParentReference(rel) {
 		return false
 	}
 
@@ -122,6 +127,17 @@ func (s *PathSanitizer) checkSuspiciousPatterns(path string) error {
 		return fmt.Errorf("path contains suspicious pattern '...': %w", core.ErrPathTraversalAttempt)
 	}
 
+	// Reject the Windows reserved filename characters. A colon is the
+	// NTFS alternate-data-stream and drive separator: a path that carries
+	// one "succeeds" on Windows while the payload lands in a hidden stream,
+	// so it is rejected before os.Create can run. The rule is unconditional
+	// rather than GOOS-gated: Venue-managed paths are system-generated and
+	// never contain these characters, and one invariant is cheaper to reason
+	// about than platform-dependent acceptance.
+	if index := strings.IndexAny(path, `:*?"<>|`); index >= 0 {
+		return fmt.Errorf("path contains reserved filename character %q: %w", path[index], core.ErrInvalidArgument)
+	}
+
 	// Check for backslash on Unix systems (potential path confusion)
 	// On Windows, backslashes are normal, so only check on non-Windows systems
 	if runtime.GOOS != "windows" && strings.Contains(path, "\\") {
@@ -131,6 +147,21 @@ func (s *PathSanitizer) checkSuspiciousPatterns(path string) error {
 	}
 
 	return nil
+}
+
+// isParentReference reports whether a cleaned path leaves the directory it is
+// joined to. The check is segment-precise: only a leading ".." segment is a
+// parent reference, while a segment that merely starts with two dots ("..data")
+// is a legal name. filepath.Clean has already collapsed every interior parent
+// reference that does not escape, so whatever survives here is leading.
+func isParentReference(cleanPath string) bool {
+	if cleanPath == ".." {
+		return true
+	}
+	if strings.HasPrefix(cleanPath, "..") {
+		return len(cleanPath) > 2 && os.IsPathSeparator(cleanPath[2])
+	}
+	return false
 }
 
 // GetRootPath returns the root path.
@@ -200,12 +231,15 @@ const maxExtensionLength = 64
 // metadata.
 //
 // It cannot traverse (filepath.Ext never keeps a separator), but a raw
-// extension can still carry control characters, trailing dots or spaces (which
-// vanish from the name on Windows and would leave the physical file
-// unaddressable), or an absurd length. Separators, NUL bytes, control
-// characters and extensions beyond the length cap are rejected with a wrapped
-// core.ErrInvalidArgument; trailing dots and spaces are trimmed, and a
-// remainder that is only a dot carries no extension and yields "".
+// extension can still carry control characters, the Windows reserved filename
+// characters (a colon would turn the write into an NTFS alternate data
+// stream), three consecutive dots (which the path sanitizer rejects after the
+// physical layout was already built around the extension), trailing dots or
+// spaces (which vanish from the name on Windows and would leave the physical
+// file unaddressable), or an absurd length. Every rejected class is reported
+// with a wrapped core.ErrInvalidArgument; trailing dots and spaces are
+// trimmed, and a remainder that is only a dot carries no extension and yields
+// "".
 func SanitizeExtension(ext string) (string, error) {
 	if ext == "" {
 		return "", nil
@@ -215,6 +249,12 @@ func SanitizeExtension(ext string) (string, error) {
 	}
 	if strings.Contains(ext, "\x00") {
 		return "", fmt.Errorf("file extension contains null byte: %w", core.ErrInvalidArgument)
+	}
+	if strings.Contains(ext, "...") {
+		return "", fmt.Errorf("file extension contains suspicious pattern '...': %w", core.ErrInvalidArgument)
+	}
+	if index := strings.IndexAny(ext, `:*?"<>|`); index >= 0 {
+		return "", fmt.Errorf("file extension contains reserved filename character %q: %w", ext[index], core.ErrInvalidArgument)
 	}
 	for _, r := range ext {
 		if r < 32 {

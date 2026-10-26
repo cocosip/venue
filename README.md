@@ -819,11 +819,9 @@ in-flight scans.
 
 The `Venue` local filesystem volume also implements the optional volume
 capabilities `core.StorageVolumeHealthProbe` (`ProbeHealth`, the forced probe
-that bypasses and refreshes the health cache),
+that bypasses and refreshes the health cache) and
 `core.StorageVolumeWritePathWarmup` (`WarmWritePathCache`, the throwaway write
-behind `volumes[].warmupOnStartup`), and
-`core.StorageVolumeWritePathDiagnostics` (`WritePathStatistics`, an aggregated
-write-path snapshot).
+behind `volumes[].warmupOnStartup`).
 
 ### Statistics and Metadata Backups
 

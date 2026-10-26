@@ -107,6 +107,12 @@ VALUES (@directory_path, 0, 0, 0, @last_updated, @created_at)
 ON CONFLICT(directory_path) DO UPDATE SET directory_path = quotas.directory_path
 RETURNING ` + sqliteQuotaColumns
 
+	// sqliteQuotaGetSQL reads one quota row without creating it. A directory
+	// without a row is answered by the caller with the domain defaults rather
+	// than materializing one, so read-only scans stay read-only.
+	sqliteQuotaGetSQL = `SELECT ` + sqliteQuotaColumns + `
+FROM quotas WHERE directory_path = @directory_path`
+
 	// sqliteQuotaUpdateSQL is the administrative absolute write. It deliberately
 	// leaves created_at alone: a quota's creation instant is immutable.
 	sqliteQuotaUpdateSQL = `
@@ -365,6 +371,34 @@ func (r *sqliteDirectoryQuotaRepository) GetOrCreate(ctx context.Context, tenant
 		sql.Named("created_at", now)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get or create directory quota: %w: %w", err, core.ErrDatabaseError)
+	}
+	return quota, nil
+}
+
+// Get returns the stored quota for a directory without creating it, or nil
+// without an error when the directory has no row.
+//
+// It is the DirectoryQuotaReader capability the quota manager's read paths use,
+// so a monitoring scan never materializes a default row for a directory it only
+// looked at. The directory path must not be empty.
+func (r *sqliteDirectoryQuotaRepository) Get(ctx context.Context, tenantID string, directoryPath string) (*core.DirectoryQuota, error) {
+	if directoryPath == "" {
+		return nil, fmt.Errorf("directory path cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	handle, err := r.acquire(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer r.release(handle)
+
+	quota, err := scanDirectoryQuota(handle.db.QueryRowContext(ctx, sqliteQuotaGetSQL,
+		sql.Named("directory_path", directoryPath)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get directory quota: %w: %w", err, core.ErrDatabaseError)
 	}
 	return quota, nil
 }
