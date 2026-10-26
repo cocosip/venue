@@ -2,9 +2,12 @@ package logging
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
+
+	"github.com/cocosip/venue/pkg/core"
 )
 
 func TestDisabledRuntimeIsSilent(t *testing.T) {
@@ -18,9 +21,20 @@ func TestDisabledRuntimeIsSilent(t *testing.T) {
 	})
 }
 
+// TestNewRejectsNilHandler pins both halves of the contract: a nil handler is
+// rejected, and the rejection is classifiable through core.ErrInvalidArgument so
+// a caller of NewVenue can treat it like every other public configuration error
+// instead of matching on message text.
 func TestNewRejectsNilHandler(t *testing.T) {
-	if _, err := New(Config{}); err == nil {
+	runtime, err := New(Config{})
+	if err == nil {
 		t.Fatal("New() error = nil, want nil-handler error")
+	}
+	if !errors.Is(err, core.ErrInvalidArgument) {
+		t.Fatalf("New() error = %v, want it to wrap core.ErrInvalidArgument", err)
+	}
+	if runtime != nil {
+		t.Fatalf("New() runtime = %v, want nil alongside the error", runtime)
 	}
 }
 

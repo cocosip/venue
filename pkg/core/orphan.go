@@ -25,8 +25,18 @@ type OrphanRecoveryReport struct {
 	BytesRecovered int64
 
 	// Errors holds safe, non-sensitive failure descriptions.
+	//
+	// The slice is capped: a scan can fail once per physical file, and a volume
+	// with a persistent fault would otherwise accumulate one string per file for
+	// the whole run. FilesFailed already carries the exact count, so the detail
+	// list is capped at OrphanRecoveryReportErrorLimit entries and drops further
+	// descriptions instead of growing without bound.
 	Errors []string
 }
+
+// OrphanRecoveryReportErrorLimit bounds how many failure descriptions one report
+// retains. The counters stay exact; only the per-file detail is capped.
+const OrphanRecoveryReportErrorLimit = 100
 
 // OrphanRecoveryService rebuilds metadata for physical files that have no
 // metadata record and re-queues them as Pending.
@@ -52,6 +62,14 @@ func NewOrphanRecoveryReport() *OrphanRecoveryReport {
 }
 
 // AddError records a safe failure description.
+//
+// Descriptions beyond OrphanRecoveryReportErrorLimit are dropped, so a scan over
+// a persistently failing volume cannot grow the report without bound. Callers
+// that need the exact failure count read FilesFailed.
 func (r *OrphanRecoveryReport) AddError(format string, args ...any) {
+	if len(r.Errors) >= OrphanRecoveryReportErrorLimit {
+		return
+	}
+
 	r.Errors = append(r.Errors, fmt.Sprintf(format, args...))
 }
