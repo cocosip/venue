@@ -1,0 +1,28 @@
+# Normalize every text file to LF in the repository and in the working tree.
+#
+# Without this, core.autocrlf decides per machine what a checkout produces, so a
+# Windows checkout writes CRLF while gofmt insists on LF. That makes gofmt -l . a
+# false failure on every Go file the setting touched, and leaves files that git
+# reports as modified while their content is identical.
+#
+# eol=lf keeps the working tree byte-identical across platforms, which is what
+# the gofmt gate and the golden files in tests expect.
+* text=auto eol=lf
+
+# Binary formats must never be normalized; a rewritten line ending corrupts them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.exe binary
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.bak binary
+
+# Download archives and database files are produced at runtime, never edited.
+*.sqlite binary
