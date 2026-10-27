@@ -8,24 +8,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/cocosip/venue/pkg/core"
 )
-
-// platformSanitizerError reports the error class path_sanitizer.go produces for
-// an input whose classification depends on the host platform: on Windows a drive
-// or verbatim (\\?\) prefix is an absolute path, while a non-Windows build
-// rejects the backslash it contains as a path traversal attempt.
-func platformSanitizerError(windowsError error, otherError error) error {
-	if runtime.GOOS == "windows" {
-		return windowsError
-	}
-	return otherError
-}
 
 // writeVolumeFile writes content through the public volume API.
 func writeVolumeFile(t *testing.T, volume *LocalFileSystemVolume, relativePath string, content string) {
@@ -187,20 +175,25 @@ func TestLocalFileSystemVolume_MoveFileRejectsUnsafePaths(t *testing.T) {
 			path: "file...txt",
 			want: core.ErrPathTraversalAttempt,
 		},
+		// The three Windows-style absolute paths below carry a reserved
+		// filename character (":" in a drive prefix, "?" in a verbatim \\?\
+		// prefix). The sanitizer's reserved-character rule is unconditional
+		// and runs before the absolute-path and backslash checks, so these
+		// are ErrInvalidArgument on every platform.
 		{
 			name: "Absolute drive path",
 			path: `C:\Windows\win.ini`,
-			want: platformSanitizerError(core.ErrInvalidArgument, core.ErrPathTraversalAttempt),
+			want: core.ErrInvalidArgument,
 		},
 		{
 			name: "Verbatim absolute path",
 			path: `\\?\C:\Windows\win.ini`,
-			want: platformSanitizerError(core.ErrInvalidArgument, core.ErrPathTraversalAttempt),
+			want: core.ErrInvalidArgument,
 		},
 		{
 			name: "Verbatim UNC path",
 			path: `\\?\UNC\server\share\payload.txt`,
-			want: platformSanitizerError(core.ErrInvalidArgument, core.ErrPathTraversalAttempt),
+			want: core.ErrInvalidArgument,
 		},
 	}
 

@@ -98,9 +98,10 @@ func TestSanitizeAndJoin_PathTraversal(t *testing.T) {
 			relativePath: "subdir/../../../file.txt",
 			wantError:    core.ErrPathTraversalAttempt,
 		},
-		// Note: Windows absolute path test removed - behavior differs by platform
-		// On Windows: Returns ErrInvalidArgument (absolute path detected)
-		// On Unix: Returns ErrPathTraversalAttempt (backslash detected)
+		// Note: Windows absolute paths (C:\Windows\win.ini and verbatim \\?\
+		// forms) are not listed here because the reserved-filename-character
+		// rule rejects them with ErrInvalidArgument on every platform, before
+		// the absolute-path or backslash checks can run.
 	}
 
 	for _, tc := range testCases {
@@ -200,9 +201,9 @@ func TestValidateRelativePath(t *testing.T) {
 			wantError:    true,
 			expectedErr:  core.ErrInvalidArgument,
 		},
-		// Note: Windows absolute path test removed - behavior differs by platform
-		// On Windows: Returns ErrInvalidArgument (absolute path detected)
-		// On Unix: Returns ErrPathTraversalAttempt (backslash detected)
+		// Note: Windows absolute paths are rejected by the unconditional
+		// reserved-filename-character rule with ErrInvalidArgument on every
+		// platform; see TestSanitizeAndJoin_PathTraversal.
 		{
 			name:         "Parent directory",
 			relativePath: "../file.txt",
