@@ -20,6 +20,13 @@ venue:
   # Enable database health checking on startup
   enableDatabaseHealthCheck: true
 
+  # Skip rebuilding directory quota counts from metadata during NewVenue.
+  # The tenant counts are always rebuilt (they live in memory); the directory pass
+  # is the expensive half on a large store. Set true only when the quota database
+  # is known to be reconciled, and call Venue.ReconcileQuotaCounts (with ingest
+  # paused) during maintenance instead.
+  skipDirectoryQuotaReconciliationOnStartup: false
+
   # Fail startup instead of continuing when a metadata database had to be
   # quarantined and no backup could be restored. The default (false) reports the
   # degraded state and continues with an empty database until the operator acts;
@@ -102,6 +109,15 @@ venue:
       # Cache the volume health probe for this long (0 = default 30s,
       # negative disables caching so every operation probes the volume)
       healthCheckCacheTTL: 30s
+      # Cache the capacity / available-space reading for this long
+      # (0 = default 5s, negative asks the filesystem on every call). Volume
+      # selection reads this per write; a stale reading that misses a filling
+      # volume costs one failed write, retried on the next candidate.
+      spaceCacheTTL: 5s
+      # Buffered writer size for payload writes (0 = default 128 KiB)
+      writeBufferSize: 131072
+      # Pooled staging buffer size for streaming one payload (0 = default 256 KiB)
+      copyBufferSize: 262144
       # How long startup waits before the first health-check *retry*. A volume
       # that answers the first probe is never delayed, so the wait only happens
       # when the volume is not ready yet (for example a network volume still
@@ -124,6 +140,9 @@ venue:
       shardingDepth: 2
       enableFsync: true
       healthCheckCacheTTL: 30s
+      spaceCacheTTL: 5s
+      writeBufferSize: 131072
+      copyBufferSize: 262144
       initialDelay: 2s
       healthCheckDelay: 500ms
       warmupOnStartup: false

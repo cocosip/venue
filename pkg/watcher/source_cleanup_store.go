@@ -80,6 +80,12 @@ type SourceCleanupJob struct {
 // SourceCleanupStoreOptions controls the durable source cleanup store.
 type SourceCleanupStoreOptions struct {
 	MaxActiveJobs int
+
+	// Sqlite is the engine policy for the cleanup database. A zero value
+	// selects sqlite.DefaultOptions so the durable cleanup database follows the
+	// same journal, synchronous and busy-timeout policy as the metadata and
+	// quota databases.
+	Sqlite sqlite.Options
 }
 
 // SourceCleanupStore owns durable reservations and leases for source cleanup.
@@ -156,7 +162,11 @@ func OpenSourceCleanupStore(ctx context.Context, path string, options SourceClea
 	if err := os.MkdirAll(filepath.Dir(filepath.Clean(path)), 0o755); err != nil {
 		return nil, fmt.Errorf("create source cleanup database directory: %w", err)
 	}
-	db, err := sqlite.Open(ctx, path, sqlite.DefaultOptions())
+	sqliteOptions := options.Sqlite
+	if sqliteOptions == (sqlite.Options{}) {
+		sqliteOptions = sqlite.DefaultOptions()
+	}
+	db, err := sqlite.Open(ctx, path, sqliteOptions)
 	if err != nil {
 		return nil, fmt.Errorf("open source cleanup database: %w", err)
 	}
@@ -220,6 +230,20 @@ func (s *sqliteSourceCleanupStore) TryReserve(ctx context.Context, job *SourceCl
 	if err := core.ValidateTenantID(job.TenantID); err != nil {
 		return false, fmt.Errorf("invalid source cleanup tenant: %w", err)
 	}
+	// Fast path: an unchanged source (same watcher, path and fingerprint) needs
+	// no reservation, and answering that with a plain read avoids taking the
+	// database's single write lock for every file a scan re-observes. The
+	// transaction below still re-checks, so a concurrent change cannot slip in.
+	var reservedFingerprint string
+	switch err := s.db.QueryRowContext(ctx,
+		`SELECT fingerprint FROM source_cleanup_jobs WHERE watcher_id = ? AND source_path = ?`,
+		job.WatcherID, job.SourcePath).Scan(&reservedFingerprint); {
+	case err == nil && reservedFingerprint == job.Fingerprint:
+		return false, nil
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return false, fmt.Errorf("read source cleanup reservation: %w", err)
+	}
+
 	now := time.Now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

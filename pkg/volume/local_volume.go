@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,22 @@ var (
 // result. Health probes touch the filesystem, so the result is reused for this
 // window instead of writing and deleting a probe file on every call.
 const DefaultHealthCheckCacheTTL = 30 * time.Second
+
+// DefaultSpaceCacheTTL is the default lifetime of a cached disk-space reading.
+// Capacity is read from the filesystem (a statfs or GetDiskFreeSpaceEx call) on
+// every write when the cache is disabled, so a short shared window keeps volume
+// selection cheap without hiding a filling disk for long: a stale reading that
+// misses a nearly-full volume costs one failed write, which the pool retries on
+// the next candidate.
+const DefaultSpaceCacheTTL = 5 * time.Second
+
+// DefaultWriteBufferSize and DefaultCopyBufferSize mirror Locus's volume
+// defaults. The write buffer batches the payload into fewer filesystem writes,
+// and the copy buffer is the per-write staging buffer reused through a pool.
+const (
+	DefaultWriteBufferSize = 128 * 1024
+	DefaultCopyBufferSize  = 256 * 1024
+)
 
 // writeWarmupFilePrefix is the volume-internal name prefix of the throwaway file
 // WarmWritePathCache creates. The leading dot keeps it out of every tenant
@@ -68,6 +85,19 @@ type LocalFileSystemVolumeOptions struct {
 	// Zero selects DefaultHealthCheckCacheTTL; a negative value disables the
 	// cache so every IsHealthy call probes the volume.
 	HealthCheckCacheTTL time.Duration
+
+	// SpaceCacheTTL is how long a TotalCapacity/AvailableSpace reading is
+	// reused. Zero selects DefaultSpaceCacheTTL; a negative value disables the
+	// cache so every call asks the filesystem.
+	SpaceCacheTTL time.Duration
+
+	// WriteBufferSize is the buffered writer size used by WriteFile.
+	// Zero selects DefaultWriteBufferSize.
+	WriteBufferSize int
+
+	// CopyBufferSize is the staging buffer size used to stream one payload.
+	// Zero selects DefaultCopyBufferSize; the buffer is reused through a pool.
+	CopyBufferSize int
 }
 
 // LocalFileSystemVolume implements StorageVolume for local filesystem.
@@ -97,13 +127,42 @@ type LocalFileSystemVolume struct {
 	syncDirectory   func(string) error
 	openFileForRead func(string) (*os.File, error)
 
-	// healthMu makes the probe single-flight: callers that arrive while a probe
-	// is running wait for it and then reuse its cached result. It guards only the
-	// cached probe state; the write path never takes it.
-	healthMu        sync.Mutex
-	healthKnown     bool
-	healthValue     bool
-	healthExpiresAt time.Time
+	// probeSpace is a seam for deterministic tests. It defaults to the
+	// platform-specific probeDiskSpace.
+	probeSpace func(context.Context) (int64, int64, error)
+
+	// healthMu guards the cached probe state. IsHealthy never holds it while a
+	// probe is running on a warm cache: an expired entry returns the stale
+	// verdict immediately and refreshes it in the background, so a slow or hung
+	// volume probe cannot stall every concurrent write.
+	healthMu         sync.Mutex
+	healthKnown      bool
+	healthValue      bool
+	healthExpiresAt  time.Time
+	healthRefreshing bool
+	// healthForce increments on every forced probe. A background refresh that
+	// started before the forced probe must not overwrite its verdict, so the
+	// refresh publishes only when the counter still matches.
+	healthForce uint64
+
+	// spaceCacheTTL is the lifetime of a cached capacity reading. Negative
+	// values disable caching.
+	spaceCacheTTL time.Duration
+
+	// spaceMu guards the cached capacity reading. The first reading is taken
+	// synchronously; later refreshes happen in the background while callers
+	// keep using the previous value.
+	spaceMu         sync.Mutex
+	spaceKnown      bool
+	spaceTotal      int64
+	spaceAvailable  int64
+	spaceExpiresAt  time.Time
+	spaceRefreshing bool
+
+	// copyBuffers and writeBuffers reuse the payload buffers across writes so a
+	// large file does not allocate one per write.
+	copyBuffers  sync.Pool
+	writeBuffers sync.Pool
 }
 
 // NewLocalFileSystemVolume creates a new local file system volume.
@@ -139,6 +198,27 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 		healthCacheTTL = DefaultHealthCheckCacheTTL
 	}
 
+	spaceCacheTTL := opts.SpaceCacheTTL
+	if spaceCacheTTL == 0 {
+		spaceCacheTTL = DefaultSpaceCacheTTL
+	}
+
+	writeBufferSize := opts.WriteBufferSize
+	if writeBufferSize == 0 {
+		writeBufferSize = DefaultWriteBufferSize
+	}
+	if writeBufferSize < 0 {
+		return nil, fmt.Errorf("write buffer size cannot be negative: %w", core.ErrInvalidArgument)
+	}
+
+	copyBufferSize := opts.CopyBufferSize
+	if copyBufferSize == 0 {
+		copyBufferSize = DefaultCopyBufferSize
+	}
+	if copyBufferSize < 0 {
+		return nil, fmt.Errorf("copy buffer size cannot be negative: %w", core.ErrInvalidArgument)
+	}
+
 	volume := &LocalFileSystemVolume{
 		volumeID:       opts.VolumeID,
 		mountPath:      opts.MountPath,
@@ -146,9 +226,18 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 		enableFsync:    opts.EnableFsync,
 		sanitizer:      NewPathSanitizer(opts.MountPath),
 		healthCacheTTL: healthCacheTTL,
+		spaceCacheTTL:  spaceCacheTTL,
 		now:            time.Now,
 	}
+	volume.copyBuffers.New = func() any {
+		buffer := make([]byte, copyBufferSize)
+		return &buffer
+	}
+	volume.writeBuffers.New = func() any {
+		return bufio.NewWriterSize(io.Discard, writeBufferSize)
+	}
 	volume.probeHealth = volume.performHealthProbe
+	volume.probeSpace = volume.probeDiskSpace
 	volume.warmupName = func() string {
 		return writeWarmupFilePrefix + uuid.NewString()
 	}
@@ -178,11 +267,89 @@ func (v *LocalFileSystemVolume) ShardingDepth() int {
 	return v.shardDepth
 }
 
+// TotalCapacity returns the total capacity in bytes.
+//
+// The reading is cached for SpaceCacheTTL: an expired reading is returned
+// immediately and refreshed in the background, so volume selection never pays a
+// filesystem round trip per write. A negative TTL disables the cache.
+func (v *LocalFileSystemVolume) TotalCapacity(ctx context.Context) (int64, error) {
+	total, _, err := v.spaceSnapshot(ctx)
+	return total, err
+}
+
+// AvailableSpace returns the available space in bytes.
+//
+// It shares the cache, the first-call probe and the background refresh with
+// TotalCapacity, so callers that ask for both pay one filesystem call.
+func (v *LocalFileSystemVolume) AvailableSpace(ctx context.Context) (int64, error) {
+	_, available, err := v.spaceSnapshot(ctx)
+	return available, err
+}
+
+// spaceSnapshot returns the cached capacity pair, probing on the first call and
+// refreshing an expired pair in the background.
+func (v *LocalFileSystemVolume) spaceSnapshot(ctx context.Context) (total int64, available int64, err error) {
+	if v.spaceCacheTTL < 0 {
+		return v.probeSpace(ctx)
+	}
+
+	now := v.now()
+	v.spaceMu.Lock()
+	if v.spaceKnown && now.Before(v.spaceExpiresAt) {
+		total, available = v.spaceTotal, v.spaceAvailable
+		v.spaceMu.Unlock()
+		return total, available, nil
+	}
+	if v.spaceKnown {
+		// Stale-while-revalidate: a filesystem that is slow to answer must not
+		// serialize every write behind one capacity query.
+		total, available = v.spaceTotal, v.spaceAvailable
+		if !v.spaceRefreshing {
+			v.spaceRefreshing = true
+			refreshCtx := context.WithoutCancel(ctx)
+			go v.refreshSpace(refreshCtx)
+		}
+		v.spaceMu.Unlock()
+		return total, available, nil
+	}
+
+	// First reading: there is nothing cached to return, so probe synchronously.
+	total, available, err = v.probeSpace(ctx)
+	if err == nil {
+		v.spaceKnown = true
+		v.spaceTotal = total
+		v.spaceAvailable = available
+		v.spaceExpiresAt = now.Add(v.spaceCacheTTL)
+	}
+	v.spaceMu.Unlock()
+	return total, available, err
+}
+
+// refreshSpace refreshes an expired capacity reading and publishes it.
+func (v *LocalFileSystemVolume) refreshSpace(ctx context.Context) {
+	total, available, err := v.probeSpace(ctx)
+
+	v.spaceMu.Lock()
+	v.spaceRefreshing = false
+	if err == nil {
+		v.spaceKnown = true
+		v.spaceTotal = total
+		v.spaceAvailable = available
+		v.spaceExpiresAt = v.now().Add(v.spaceCacheTTL)
+	}
+	v.spaceMu.Unlock()
+}
+
 // IsHealthy checks if the volume is healthy and available for operations.
 //
 // The probe (mount-path stat plus a small write/delete round trip) is cached
 // for HealthCheckCacheTTL, and a negative TTL disables the cache. Failed probes
-// are cached for the same window. Concurrent callers share a single probe.
+// are cached for the same window.
+//
+// On a warm cache an expired verdict is refreshed in the background: the caller
+// gets the previous answer immediately and never waits for a slow or hung probe.
+// The first call has no answer to return, so it probes synchronously; a forced
+// probe should use ProbeHealth.
 //
 // A cancelled or expired context never poisons the cache: a context failure
 // says nothing about the volume, and caching it would make one cancelled
@@ -198,21 +365,59 @@ func (v *LocalFileSystemVolume) IsHealthy(ctx context.Context) bool {
 	}
 
 	v.healthMu.Lock()
-	defer v.healthMu.Unlock()
-
 	now := v.now()
 	if v.healthKnown && now.Before(v.healthExpiresAt) {
-		return v.healthValue
+		healthy := v.healthValue
+		v.healthMu.Unlock()
+		return healthy
 	}
 
-	// Only the lock holder probes; callers blocked here reuse the result that
-	// this probe caches before releasing the lock.
+	if v.healthKnown {
+		// Stale-while-revalidate: the expiry window must not turn every
+		// concurrent writer into a probe queue behind one slow filesystem.
+		healthy := v.healthValue
+		if !v.healthRefreshing {
+			v.healthRefreshing = true
+			force := v.healthForce
+			refreshCtx := context.WithoutCancel(ctx)
+			go v.refreshHealth(refreshCtx, force)
+		}
+		v.healthMu.Unlock()
+		return healthy
+	}
+
+	// No known verdict yet: probe synchronously so startup and the first write
+	// observe the real state. The lock serializes concurrent first callers onto
+	// this one probe, and each of them reuses the published result.
 	healthy := v.probeHealth(ctx)
 	v.healthKnown = true
 	v.healthValue = healthy
 	v.healthExpiresAt = now.Add(v.healthCacheTTL)
+	v.healthMu.Unlock()
 
 	return healthy
+}
+
+// refreshHealth probes the volume for an expired cached verdict and publishes the
+// outcome.
+//
+// It runs on its own goroutine, so it never holds healthMu while the probe does
+// I/O. A context detached from the caller's cancellation is used because the
+// caller has already received the stale verdict and may have finished its
+// request. force is the forced-probe counter observed when the refresh started;
+// if a ProbeHealth ran meanwhile, its explicit verdict wins and this result is
+// dropped.
+func (v *LocalFileSystemVolume) refreshHealth(ctx context.Context, force uint64) {
+	healthy := v.probeHealth(ctx)
+
+	v.healthMu.Lock()
+	v.healthRefreshing = false
+	if v.healthForce == force {
+		v.healthKnown = true
+		v.healthValue = healthy
+		v.healthExpiresAt = v.now().Add(v.healthCacheTTL)
+	}
+	v.healthMu.Unlock()
 }
 
 // ProbeHealth performs an immediate health probe and refreshes the cached health
@@ -232,6 +437,7 @@ func (v *LocalFileSystemVolume) ProbeHealth(ctx context.Context) bool {
 	healthy := v.probeHealth(ctx)
 
 	v.healthMu.Lock()
+	v.healthForce++
 	v.healthKnown = true
 	v.healthValue = healthy
 	v.healthExpiresAt = v.now().Add(v.healthCacheTTL)
@@ -329,9 +535,10 @@ func contextFailure(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// TotalCapacity and AvailableSpace are implemented in platform-specific files:
-// - local_volume_unix.go for Linux/macOS
-// - local_volume_windows.go for Windows
+// TotalCapacity and AvailableSpace share the cached snapshot in this file; the
+// platform-specific files implement probeDiskSpace:
+// - local_volume_unix.go for Linux/macOS (one statfs call)
+// - local_volume_windows.go for Windows (one GetDiskFreeSpaceEx call)
 
 // WriteFile writes a file to the specified path within the volume.
 // Returns the number of bytes written.
@@ -380,8 +587,28 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 	}()
 
 	// Copy content through a context-aware reader so a cancelled request stops
-	// at the next chunk instead of streaming the whole payload.
-	written, copyErr := io.Copy(file, &contextReader{ctx: ctx, reader: content})
+	// at the next chunk instead of streaming the whole payload. The payload is
+	// buffered into write-buffer-sized filesystem writes, and the staging buffer
+	// is reused across writes; exposing only Write (not ReaderFrom) keeps
+	// io.CopyBuffer from silently bypassing that buffer.
+	buffer := v.copyBuffers.Get().(*[]byte)
+	defer v.copyBuffers.Put(buffer)
+
+	buffered := v.writeBuffers.Get().(*bufio.Writer)
+	buffered.Reset(file)
+	defer func() {
+		buffered.Reset(io.Discard)
+		v.writeBuffers.Put(buffered)
+	}()
+
+	written, copyErr := io.CopyBuffer(
+		struct{ io.Writer }{buffered},
+		&contextReader{ctx: ctx, reader: content},
+		*buffer,
+	)
+	if copyErr == nil {
+		copyErr = buffered.Flush()
+	}
 	if copyErr != nil {
 		return 0, fmt.Errorf("failed to write file content: %w", copyErr)
 	}

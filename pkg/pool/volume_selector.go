@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"sync"
 
 	"github.com/cocosip/venue/pkg/core"
 )
@@ -32,6 +31,9 @@ type VolumeCandidateSelector interface {
 // MostAvailableSpaceSelector selects the volume with the most available space.
 // Volumes that are unhealthy, report an error, or have no free space left are
 // never selected.
+//
+// The storage pool uses this selector exclusively. A different selection policy
+// would need a new option on StoragePool, so no other selector is shipped.
 type MostAvailableSpaceSelector struct{}
 
 // SelectVolume selects the volume with the most available space.
@@ -98,78 +100,4 @@ func (s *MostAvailableSpaceSelector) SelectVolumeCandidates(
 		result[i] = candidates[i].volume
 	}
 	return result, nil
-}
-
-// RoundRobinSelector selects volumes in a round-robin fashion. It is safe for
-// concurrent use.
-type RoundRobinSelector struct {
-	mu        sync.Mutex
-	lastIndex int
-}
-
-// SelectVolume selects the next volume in round-robin order.
-//
-// Healthy volumes are ordered by volume ID so rotation is deterministic even
-// though the input is a map.
-func (s *RoundRobinSelector) SelectVolume(ctx context.Context, volumes map[string]core.StorageVolume) (core.StorageVolume, error) {
-	if len(volumes) == 0 {
-		return nil, fmt.Errorf("no volumes available: %w", core.ErrInsufficientStorage)
-	}
-
-	// Convert map to slice for indexing
-	volumeSlice := make([]core.StorageVolume, 0, len(volumes))
-	for _, vol := range volumes {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if vol.IsHealthy(ctx) {
-			volumeSlice = append(volumeSlice, vol)
-		}
-	}
-
-	if len(volumeSlice) == 0 {
-		return nil, fmt.Errorf("no healthy volumes available: %w", core.ErrInsufficientStorage)
-	}
-
-	sort.SliceStable(volumeSlice, func(i, j int) bool {
-		return volumeSlice[i].VolumeID() < volumeSlice[j].VolumeID()
-	})
-
-	s.mu.Lock()
-	index := s.lastIndex % len(volumeSlice)
-	selected := volumeSlice[index]
-	s.lastIndex = (index + 1) % len(volumeSlice)
-	s.mu.Unlock()
-
-	return selected, nil
-}
-
-// FirstHealthySelector always selects the first healthy volume.
-type FirstHealthySelector struct{}
-
-// SelectVolume selects the first healthy volume, ordered by volume ID.
-func (s *FirstHealthySelector) SelectVolume(ctx context.Context, volumes map[string]core.StorageVolume) (core.StorageVolume, error) {
-	if len(volumes) == 0 {
-		return nil, fmt.Errorf("no volumes available: %w", core.ErrInsufficientStorage)
-	}
-
-	healthy := make([]core.StorageVolume, 0, len(volumes))
-	for _, volume := range volumes {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if volume.IsHealthy(ctx) {
-			healthy = append(healthy, volume)
-		}
-	}
-
-	if len(healthy) == 0 {
-		return nil, fmt.Errorf("no healthy volumes available: %w", core.ErrInsufficientStorage)
-	}
-
-	sort.SliceStable(healthy, func(i, j int) bool {
-		return healthy[i].VolumeID() < healthy[j].VolumeID()
-	})
-
-	return healthy[0], nil
 }

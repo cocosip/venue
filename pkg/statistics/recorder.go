@@ -300,6 +300,9 @@ func (r *Recorder) Record(name string, value int64, timestamp time.Time, dimensi
 	}
 }
 
+// StatisticsEnabled reports that this recorder retains deltas.
+func (r *Recorder) StatisticsEnabled() bool { return true }
+
 // cell returns the counter cell for key, creating it while the series bound
 // allows. It returns nil when the bound is already reached.
 func (r *Recorder) cell(key seriesKey) *counter {
@@ -692,6 +695,10 @@ var Noop NoopRecorder
 
 // Record drops the delta. It allocates nothing.
 func (NoopRecorder) Record(string, int64, time.Time, map[string]string) {}
+
+// StatisticsEnabled reports that this recorder retains nothing, so instrumented
+// call sites can skip building dimension maps for it.
+func (NoopRecorder) StatisticsEnabled() bool { return false }
 
 // Snapshot returns an empty snapshot with a non-nil measurement slice.
 func (NoopRecorder) Snapshot(core.StatisticsQuery) core.StatisticsSnapshot {

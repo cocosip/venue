@@ -57,6 +57,11 @@ const (
 	// open may perform before it gives up. Without a bound, a database whose
 	// recreation also fails would quarantine in a loop.
 	corruptedDatabaseRecoveryAttempts = 2
+
+	// metadataIdleSweepInterval is how many handle releases pass between two
+	// idle eviction sweeps. The sweep is sampled so the idle timeout does not
+	// put an O(n log n) handle-table sort on every operation.
+	metadataIdleSweepInterval = 256
 )
 
 // SQLite metadata schema. Every statement is idempotent, so the whole script can
@@ -307,6 +312,12 @@ type SQLiteMetadataRepository struct {
 	// db is still nil.
 	openings map[string]*sqliteTenantOpening
 
+	// releaseOps counts handle releases so an idle handle is swept even when no
+	// new tenant database is opened. Without this counter the idle timeout only
+	// took effect on the next cold open, which never happens for a fixed tenant
+	// set. Guarded by mu.
+	releaseOps uint64
+
 	dirMu       sync.Mutex
 	dirTenants  []string
 	dirScannedA time.Time
@@ -384,6 +395,7 @@ type SQLiteMetadataTenantBackupService interface {
 var (
 	_ core.MetadataRepository           = (*SQLiteMetadataRepository)(nil)
 	_ core.StatusPageReader             = (*SQLiteMetadataRepository)(nil)
+	_ core.MetadataQuotaCounter         = (*SQLiteMetadataRepository)(nil)
 	_ core.MetadataBackupService        = (*SQLiteMetadataRepository)(nil)
 	_ SQLiteMetadataTenantBackupService = (*SQLiteMetadataRepository)(nil)
 )
@@ -1564,6 +1576,15 @@ func (r *SQLiteMetadataRepository) end(handle *sqliteTenantDatabase) {
 	}
 	handle.lastUsed = r.now()
 	handle.lastUsedNanos = handle.lastUsed.UnixNano()
+
+	// Sample the idle sweep instead of running it on every release: an idle
+	// timeout must not put an O(n log n) handle-table sort on the operation
+	// path. A fixed tenant set keeps its handles open forever otherwise, because
+	// the only other eviction point is a cold open that never happens.
+	r.releaseOps++
+	if r.idleTimeout > 0 && r.releaseOps%metadataIdleSweepInterval == 0 {
+		r.evictLocked("")
+	}
 	r.mu.Unlock()
 }
 

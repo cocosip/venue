@@ -27,6 +27,12 @@ const (
 const (
 	defaultVolumeInitialDelay     = 2 * time.Second
 	defaultVolumeHealthCheckDelay = 500 * time.Millisecond
+
+	// Volume capacity and write-path defaults. They mirror Locus: a short
+	// capacity cache, a buffered payload writer and a pooled staging buffer.
+	defaultVolumeSpaceCacheTTL   = 5 * time.Second
+	defaultVolumeWriteBufferSize = 128 * 1024
+	defaultVolumeCopyBufferSize  = 256 * 1024
 )
 
 // Advanced watcher defaults, applied by ApplyDefaults only to zero values.
@@ -58,6 +64,16 @@ type Config struct {
 	AutoCreateTenants                 bool   `json:"autoCreateTenants" yaml:"autoCreateTenants" mapstructure:"autoCreateTenants"`
 	DefaultTenantQuota                int64  `json:"defaultTenantQuota" yaml:"defaultTenantQuota" mapstructure:"defaultTenantQuota"`
 	EnableDatabaseHealthCheck         bool   `json:"enableDatabaseHealthCheck" yaml:"enableDatabaseHealthCheck" mapstructure:"enableDatabaseHealthCheck"`
+
+	// SkipDirectoryQuotaReconciliationOnStartup skips rebuilding directory
+	// quota counts from metadata during NewVenue.
+	//
+	// The directory pass is the expensive half of startup reconciliation: it
+	// scans every counted record and writes one row per logical directory. A
+	// deployment with a stable, already-reconciled quota database can skip it and
+	// call Venue.ReconcileQuotaCounts during a maintenance window instead.
+	// Tenant counts are always rebuilt, because they live only in memory.
+	SkipDirectoryQuotaReconciliationOnStartup bool `json:"skipDirectoryQuotaReconciliationOnStartup" yaml:"skipDirectoryQuotaReconciliationOnStartup" mapstructure:"skipDirectoryQuotaReconciliationOnStartup"`
 
 	// FailFastOnStartupRecoveryFailure makes startup fail when a database had to
 	// be quarantined and could not be restored from a backup. When false (the
@@ -202,6 +218,20 @@ type VolumeConfig struct {
 	// write path does not perform a probe write per volume per operation.
 	// Zero selects the runtime default (30s); a negative value disables caching.
 	HealthCheckCacheTTL time.Duration `json:"healthCheckCacheTTL" yaml:"healthCheckCacheTTL" mapstructure:"healthCheckCacheTTL"`
+
+	// SpaceCacheTTL caches the volume capacity and available-space reading.
+	// Zero selects the runtime default (5s); a negative value asks the
+	// filesystem on every call.
+	SpaceCacheTTL time.Duration `json:"spaceCacheTTL" yaml:"spaceCacheTTL" mapstructure:"spaceCacheTTL"`
+
+	// WriteBufferSize is the buffered writer size used for payload writes.
+	// Zero selects the runtime default (128 KiB).
+	WriteBufferSize int `json:"writeBufferSize" yaml:"writeBufferSize" mapstructure:"writeBufferSize"`
+
+	// CopyBufferSize is the staging buffer size used to stream one payload.
+	// Zero selects the runtime default (256 KiB); the buffer is reused through a
+	// pool and is never allocated per write.
+	CopyBufferSize int `json:"copyBufferSize" yaml:"copyBufferSize" mapstructure:"copyBufferSize"`
 
 	// InitialDelay is how long startup waits before the first health-check retry
 	// for this volume, so a network volume such as a Kubernetes PVC can finish
@@ -830,12 +860,6 @@ func (c *Config) ApplyDefaults() {
 	if c.Cleanup.PermanentlyFailedDisposition == "" {
 		c.Cleanup.PermanentlyFailedDisposition = d.Cleanup.PermanentlyFailedDisposition
 	}
-	if c.Cleanup.DeadLetter.RootPath == "" {
-		c.Cleanup.DeadLetter.RootPath = d.Cleanup.DeadLetter.RootPath
-	}
-	if c.Cleanup.DeadLetter.ShardingDepth == 0 {
-		c.Cleanup.DeadLetter.ShardingDepth = d.Cleanup.DeadLetter.ShardingDepth
-	}
 	if c.Sqlite.JournalMode == "" {
 		c.Sqlite.JournalMode = d.Sqlite.JournalMode
 	}
@@ -942,6 +966,15 @@ func (c *Config) ApplyDefaults() {
 		}
 		if c.Volumes[i].HealthCheckDelay == 0 {
 			c.Volumes[i].HealthCheckDelay = defaultVolumeHealthCheckDelay
+		}
+		if c.Volumes[i].SpaceCacheTTL == 0 {
+			c.Volumes[i].SpaceCacheTTL = defaultVolumeSpaceCacheTTL
+		}
+		if c.Volumes[i].WriteBufferSize == 0 {
+			c.Volumes[i].WriteBufferSize = defaultVolumeWriteBufferSize
+		}
+		if c.Volumes[i].CopyBufferSize == 0 {
+			c.Volumes[i].CopyBufferSize = defaultVolumeCopyBufferSize
 		}
 	}
 	for i := range c.FileWatchers {
@@ -1094,6 +1127,12 @@ func (c *Config) Validate() error {
 		}
 		if volume.HealthCheckDelay < 0 {
 			return fmt.Errorf("volume[%d]: HealthCheckDelay cannot be negative", i)
+		}
+		if volume.WriteBufferSize < 0 {
+			return fmt.Errorf("volume[%d]: WriteBufferSize cannot be negative", i)
+		}
+		if volume.CopyBufferSize < 0 {
+			return fmt.Errorf("volume[%d]: CopyBufferSize cannot be negative", i)
 		}
 	}
 

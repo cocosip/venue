@@ -36,9 +36,13 @@ type FileSchedulerOptions struct {
 
 	// TimedOutReclaimCooldown is the minimum interval between immediate reclaim
 	// attempts for one tenant. Default: 30 seconds; a negative value disables the
-	// cooldown (every empty result may reclaim). The cooldown is shared by the
-	// synchronous empty-queue reclaim and the opportunistic background pass, so the
-	// two cannot both run for one tenant inside one cooldown window.
+	// cooldown (every empty result may reclaim).
+	//
+	// The synchronous empty-queue reclaim and the opportunistic background pass
+	// each keep their own per-tenant deadline with this value. They deliberately
+	// do not share a window: an emergency reclaim must never be suppressed by a
+	// recent opportunistic pass, so a tenant can reclaim at most once per path
+	// per window.
 	TimedOutReclaimCooldown time.Duration
 
 	// EmptyQueueReclaimBatchSize bounds the synchronous reclaim performed when a
@@ -204,8 +208,14 @@ func NewFileScheduler(
 		opts = DefaultFileSchedulerOptions()
 	}
 
-	if opts.RetryPolicy == nil {
-		opts.RetryPolicy = core.DefaultFileRetryPolicy()
+	// The scheduler repairs unset or unusable values, but it must never mutate
+	// the caller's options: a caller may reuse one options value for several
+	// schedulers (for example one per tenant scope) or read it concurrently
+	// while construction runs. All repair below therefore happens on a copy.
+	effective := *opts
+
+	if effective.RetryPolicy == nil {
+		effective.RetryPolicy = core.DefaultFileRetryPolicy()
 	}
 
 	// A non-positive delay cannot express a usable backoff: a zero
@@ -213,47 +223,47 @@ func NewFileScheduler(
 	// tight retry loop) and a negative InitialRetryDelay yields an
 	// availableAt in the past. Both are repaired rather than rejected so a
 	// partially hand-built policy still starts. The policy is copied first so
-	// the caller's value is never mutated.
+	// the caller's policy value is never mutated.
 	retryDefaults := core.DefaultFileRetryPolicy()
-	clampedPolicy := *opts.RetryPolicy
+	clampedPolicy := *effective.RetryPolicy
 	if clampedPolicy.InitialRetryDelay <= 0 {
 		clampedPolicy.InitialRetryDelay = retryDefaults.InitialRetryDelay
 	}
 	if clampedPolicy.MaxRetryDelay <= 0 {
 		clampedPolicy.MaxRetryDelay = retryDefaults.MaxRetryDelay
 	}
-	opts.RetryPolicy = &clampedPolicy
+	effective.RetryPolicy = &clampedPolicy
 
-	if opts.ProcessingTimeout == 0 {
-		opts.ProcessingTimeout = 30 * time.Minute
+	if effective.ProcessingTimeout == 0 {
+		effective.ProcessingTimeout = 30 * time.Minute
 	}
 
 	// A zero cooldown means the option was left unset; only a negative value
 	// disables the cooldown gate.
-	if opts.TimedOutReclaimCooldown == 0 {
-		opts.TimedOutReclaimCooldown = defaultTimedOutReclaimCooldown
+	if effective.TimedOutReclaimCooldown == 0 {
+		effective.TimedOutReclaimCooldown = defaultTimedOutReclaimCooldown
 	}
 
 	// A zero empty-queue batch size means the option was left unset, matching the
 	// documented configuration semantics; only a negative value disables the
 	// synchronous pass. The background batch size deliberately has no such
 	// substitution: any non-positive value disables the background pass.
-	if opts.EmptyQueueReclaimBatchSize == 0 {
-		opts.EmptyQueueReclaimBatchSize = DefaultEmptyQueueReclaimBatchSize
+	if effective.EmptyQueueReclaimBatchSize == 0 {
+		effective.EmptyQueueReclaimBatchSize = DefaultEmptyQueueReclaimBatchSize
 	}
 
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
 
 	return &fileScheduler{
 		metadataRepo:                       metadataRepo,
-		retryPolicy:                        opts.RetryPolicy,
-		processingTimeout:                  opts.ProcessingTimeout,
-		recoverTimedOutOnEmptyQueue:        opts.RecoverTimedOutOnEmptyQueue,
-		timedOutReclaimCooldown:            opts.TimedOutReclaimCooldown,
-		emptyQueueReclaimBatchSize:         opts.EmptyQueueReclaimBatchSize,
-		backgroundTimedOutReclaimEnabled:   opts.BackgroundTimedOutReclaimEnabled,
-		backgroundTimedOutReclaimBatchSize: opts.BackgroundTimedOutReclaimBatchSize,
-		logger:                             opts.Logging,
+		retryPolicy:                        effective.RetryPolicy,
+		processingTimeout:                  effective.ProcessingTimeout,
+		recoverTimedOutOnEmptyQueue:        effective.RecoverTimedOutOnEmptyQueue,
+		timedOutReclaimCooldown:            effective.TimedOutReclaimCooldown,
+		emptyQueueReclaimBatchSize:         effective.EmptyQueueReclaimBatchSize,
+		backgroundTimedOutReclaimEnabled:   effective.BackgroundTimedOutReclaimEnabled,
+		backgroundTimedOutReclaimBatchSize: effective.BackgroundTimedOutReclaimBatchSize,
+		logger:                             effective.Logging,
 		reclaimDeadlines:                   make(map[string]time.Time),
 		backgroundReclaimDeadlines:         make(map[string]time.Time),
 		backgroundCtx:                      backgroundCtx,
@@ -345,7 +355,9 @@ func (s *fileScheduler) GetNextBatchForProcessing(ctx context.Context, tenant co
 
 	locations, err := s.claimPendingBatch(ctx, tenant.ID, batchSize)
 	if err != nil {
-		return nil, err
+		// locations may be a non-empty claimed prefix (see claimPendingBatch);
+		// return it alongside the failure so the caller does not lose leases.
+		return locations, err
 	}
 	if len(locations) > 0 {
 		s.scheduleBackgroundTimedOutReclaim(tenant.ID)
@@ -362,7 +374,7 @@ func (s *fileScheduler) GetNextBatchForProcessing(ctx context.Context, tenant co
 
 	locations, err = s.claimPendingBatch(ctx, tenant.ID, batchSize)
 	if err != nil {
-		return nil, err
+		return locations, err
 	}
 	if len(locations) > 0 {
 		s.scheduleBackgroundTimedOutReclaim(tenant.ID)
@@ -437,7 +449,11 @@ func (s *fileScheduler) claimPendingBatch(ctx context.Context, tenantID string, 
 				break
 			}
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				// The prefix claimed before cancellation is real work the
+				// caller already owns: returning it together with the context
+				// error keeps those leases visible instead of stranding them
+				// in Processing until the timeout reclaim.
+				return claimed, err
 			}
 
 			err := s.transitionToProcessing(ctx, file)
@@ -448,7 +464,10 @@ func (s *fileScheduler) claimPendingBatch(ctx context.Context, tenantID string, 
 				continue
 			}
 			if !claimRetryable(err) {
-				return nil, fmt.Errorf("failed to claim file %q: %w", file.FileKey, err)
+				// Same contract as the cancellation path: the failed candidate
+				// is not claimed, but every earlier success in this batch is
+				// returned so the caller can process or release it.
+				return claimed, fmt.Errorf("failed to claim file %q: %w", file.FileKey, err)
 			}
 		}
 

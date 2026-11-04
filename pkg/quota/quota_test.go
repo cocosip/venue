@@ -30,6 +30,108 @@ func newQuotaManagerRepository(t *testing.T) core.DirectoryQuotaRepository {
 	return repository
 }
 
+// TestSQLiteDirectoryQuotaRepositorySetFileCounts verifies the reconciliation
+// write path: several counts in one transaction, a missing directory created with
+// the domain defaults, and an existing limit preserved.
+func TestSQLiteDirectoryQuotaRepositorySetFileCounts(t *testing.T) {
+	ctx := context.Background()
+
+	repository := newQuotaManagerRepository(t)
+	setter, ok := repository.(core.DirectoryQuotaCountSetter)
+	if !ok {
+		t.Fatal("SQLite directory quota repository does not implement DirectoryQuotaCountSetter")
+	}
+
+	manager, err := NewDirectoryQuotaManager(repository)
+	if err != nil {
+		t.Fatalf("NewDirectoryQuotaManager() error = %v", err)
+	}
+	if err := manager.SetQuota(ctx, "tenant-set", "/limited", 2); err != nil {
+		t.Fatalf("SetQuota() error = %v", err)
+	}
+	if err := manager.IncrementFileCount(ctx, "tenant-set", "/limited"); err != nil {
+		t.Fatalf("IncrementFileCount() error = %v", err)
+	}
+
+	if err := setter.SetFileCounts(ctx, "tenant-set", map[string]int{
+		"/limited": 1,
+		"/fresh":   3,
+	}); err != nil {
+		t.Fatalf("SetFileCounts() error = %v", err)
+	}
+
+	limited, err := manager.GetFileCount(ctx, "tenant-set", "/limited")
+	if err != nil {
+		t.Fatalf("GetFileCount(/limited) error = %v", err)
+	}
+	fresh, err := manager.GetFileCount(ctx, "tenant-set", "/fresh")
+	if err != nil {
+		t.Fatalf("GetFileCount(/fresh) error = %v", err)
+	}
+	if limited != 1 || fresh != 3 {
+		t.Fatalf("counts = (%d, %d), want (1, 3)", limited, fresh)
+	}
+
+	// The existing limit survived the absolute count update: one more file fits.
+	if canAdd, err := manager.CanAddFile(ctx, "tenant-set", "/limited"); err != nil || !canAdd {
+		t.Fatalf("CanAddFile(/limited) = (%v, %v), want (true, nil)", canAdd, err)
+	}
+	// The freshly created row is unlimited, like GetOrCreate creates it.
+	if canAdd, err := manager.CanAddFile(ctx, "tenant-set", "/fresh"); err != nil || !canAdd {
+		t.Fatalf("CanAddFile(/fresh) = (%v, %v), want (true, nil)", canAdd, err)
+	}
+}
+
+// TestSQLiteDirectoryQuotaRepositoryOptimizePrunesEmptyRows verifies maintenance
+// drops rows with no count, no limit and no enabled flag while keeping a
+// configured quota that currently has no file.
+func TestSQLiteDirectoryQuotaRepositoryOptimizePrunesEmptyRows(t *testing.T) {
+	ctx := context.Background()
+
+	repository := newQuotaManagerRepository(t)
+	manager, err := NewDirectoryQuotaManager(repository)
+	if err != nil {
+		t.Fatalf("NewDirectoryQuotaManager() error = %v", err)
+	}
+
+	if err := manager.IncrementFileCount(ctx, "tenant-prune", "/empty"); err != nil {
+		t.Fatalf("IncrementFileCount(/empty) error = %v", err)
+	}
+	if err := manager.DecrementFileCount(ctx, "tenant-prune", "/empty"); err != nil {
+		t.Fatalf("DecrementFileCount(/empty) error = %v", err)
+	}
+	if err := manager.SetQuota(ctx, "tenant-prune", "/limited", 2); err != nil {
+		t.Fatalf("SetQuota(/limited) error = %v", err)
+	}
+
+	optimizer, ok := repository.(interface{ Optimize(context.Context) error })
+	if !ok {
+		t.Fatal("repository does not implement Optimize")
+	}
+	if err := optimizer.Optimize(ctx); err != nil {
+		t.Fatalf("Optimize() error = %v", err)
+	}
+
+	reader, ok := repository.(core.DirectoryQuotaReader)
+	if !ok {
+		t.Fatal("repository does not implement DirectoryQuotaReader")
+	}
+	empty, err := reader.Get(ctx, "tenant-prune", "/empty")
+	if err != nil {
+		t.Fatalf("Get(/empty) error = %v", err)
+	}
+	if empty != nil {
+		t.Fatalf("Get(/empty) = %+v, want the empty row pruned", empty)
+	}
+	limited, err := reader.Get(ctx, "tenant-prune", "/limited")
+	if err != nil {
+		t.Fatalf("Get(/limited) error = %v", err)
+	}
+	if limited == nil || limited.MaxCount != 2 {
+		t.Fatalf("Get(/limited) = %+v, want the configured limit retained", limited)
+	}
+}
+
 // TestDirectoryQuotaManager tests the directory quota manager against the SQLite
 // directory-quota repository it backs at runtime.
 func TestDirectoryQuotaManager(t *testing.T) {

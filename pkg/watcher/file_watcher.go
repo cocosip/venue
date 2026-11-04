@@ -839,7 +839,7 @@ func (w *fileWatcher) scanWatcher(ctx context.Context, config *core.FileWatcherC
 // The tenant dimension is empty-safe: a multi-tenant watcher imports for
 // whichever tenants its subdirectories name, so it carries no single tenant ID.
 func (w *fileWatcher) recordScanStatistics(config *core.FileWatcherConfiguration, result *core.FileWatcherScanResult) {
-	if w.statistics == nil || config == nil || result == nil {
+	if !core.StatisticsRecordingEnabled(w.statistics) || config == nil || result == nil {
 		return
 	}
 
@@ -1184,6 +1184,9 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	if err != nil {
 		return outcome, fmt.Errorf("failed to fingerprint file: %w", err)
 	}
+	// Close before the pending-action and import paths: a pending
+	// post-import Delete/Move must be able to act on the source, which an open
+	// read handle blocks on Windows.
 	if err := file.Close(); err != nil {
 		return outcome, fmt.Errorf("failed to close fingerprint source: %w", err)
 	}
@@ -1776,6 +1779,11 @@ func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.
 		}
 
 		tenantPath := filepath.Join(config.WatchPath, tenant.ID)
+		if info, statErr := os.Stat(tenantPath); statErr == nil && info.IsDir() {
+			// The directory already exists, which is the normal steady state.
+			// Reporting "created" on every scan made the event meaningless.
+			continue
+		}
 		if err := os.MkdirAll(tenantPath, 0755); err != nil {
 			w.emit(ctx, slog.LevelWarn, "tenant_directory_create_failed", "Failed to create tenant directory", slog.String("tenant_id", tenant.ID), errorTypeAttr(err))
 		} else {

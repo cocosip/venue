@@ -193,7 +193,7 @@ func NewStoragePool(opts *StoragePoolOptions) (core.StoragePool, error) {
 // The recorder is optional: a nil recorder is the documented "recording
 // disabled" state, and recording never affects the storage operation.
 func (p *storagePool) recordStatistic(name string, value int64, tenantID, volumeID string) {
-	if p.statistics == nil {
+	if !core.StatisticsRecordingEnabled(p.statistics) {
 		return
 	}
 
@@ -728,12 +728,16 @@ func (p *storagePool) GetNextFileForProcessing(ctx context.Context, tenant core.
 // GetNextBatchForProcessing retrieves a batch of pending files for processing.
 func (p *storagePool) GetNextBatchForProcessing(ctx context.Context, tenant core.TenantContext, batchSize int) ([]*core.FileLocation, error) {
 	locations, err := p.scheduler.GetNextBatchForProcessing(ctx, tenant, batchSize)
-	if err != nil {
-		return nil, err
-	}
-
 	for _, location := range locations {
 		p.recordDequeue(location)
+	}
+	if err != nil {
+		// A non-empty slice is a claimed prefix: the scheduler already
+		// transitioned those files to Processing, so the caller owns them even
+		// though a later candidate failed. Returning both keeps the leases
+		// reachable; callers that only inspect err would strand them until the
+		// timeout reclaim.
+		return locations, err
 	}
 
 	return locations, nil

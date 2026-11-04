@@ -322,6 +322,42 @@ func TestFollowUpOptimizationDefaultsAndFluent(t *testing.T) {
 	}
 }
 
+// TestVolumeCapacityCacheAndBufferDefaults covers the capacity-cache and payload
+// buffer defaults, including the negative-size validation.
+func TestVolumeCapacityCacheAndBufferDefaults(t *testing.T) {
+	cfg := &Config{Volumes: []VolumeConfig{{VolumeID: "v1", MountPath: "storage"}}}
+	cfg.ApplyDefaults()
+
+	volume := cfg.Volumes[0]
+	if volume.SpaceCacheTTL != 5*time.Second {
+		t.Errorf("SpaceCacheTTL = %v, want 5s", volume.SpaceCacheTTL)
+	}
+	if volume.WriteBufferSize != 128*1024 {
+		t.Errorf("WriteBufferSize = %d, want 128 KiB", volume.WriteBufferSize)
+	}
+	if volume.CopyBufferSize != 256*1024 {
+		t.Errorf("CopyBufferSize = %d, want 256 KiB", volume.CopyBufferSize)
+	}
+
+	cfg.Volumes[0].WriteBufferSize = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() with a negative WriteBufferSize error = nil")
+	}
+	cfg.Volumes[0].WriteBufferSize = 0
+	cfg.Volumes[0].CopyBufferSize = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() with a negative CopyBufferSize error = nil")
+	}
+
+	fluent := NewVolumeConfig().
+		WithSpaceCacheTTL(-1).
+		WithWriteBufferSize(4096).
+		WithCopyBufferSize(8192)
+	if fluent.SpaceCacheTTL != -1 || fluent.WriteBufferSize != 4096 || fluent.CopyBufferSize != 8192 {
+		t.Fatalf("fluent volume buffers = %#v, want the configured values", fluent)
+	}
+}
+
 func TestSourceCleanupDefaultsAndFluentConstruction(t *testing.T) {
 	defaults := DefaultConfig()
 	if !defaults.SourceCleanup.Enabled {

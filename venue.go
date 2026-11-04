@@ -62,8 +62,8 @@ type Venue struct {
 	metadataBackupCore *MetadataBackupService
 
 	// statisticsRecorder is the runtime's recorder: statistics.Noop when
-	// statistics are disabled, so every instrumented call site can forward
-	// unconditionally.
+	// statistics are disabled. Call sites check core.StatisticsRecordingEnabled
+	// before building dimensions, so a noop recorder does not allocate.
 	statisticsRecorder core.StatisticsRecorder
 	statisticsOutput   *statistics.OutputService
 
@@ -118,8 +118,9 @@ func NewVenue(cfg *config.Config) (*Venue, error) {
 // periodic output service from configuration.
 //
 // Statistics are disabled by default: a disabled configuration installs the noop
-// recorder, so every instrumented call site forwards unconditionally and pays
-// nothing.
+// recorder, and call sites check core.StatisticsRecordingEnabled before building
+// dimensions or recording, so a noop recorder costs one interface call rather
+// than a dimension map allocation.
 func (v *Venue) initializeStatistics() error {
 	options := statisticsOptions(v.config.Statistics)
 	if !options.Enabled {
@@ -422,7 +423,10 @@ func (v *Venue) initialize() error {
 		return fmt.Errorf("failed to create directory quota manager: %w", err)
 	}
 	v.dirQuotaManager = dirQuotaMgr
-	if err := v.reconcileDirectoryQuotaCounts(ctx); err != nil {
+	if v.config.SkipDirectoryQuotaReconciliationOnStartup {
+		v.emit(ctx, slog.LevelInfo, "directory_quota_reconcile_skipped",
+			"Directory quota reconciliation skipped by configuration")
+	} else if err := v.reconcileDirectoryQuotaCounts(ctx); err != nil {
 		return fmt.Errorf("failed to reconcile directory quotas: %w", err)
 	}
 
@@ -455,6 +459,9 @@ func (v *Venue) initialize() error {
 				ShardDepth:          volConfig.ShardingDepth,
 				EnableFsync:         volConfig.EnableFsync,
 				HealthCheckCacheTTL: volConfig.HealthCheckCacheTTL,
+				SpaceCacheTTL:       volConfig.SpaceCacheTTL,
+				WriteBufferSize:     volConfig.WriteBufferSize,
+				CopyBufferSize:      volConfig.CopyBufferSize,
 			})
 		default:
 			return fmt.Errorf("unsupported volume type %s for volume %s", volConfig.VolumeType, volConfig.VolumeID)
@@ -605,6 +612,7 @@ func (v *Venue) initialize() error {
 			}
 			openedStore, openErr := watcher.OpenSourceCleanupStore(ctx, databasePath, watcher.SourceCleanupStoreOptions{
 				MaxActiveJobs: v.config.SourceCleanup.MaxActiveJobs,
+				Sqlite:        sqliteOptions(v.config.Sqlite),
 			})
 			if openErr != nil {
 				return fmt.Errorf("failed to open source cleanup store: %w", openErr)
@@ -841,10 +849,17 @@ const quotaReconcilePageSize = 500
 // ReconcileQuotaCounts rebuilds the tenant and directory file counts from
 // persisted metadata.
 //
-// NewVenue runs the same reconciliation at startup. Expose this method for
+// NewVenue runs the tenant pass always and the directory pass unless
+// SkipDirectoryQuotaReconciliationOnStartup is set. Expose this method for
 // operator repair: if a count drifted because a process died mid-transition, or
 // because files were removed out-of-band, calling it restores both counters
-// without a restart. It is safe to call while the runtime is running.
+// without a restart.
+//
+// The method writes absolute counts, so concurrent writes can lose their
+// increment between the scan and the write. Call it while ingest is paused (for
+// example during a maintenance window), or accept a later reconciliation to
+// repair the drift it can introduce; do not run it against a busy instance and
+// expect the counts to be exact.
 func (v *Venue) ReconcileQuotaCounts(ctx context.Context) error {
 	if err := v.reconcileTenantQuotaCounts(ctx); err != nil {
 		return fmt.Errorf("failed to reconcile tenant quotas: %w", err)
@@ -900,9 +915,19 @@ func (v *Venue) reconcileTenantQuotaCounts(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to list tenants: %w", err)
 	}
+	counter, hasCounter := v.metadataRepo.(core.MetadataQuotaCounter)
 	for _, tenantContext := range tenants {
 		count := 0
-		if err := v.forEachCountedRecord(ctx, tenantContext.ID, func(*core.FileMetadata) error {
+		if hasCounter {
+			// One aggregate query per tenant instead of paging every record into
+			// Go memory. The count is the same; the cost is independent of how
+			// many columns a record has.
+			aggregate, countErr := counter.CountByStatuses(ctx, tenantContext.ID, quotaCountedStatuses[:])
+			if countErr != nil {
+				return fmt.Errorf("failed to count files for tenant %s: %w", tenantContext.ID, countErr)
+			}
+			count = int(aggregate)
+		} else if err := v.forEachCountedRecord(ctx, tenantContext.ID, func(*core.FileMetadata) error {
 			count++
 			return nil
 		}); err != nil {
@@ -920,6 +945,8 @@ func (v *Venue) reconcileDirectoryQuotaCounts(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to list tenants: %w", err)
 	}
+	counter, hasCounter := v.metadataRepo.(core.MetadataQuotaCounter)
+	setter, hasSetter := v.dirQuotaRepo.(core.DirectoryQuotaCountSetter)
 	for _, tenantContext := range tenants {
 		counts := make(map[string]int)
 		existing, err := v.dirQuotaRepo.GetAll(ctx, tenantContext.ID)
@@ -931,11 +958,27 @@ func (v *Venue) reconcileDirectoryQuotaCounts(ctx context.Context) error {
 		for _, quota := range existing {
 			counts[directorypath.Normalize(quota.DirectoryPath)] = 0
 		}
-		if err := v.forEachCountedRecord(ctx, tenantContext.ID, func(record *core.FileMetadata) error {
+		if hasCounter {
+			usage, countErr := counter.CountByDirectory(ctx, tenantContext.ID, quotaCountedStatuses[:])
+			if countErr != nil {
+				return fmt.Errorf("failed to count directory usage for tenant %s: %w", tenantContext.ID, countErr)
+			}
+			for directoryPath, count := range usage {
+				counts[directorypath.Normalize(directoryPath)] += count
+			}
+		} else if err := v.forEachCountedRecord(ctx, tenantContext.ID, func(record *core.FileMetadata) error {
 			counts[directorypath.Normalize(record.DirectoryPath)]++
 			return nil
 		}); err != nil {
 			return fmt.Errorf("failed to count directory usage for tenant %s: %w", tenantContext.ID, err)
+		}
+
+		if hasSetter {
+			// One transaction per tenant instead of two statements per directory.
+			if err := setter.SetFileCounts(ctx, tenantContext.ID, counts); err != nil {
+				return fmt.Errorf("failed to set directory counts for tenant %s: %w", tenantContext.ID, err)
+			}
+			continue
 		}
 		for directoryPath, count := range counts {
 			if err := v.dirQuotaManager.SetFileCount(ctx, tenantContext.ID, directoryPath, count); err != nil {

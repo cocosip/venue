@@ -1435,6 +1435,42 @@ func TestSQLiteMetadataRepositoryEvictsIdleHandles(t *testing.T) {
 	}
 }
 
+// TestSQLiteMetadataRepositorySweepsIdleHandlesWithoutAColdOpen pins the sampled
+// idle sweep: a fixed tenant set never opens a new database, so the historical
+// "evict on cold open" rule left idle handles open forever.
+func TestSQLiteMetadataRepositorySweepsIdleHandlesWithoutAColdOpen(t *testing.T) {
+	clock := newTraceClock(time.Now().UTC())
+	repo := newSQLiteFixtureRepository(t, func(options *SQLiteRepositoryOptions) {
+		options.now = clock.Now
+		options.OpenDatabaseIdleTimeout = time.Minute
+	})
+	ctx := context.Background()
+
+	if err := repo.AddOrUpdate(ctx, sqliteRecord("tenant-idle", "file-1", clock.Now())); err != nil {
+		t.Fatalf("AddOrUpdate(idle) error = %v", err)
+	}
+	if err := repo.AddOrUpdate(ctx, sqliteRecord("tenant-busy", "file-1", clock.Now())); err != nil {
+		t.Fatalf("AddOrUpdate(busy) error = %v", err)
+	}
+
+	clock.Advance(2 * time.Minute)
+
+	// Tenant-busy stays active; the sweep runs on its release operations even
+	// though no new tenant database is ever opened.
+	for range metadataIdleSweepInterval {
+		if _, err := repo.Get(ctx, "tenant-busy", "file-1"); err != nil {
+			t.Fatalf("Get(busy) error = %v", err)
+		}
+	}
+
+	repo.mu.RLock()
+	_, idleOpen := repo.databases["tenant-idle"]
+	repo.mu.RUnlock()
+	if idleOpen {
+		t.Fatal("idle handle survived the sampled sweep without a cold open")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency and lifecycle
 // ---------------------------------------------------------------------------

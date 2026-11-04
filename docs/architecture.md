@@ -92,7 +92,10 @@ Optional capabilities are used exclusively through type assertions. Every capabi
 
 | Interface | Purpose | type-assert / usage | Compile-time implementation assertion |
 | --- | --- | --- | --- |
-| `StatusPageReader` (`pkg/core/interfaces.go:493`) | Paged enumeration by status so long tasks do not load whole tables | `venue.go:808` (quota reconciliation), `pkg/cleanup/cleanup_service.go:232` (all status-based scans); both have a `GetByStatus` fallback (`venue.go:828`, `pkg/cleanup/cleanup_service.go:234`) | `pkg/metadata/sqlite_repository.go:380`; implementation `pkg/metadata/sqlite_paging.go:74-141` |
+| `StatusPageReader` (`pkg/core/interfaces.go:493`) | Paged enumeration by status so long tasks do not load whole tables | `pkg/cleanup/cleanup_service.go:259` (all status-based scans); the `GetByStatus` fallback lives in `pkg/cleanup/cleanup_service.go:266-293`. Quota reconciliation prefers the aggregate capability below and falls back to this paging path (`venue.go:918-929`, `:948-973`) | `pkg/metadata/sqlite_repository.go:397`; implementation `pkg/metadata/sqlite_paging.go:74-141` |
+| `MetadataQuotaCounter` (`pkg/core/interfaces.go:553`) | Aggregate tenant and per-directory quota counts inside SQLite | `venue.go:918-929` (tenant count) and `venue.go:948-973` (directory map); falls back to `StatusPageReader` when absent | `pkg/metadata/sqlite_repository.go:398`; implementation `pkg/metadata/sqlite_quota_counts.go:14-111` |
+| `DirectoryQuotaAtomicIncrementer` (`pkg/core/interfaces.go:707`) | Limit check plus increment in one statement | `pkg/quota/directory_quota_manager.go:58-68`; falls back to `GetOrCreate` plus `IncrementCount` | `pkg/quota/sqlite_directory_quota_repository.go:345-347`; implementation `:573-598` |
+| `DirectoryQuotaCountSetter` (`pkg/core/interfaces.go:721`) | Replace many directory counts in one transaction | `venue.go:976-983` (startup/operator reconciliation); falls back to one `SetFileCount` per directory (`venue.go:984-988`) | `pkg/quota/sqlite_directory_quota_repository.go:345-347`; implementation `:608-659` |
 | `FileMover` (`pkg/core/interfaces.go:284`) | Zero-copy atomic intra-volume move (dead-letter optimization) | `pkg/cleanup/dead_letter.go:195`; when unimplemented it falls back to read+write+delete (`:199-215`) | `pkg/volume/local_volume.go:23` |
 | `StorageVolumePathBuilder` (`pkg/core/interfaces.go:221`) | Volume-defined physical layout (the volume decides sharding) | `pkg/pool/storage_pool.go:477`; without an implementation it falls back to the date-directory generator (`:480`) | Method-level at `pkg/volume/local_volume.go:656` (not asserted in a package-level `var` block) |
 | `MetadataBackupService` (`pkg/core/interfaces.go:363`) | Online consistent backup stream | `venue_metadata_backup.go:83` (`(*Venue).BackupMetadata` asserts the capability on the metadata repository and fails with `ErrInvalidArgument` when it is absent, `:85`); `newMetadataBackupService` errors when backups are enabled but the repository has no per-tenant capability (`venue_metadata_backup.go:171-174`) | `pkg/metadata/sqlite_repository.go:381`; implementation `:1207-1244` (`Backup`, a zip of one `VACUUM INTO` copy per tenant) plus `BackupTenant` (`pkg/metadata/sqlite_backup.go:30-62`) declared by `SQLiteMetadataTenantBackupService` (`pkg/metadata/sqlite_repository.go:363-374`) |
@@ -190,7 +193,7 @@ The actual order is: tenant gate → tenant-quota increment → **volume candida
 | 4 | The extension is kept for diagnostics only | `pkg/pool/storage_pool.go:218-221` |
 | 5 | Register the rollback defer (rollback also happens when a panic is recovered) | `pkg/pool/storage_pool.go:227-242` |
 | 6 | Increment the tenant quota; over the limit → `ErrTenantQuotaExceeded` | `pkg/pool/storage_pool.go:245-250`; `pkg/quota/tenant_quota_manager.go:141-143` |
-| 7 | Select volume candidates (filtered by remaining bytes when seekable) | `pkg/pool/storage_pool.go:253`, `:418-437`; no candidate → `ErrInsufficientStorage` (`:427`). The default selector is `MostAvailableSpaceSelector` (assigned at construction, `:156`; implemented at `pkg/pool/volume_selector.go:49-101`: it skips unhealthy volumes, volumes that error, volumes with zero free space, and volumes with less than `requiredBytes`, then sorts by descending free space with volume ID as tie-breaker); the optional extension interface `VolumeCandidateSelector` (`pkg/pool/volume_selector.go:23-30`) is type-asserted at `pkg/pool/storage_pool.go:421`, and when absent it degrades to single-volume selection (`:432-436`) |
+| 7 | Select volume candidates (filtered by remaining bytes when seekable) | `pkg/pool/storage_pool.go:516-527` (default selector assigned at construction, `:184`); no candidate → `ErrInsufficientStorage` (`:522`, `pkg/pool/volume_selector.go:57`, `:88`). The default selector is `MostAvailableSpaceSelector` (`pkg/pool/volume_selector.go:51-103`: it skips unhealthy volumes, volumes that error, volumes with zero free space, and volumes with less than `requiredBytes`, then sorts by descending free space with volume ID as tie-breaker); the optional extension interface `VolumeCandidateSelector` (`pkg/pool/volume_selector.go:22-29`) is type-asserted at `pkg/pool/storage_pool.go:516`, and when absent it degrades to single-volume selection (`:527`). No other selection policy is shipped or configurable |
 | 8 | Increment the directory quota; over the limit → `ErrDirectoryQuotaExceeded` | `pkg/pool/storage_pool.go:259-264`; `pkg/quota/directory_quota_manager.go:65-67` |
 | 9 | Write per candidate: pessimistically record the target → `WriteFile` → delete the partial file on failure → move to the next candidate only when seekable | `pkg/pool/storage_pool.go:328-370` (record `:342-344`, write `:346`, delete partial file `:353`, rewind `:334-338`) |
 | 10 | Physical path generation: `tenantID/<shard...>/<fileKey><ext>` | `pkg/pool/storage_pool.go:468-481` → `pkg/volume/local_volume.go:656-667` → `pkg/volume/path_sanitizer.go:186-219` |
@@ -332,8 +335,15 @@ Consequently, `&config.Config{}` + `ApplyDefaults()` cannot restore the followin
 | `FileWatchers[i].Enabled` / `FileWatcherRoots[i].Enabled` | Caller-dependent; the configuration example sets true | `config/config.go:228`, `:283` | No |
 | `Statistics.Dimensions.VolumeID` / `WatcherID` / `Operation` | all true | `config/config.go:644`, `:645`, `:646` | No (it only fills WindowSize/Retention/MaxSeries/Output, `:753-770`) |
 
-A typical observable consequence: when constructed from `&config.Config{}`, `Cleanup.DeadLetter` is filled in by `ApplyDefaults` with `RootPath=".deadletter"` and `ShardingDepth=2` (`config/config.go:723-728`), so the "apply defaults only when all fields are zero" branch of `DeadLetterOptions.withDefaults()` (`pkg/cleanup/dead_letter.go:59-67`) no longer fires, and the resulting dead-letter paths **lose the tenant and date partitions**. The default values themselves live in `DefaultConfig` (`config/config.go:597-602`).
-
+The dead-letter exclusions are phrased so that the `&config.Config{}` plus
+`ApplyDefaults()` path keeps the documented full layout: `ApplyDefaults` fills
+`RootPath=".deadletter"` and `ShardingDepth=2` (its own default block), while the
+two booleans stay `false` and therefore keep the tenant and date segments. The
+"apply defaults only when all fields are zero" branch of
+`DeadLetterOptions.withDefaults()` (`pkg/cleanup/dead_letter.go:59-67`) no longer
+fires once `ApplyDefaults` has filled the root, but because the zero value of
+each exclusion already means "include the segment", the resulting layout is the
+same full layout `DefaultConfig` describes (`config/config.go:553-560`).
 For contrast: the throttling/debounce switches of `config.FileWatcherConfig`/`FileWatcherRootConfig` use inverted naming (`DisableImportedFilesPruneThrottle`, `DisableImportedFilesHistoryFlushDebounce`, `config/config.go:251-268`, `:322-337`) and therefore avoid the zero-value trap. The positive-polarity runtime fields in `pkg/core.FileWatcherConfiguration` (`EnableImportedFilesPruneThrottle` and friends, `pkg/core/interfaces.go:700-716`) are inverted back when `venue.go` maps the configuration (`venue.go:635`, `:637`, `:692`, `:694`) and are consumed by the import path (`pkg/watcher/file_watcher.go:1667`, `:1695`).
 
 ### 6.5 Construction-time watcher enablement versus the persisted document
@@ -363,7 +373,7 @@ For contrast: the throttling/debounce switches of `config.FileWatcherConfig`/`Fi
 | `ErrTenantAlreadyExists` | `:21` | `venue.go:328`, `pkg/tenant/manager.go:252` |
 | `ErrTenantQuotaExceeded` | `:26` | `pkg/quota/tenant_quota_manager.go:142` |
 | `ErrDirectoryQuotaExceeded` | `:29` | `pkg/quota/directory_quota_manager.go:66` |
-| `ErrInsufficientStorage` | `:34` | `pkg/pool/storage_pool.go:427`, `pkg/pool/volume_selector.go:55`, `:86`, `:116`, `:131`, `:153`, `:167` |
+| `ErrInsufficientStorage` | `:34` | `pkg/pool/storage_pool.go:522`, `pkg/pool/volume_selector.go:57`, `:88` |
 | `ErrStorageVolumeUnavailable` / `ErrVolumeAlreadyMounted` | `:37`, `:40` | `ErrStorageVolumeUnavailable` is returned by `venue.waitForVolume` when a volume never answers two consecutive probes (`venue.go:246-251`); `ErrVolumeAlreadyMounted` is **deprecated**: no runtime return site |
 | `ErrFileNotFound` | `:45` | `pkg/metadata/sqlite_repository.go:597`, `:808`, `:913`; `pkg/volume/local_volume.go:413`, `:494` |
 | `ErrFileAlreadyProcessing` | `:48` | **Deprecated**: no runtime code returns it |

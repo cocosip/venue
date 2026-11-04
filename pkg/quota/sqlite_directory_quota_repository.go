@@ -39,6 +39,11 @@ const (
 	// that another process is holding open.
 	quotaCheckpointTimeout = 5 * time.Second
 
+	// quotaIdleSweepInterval is how many handle releases pass between two idle
+	// eviction sweeps. The sweep is deliberately sampled: an idle timeout must
+	// not put an O(n log n) handle-table sort on every quota operation.
+	quotaIdleSweepInterval = 256
+
 	// quotaCorruptedDatabaseRecoveryAttempts bounds how many quarantines a single
 	// open may perform before it gives up. Without a bound, a database whose
 	// recreation also fails would quarantine in a loop.
@@ -148,6 +153,44 @@ ON CONFLICT(directory_path) DO UPDATE SET
     current_count = quotas.current_count + 1,
     last_updated  = excluded.last_updated`
 
+	// sqliteQuotaIncrementIfAllowedSQL checks the directory limit and increments
+	// in one statement.
+	//
+	// A row exists and still has room, or is unlimited/disabled: the conflict
+	// branch increments it. A row at its limit matches no row in the conflict
+	// branch (the DO UPDATE WHERE clause blocks it), so QueryRow reports
+	// sql.ErrNoRows and the caller maps that to ErrDirectoryQuotaExceeded. A
+	// missing row is inserted with count 1 and the domain defaults, exactly like
+	// the historical GetOrCreate + IncrementCount pair.
+	//
+	// The limit predicate mirrors core.DirectoryQuota.CanAddFile: the limit
+	// applies only to an enabled row with a positive MaxCount.
+	sqliteQuotaIncrementIfAllowedSQL = `
+INSERT INTO quotas (directory_path, current_count, max_count, enabled, last_updated, created_at)
+VALUES (@directory_path, 1, 0, 0, @last_updated, @created_at)
+ON CONFLICT(directory_path) DO UPDATE SET
+    current_count = quotas.current_count + 1,
+    last_updated  = excluded.last_updated
+WHERE quotas.enabled = 0 OR quotas.max_count <= 0 OR quotas.current_count < quotas.max_count
+RETURNING current_count`
+
+	// sqliteQuotaPruneEmptySQL drops rows that carry no state: no counted file,
+	// no configured limit and not enabled. Maintenance runs it before VACUUM.
+	sqliteQuotaPruneEmptySQL = `
+DELETE FROM quotas
+WHERE current_count = 0 AND max_count <= 0 AND enabled = 0`
+
+	// sqliteQuotaSetCountSQL replaces one directory's count while preserving its
+	// configured limit and enabled flag. The DO UPDATE WHERE clause skips rows
+	// whose count is already correct, so reconciliation only writes real drift.
+	sqliteQuotaSetCountSQL = `
+INSERT INTO quotas (directory_path, current_count, max_count, enabled, last_updated, created_at)
+VALUES (@directory_path, @current_count, 0, 0, @last_updated, @created_at)
+ON CONFLICT(directory_path) DO UPDATE SET
+    current_count = excluded.current_count,
+    last_updated  = excluded.last_updated
+WHERE quotas.current_count <> excluded.current_count`
+
 	// sqliteQuotaDecrementSQL floors the count at 0 in the statement itself, so
 	// the count can never go negative. A missing row matches nothing, which is
 	// the Badger implementation's "nothing to decrement" no-op.
@@ -249,6 +292,12 @@ type sqliteDirectoryQuotaRepository struct {
 	// other tenant's quota operations.
 	openings map[string]*quotaTenantOpening
 
+	// releaseOps counts handle releases so idle handles are swept periodically
+	// instead of on every operation. A per-operation eviction scan would sort
+	// the whole handle table on the hottest I/O path; a bounded sweep keeps the
+	// configured idle timeout effective without that cost. Guarded by mu.
+	releaseOps uint64
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -294,6 +343,8 @@ func errSQLiteQuotaRepositoryClosed() error {
 
 // Compile-time proof that the repository satisfies the frozen interface.
 var _ core.DirectoryQuotaRepository = (*sqliteDirectoryQuotaRepository)(nil)
+var _ core.DirectoryQuotaAtomicIncrementer = (*sqliteDirectoryQuotaRepository)(nil)
+var _ core.DirectoryQuotaCountSetter = (*sqliteDirectoryQuotaRepository)(nil)
 
 // NewSQLiteDirectoryQuotaRepository builds a SQLite directory-quota repository.
 //
@@ -511,6 +562,102 @@ func (r *sqliteDirectoryQuotaRepository) IncrementCount(ctx context.Context, ten
 	return nil
 }
 
+// IncrementCountIfAllowed checks the directory limit and increments the count in
+// one statement, so the write path no longer issues a read-then-write pair.
+//
+// A row at its limit returns core.ErrDirectoryQuotaExceeded without changing the
+// count. A missing row is created with count 1, matching GetOrCreate followed by
+// IncrementCount. The single statement also makes the check race-free across
+// processes and repository handles, which the historical pair could not
+// guarantee.
+func (r *sqliteDirectoryQuotaRepository) IncrementCountIfAllowed(ctx context.Context, tenantID string, directoryPath string) error {
+	if directoryPath == "" {
+		return fmt.Errorf("directory path cannot be empty: %w", core.ErrInvalidArgument)
+	}
+
+	handle, err := r.acquire(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer r.release(handle)
+
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+
+	now := timeToNanos(r.now())
+	var count int
+	err = handle.db.QueryRowContext(ctx, sqliteQuotaIncrementIfAllowedSQL,
+		sql.Named("directory_path", directoryPath),
+		sql.Named("last_updated", now),
+		sql.Named("created_at", now)).Scan(&count)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.ErrDirectoryQuotaExceeded
+	}
+	if err != nil {
+		return fmt.Errorf("failed to increment directory quota count: %w: %w", err, core.ErrDatabaseError)
+	}
+	return nil
+}
+
+// SetFileCounts replaces several directory counts in one transaction, skipping
+// rows whose count is already correct.
+//
+// It is the reconciliation write path: one transaction per tenant instead of the
+// GetOrCreate plus Update pair per directory, and the configured max count and
+// enabled flag of an existing row are preserved.
+func (r *sqliteDirectoryQuotaRepository) SetFileCounts(ctx context.Context, tenantID string, counts map[string]int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	for directoryPath, count := range counts {
+		if directoryPath == "" {
+			return fmt.Errorf("directory path cannot be empty: %w", core.ErrInvalidArgument)
+		}
+		if count < 0 {
+			return fmt.Errorf("directory count cannot be negative: %w", core.ErrInvalidArgument)
+		}
+	}
+
+	handle, err := r.acquire(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer r.release(handle)
+
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+
+	tx, err := handle.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin directory quota count update: %w: %w", err, core.ErrDatabaseError)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	statement, err := tx.PrepareContext(ctx, sqliteQuotaSetCountSQL)
+	if err != nil {
+		return fmt.Errorf("failed to prepare directory quota count update: %w: %w", err, core.ErrDatabaseError)
+	}
+	defer func() { _ = statement.Close() }()
+
+	now := timeToNanos(r.now())
+	for directoryPath, count := range counts {
+		if _, err := statement.ExecContext(ctx,
+			sql.Named("directory_path", directoryPath),
+			sql.Named("current_count", count),
+			sql.Named("last_updated", now),
+			sql.Named("created_at", now)); err != nil {
+			return fmt.Errorf("failed to set directory quota count: %w: %w", err, core.ErrDatabaseError)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit directory quota counts: %w: %w", err, core.ErrDatabaseError)
+	}
+	return nil
+}
+
 // DecrementCount atomically decrements a directory's file count.
 //
 // The floor is the statement's own MAX(current_count - 1, 0), so the count can
@@ -615,6 +762,15 @@ func (r *sqliteDirectoryQuotaRepository) optimizeHandle(ctx context.Context, han
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 
+	// A row that holds no file, has no limit and is not enabled carries no
+	// information; the write path recreates it on demand. Pruning it keeps the
+	// quota database proportional to active directories instead of every path
+	// the store has ever seen.
+	if _, err := handle.db.ExecContext(ctx, sqliteQuotaPruneEmptySQL); err != nil {
+		warnQuotaRepositoryEvent(r.logging, "quota_optimize_failed", "prune_empty_failed")
+		return
+	}
+
 	if err := sqlite.TruncateCheckpoint(ctx, handle.db); err != nil {
 		warnQuotaRepositoryEvent(r.logging, "quota_optimize_failed", "checkpoint_failed")
 		return
@@ -697,9 +853,10 @@ func (r *sqliteDirectoryQuotaRepository) acquire(ctx context.Context, tenantID s
 		}
 		if handle, ok := r.databases[tenantID]; ok {
 			r.touchLocked(handle)
-			evicted := r.evictLocked(tenantID)
+			// Eviction runs when a handle is opened and on the periodic release
+			// sweep below, never on every acquisition: the bound cannot be
+			// exceeded without an open, so a hit needs no table scan.
 			r.mu.Unlock()
-			r.closeEvicted(evicted)
 			return handle, nil
 		}
 		if pending, ok := r.openings[tenantID]; ok {
@@ -769,9 +926,15 @@ func (r *sqliteDirectoryQuotaRepository) notifyQuarantined(quarantined []string)
 }
 
 // release drops one reference on a handle acquired by acquire. The usage stamp is
-// refreshed so a long operation does not look idle the moment it finishes, and the
-// handle bound is re-applied so it converges as soon as the operations that made
-// it exceed the limit are done.
+// refreshed so a long operation does not look idle the moment it finishes, and
+// the handle bound is re-applied so it converges as soon as the operations that
+// made it exceed the limit are done.
+//
+// Idle eviction is sampled: sorting the whole handle table on every release
+// would turn a cheap quota call into an O(n log n) scan once an operator
+// configures a bound or a timeout. The idle timeout is checked once per
+// quotaIdleSweepInterval releases instead, which keeps handles bounded without
+// putting the sweep on the hot path.
 func (r *sqliteDirectoryQuotaRepository) release(handle *sqliteQuotaTenantDatabase) {
 	if handle == nil {
 		return
@@ -783,8 +946,11 @@ func (r *sqliteDirectoryQuotaRepository) release(handle *sqliteQuotaTenantDataba
 	handle.lastUsed = r.now()
 	handle.lastUsedNanos = handle.lastUsed.UnixNano()
 
+	r.releaseOps++
 	var evicted []*sqliteQuotaTenantDatabase
 	if r.maxOpenDatabases > 0 && len(r.databases) > r.maxOpenDatabases {
+		evicted = r.evictLocked("")
+	} else if r.idleTimeout > 0 && r.releaseOps%quotaIdleSweepInterval == 0 {
 		evicted = r.evictLocked("")
 	}
 	r.mu.Unlock()

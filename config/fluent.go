@@ -36,6 +36,14 @@ func (c *Config) WithDatabaseHealthCheckEnabled(enabled bool) *Config {
 	return c
 }
 
+// WithDirectoryQuotaReconciliationOnStartup enables or disables the startup
+// directory-quota rebuild. Disabling it trades a stale directory count until the
+// next ReconcileQuotaCounts call for a faster startup on large stores.
+func (c *Config) WithDirectoryQuotaReconciliationOnStartup(enabled bool) *Config {
+	c.SkipDirectoryQuotaReconciliationOnStartup = !enabled
+	return c
+}
+
 // WithRetryPolicy sets retry policy configuration.
 func (c *Config) WithRetryPolicy(value *RetryPolicyConfig) *Config {
 	if value != nil {
@@ -810,6 +818,28 @@ func (c *VolumeConfig) WithFsync(enabled bool) *VolumeConfig { c.EnableFsync = e
 // Zero selects the runtime default; a negative value disables caching.
 func (c *VolumeConfig) WithHealthCheckCacheTTL(value time.Duration) *VolumeConfig {
 	c.HealthCheckCacheTTL = value
+	return c
+}
+
+// WithSpaceCacheTTL sets how long a capacity/available-space reading is cached.
+// Zero selects the runtime default; a negative value asks the filesystem on
+// every call.
+func (c *VolumeConfig) WithSpaceCacheTTL(value time.Duration) *VolumeConfig {
+	c.SpaceCacheTTL = value
+	return c
+}
+
+// WithWriteBufferSize sets the buffered writer size used for payload writes.
+// Zero selects the runtime default.
+func (c *VolumeConfig) WithWriteBufferSize(value int) *VolumeConfig {
+	c.WriteBufferSize = value
+	return c
+}
+
+// WithCopyBufferSize sets the pooled staging buffer size used to stream one
+// payload. Zero selects the runtime default.
+func (c *VolumeConfig) WithCopyBufferSize(value int) *VolumeConfig {
+	c.CopyBufferSize = value
 	return c
 }
 

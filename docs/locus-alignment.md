@@ -12,7 +12,7 @@
 | Behavioral baseline | Locus `v2.0.0`, commit `292bd2cea7051ec277d97ca708443e668b40a2d4` |
 | Watcher update baseline | Locus `v1.5.5`, commit `06c152a`; durable source cleanup is the current watcher behavior reference |
 | Locus read-only export | `locus/` (the reference checkout for Locus v2.0.0 is not part of this repository; `locus/src/Locus`, `locus/src/Locus.Core`, `locus/src/Locus.MultiTenant`, `locus/src/Locus.FileSystem`, `locus/src/Locus.Storage`) |
-| Venue counterpart | Current working tree based on HEAD `a217552`, including the uncommitted watcher-alignment changes described here; every conclusion follows the code on disk |
+| Venue counterpart | Current working tree based on HEAD `c174ea3`, including the uncommitted performance- and correctness-audit changes described here; every conclusion follows the code on disk |
 | Storage-engine design | `docs/sqlite-storage-design.md` (directory and file layout, schema, PRAGMA and connection policy, CAS SQL, backup and corruption recovery) |
 
 ### 1.2 Classification
@@ -227,13 +227,43 @@ The former U6 (whether the reclaim batch-size and background-reclaim keys were e
 
 ### 6.1 Documentation/behaviour mismatches still open
 
-One finding of the documentation review remains open and is also recorded as code-adjacent debt in `docs/architecture.md`.
+None. The former dead-letter finding is closed by phrasing both switches as
+exclusions: `ExcludeTenantFromPath` and `ExcludeDatePartition`
+(`config/config.go:556`, `:560`) keep the segment at their zero value, so a
+configuration built from `&config.Config{}` plus `ApplyDefaults()` — which fills
+only `RootPath` and `ShardingDepth` (`config/config.go:800-805`) — keeps the
+documented full layout instead of dropping it. `docs/architecture.md` §6.4
+records the same reasoning.
 
-| Location | Description | Evidence |
-| --- | --- | --- |
-| `config.ApplyDefaults` | The two dead-letter booleans are not restored by `ApplyDefaults`, which fills only `RootPath` and `ShardingDepth` (`config/config.go:723-728`), while `DefaultConfig` sets both to true (`:597-602`). A configuration built from `&config.Config{}` plus `ApplyDefaults()` therefore loses the dead-letter tenant and date partitions, and the README does not warn about this pair | `config/config.go:723-728`, `:597-602`; `pkg/cleanup/dead_letter.go:59-67`; see `docs/architecture.md` §6.4 |
+The remaining findings of the same review are closed: the README's reclaim text (`README.md:545-555`), its status-scan claim (`README.md:917-918`), its "not implemented" list (`README.md:939-944`; one dangling `docs/` reference in that list is recorded in `docs/architecture.md` §10.2) and its Locus-divergence list (`README.md:895-937`) now match the code; `FileStatusDeadLettered` is documented as produced by cleanup (`pkg/core/models.go:89-93`); the retention keys are present in `venue-config-example.yaml` and documented in the README; and the volume probe cache, capacity cache and payload buffers are exposed as configuration (`config/config.go:217-234`, `pkg/volume/local_volume.go:33-49`).
 
-The remaining findings of the same review are closed: the README's reclaim text (`README.md:545-555`), its status-scan claim (`README.md:917-918`), its "not implemented" list (`README.md:939-944`; one dangling `docs/` reference in that list is recorded in `docs/architecture.md` §10.2) and its Locus-divergence list (`README.md:895-937`) now match the code; `FileStatusDeadLettered` is documented as produced by cleanup (`pkg/core/models.go:89-93`); the retention keys are present in `venue-config-example.yaml` and documented in the README; and the volume health-probe cache TTL is exposed as configuration (`config/config.go:193-196`, `pkg/volume/local_volume.go:185-206`).
+### 6.2 Post-audit hardening (no new observable gap)
+
+The performance and correctness audit changed internal mechanisms without
+adding a caller-visible difference from Locus:
+
+- Startup quota reconciliation counts through aggregate SQL instead of paging
+  every record (`core.MetadataQuotaCounter`,
+  `pkg/metadata/sqlite_quota_counts.go`) and writes directory counts in one
+  transaction per tenant (`core.DirectoryQuotaCountSetter`,
+  `pkg/quota/sqlite_directory_quota_repository.go`). It can be skipped with
+  `skipDirectoryQuotaReconciliationOnStartup`, and `ReconcileQuotaCounts` now
+  documents that its absolute counts require quiesced writes.
+- The directory quota write path uses one conditional `INSERT ... RETURNING`
+  statement (`core.DirectoryQuotaAtomicIncrementer`) instead of a
+  read-then-write pair.
+- Idle metadata handles are swept on a sampled release counter, so
+  `openDatabaseIdleTimeout` actually reclaims a fixed tenant set
+  (`pkg/metadata/sqlite_repository.go`).
+- The volume caches capacity readings and refreshes expired health/space results
+  in the background, and buffers payload writes with a pooled copy buffer,
+  matching Locus's `LocalFileSystemVolume` (`pkg/volume/local_volume.go`,
+  `config/config.go:201-215`).
+- The durable source-cleanup database follows the configured SQLite policy, and
+  an unchanged source is deduplicated with a read instead of a write
+  transaction (`pkg/watcher/source_cleanup_store.go`).
+- Cleanup deletes one metadata page per transaction and removes empty
+  directories in a single post-order pass (`pkg/cleanup/cleanup_service.go`).
 
 ---
 

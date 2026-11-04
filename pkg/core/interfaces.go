@@ -75,6 +75,10 @@ type StoragePool interface {
 	// This operation is thread-safe - no file will be returned more than once.
 	//
 	// It returns an empty slice and a nil error when no file is available.
+	// A failure after some files were already claimed returns those locations
+	// together with the error: the non-empty slice is valid work the caller
+	// owns and must process or release, and only the failed candidate was not
+	// claimed.
 	//
 	// Errors:
 	// - ErrTenantDisabled if tenant is disabled
@@ -176,6 +180,8 @@ type FileScheduler interface {
 	// transaction.
 	//
 	// It returns an empty slice and a nil error when no file is available.
+	// A failure after some files were already claimed returns those locations
+	// together with the error; a non-empty slice is valid claimed work.
 	GetNextBatchForProcessing(ctx context.Context, tenant TenantContext, batchSize int) ([]*FileLocation, error)
 
 	// MarkAsCompleted marks a file as completed and schedules it for deletion.
@@ -326,6 +332,32 @@ type StatisticsRecorder interface {
 	// are optional; an implementation retains only the dimension keys it was
 	// configured to keep.
 	Record(name string, value int64, timestamp time.Time, dimensions map[string]string)
+}
+
+// StatisticsEnabledReporter is an optional StatisticsRecorder capability that
+// reports whether the recorder retains any delta.
+//
+// A recorder that answers false is a compile-time disabled recorder such as the
+// noop implementation. Instrumented call sites can then skip the dimension map
+// they would otherwise build for Record, so a disabled statistics
+// configuration costs no allocations at all.
+type StatisticsEnabledReporter interface {
+	StatisticsEnabled() bool
+}
+
+// StatisticsRecordingEnabled reports whether recorder retains any delta.
+//
+// A nil recorder is disabled. A recorder that implements
+// StatisticsEnabledReporter reports its own state; every other recorder is
+// treated as enabled, so a custom recorder keeps working unchanged.
+func StatisticsRecordingEnabled(recorder StatisticsRecorder) bool {
+	if recorder == nil {
+		return false
+	}
+	if reporter, ok := recorder.(StatisticsEnabledReporter); ok {
+		return reporter.StatisticsEnabled()
+	}
+	return true
 }
 
 // StatisticsReader reads aggregated in-process statistics snapshots.
@@ -510,6 +542,25 @@ type StatusPageReader interface {
 	GetByStatusPage(ctx context.Context, tenantID string, status FileProcessingStatus, cursor string, limit int) (*MetadataPage, error)
 }
 
+// MetadataQuotaCounter is the optional MetadataRepository capability that
+// aggregates quota-relevant counts inside SQLite.
+//
+// Startup quota reconciliation needs the number of files per tenant and per
+// logical directory. Counting through StatusPageReader loads every record into
+// Go memory and walks the same table six times; these two queries return the
+// aggregates directly, so startup cost is one index scan per tenant and the
+// result is independent of the record count.
+type MetadataQuotaCounter interface {
+	// CountByStatuses returns how many records of one tenant have any of the
+	// given statuses. Duplicate statuses are counted once.
+	CountByStatuses(ctx context.Context, tenantID string, statuses []FileProcessingStatus) (int64, error)
+
+	// CountByDirectory returns the number of records per logical directory for
+	// one tenant and the given statuses. A directory with no counted record is
+	// absent from the map.
+	CountByDirectory(ctx context.Context, tenantID string, statuses []FileProcessingStatus) (map[string]int, error)
+}
+
 // MetadataRepository manages file metadata storage with caching.
 type MetadataRepository interface {
 	// AddOrUpdate adds or updates file metadata atomically.
@@ -642,6 +693,36 @@ type DirectoryQuotaReader interface {
 	// Get returns the stored quota for a directory, or nil without an error
 	// when the directory has no row.
 	Get(ctx context.Context, tenantID string, directoryPath string) (*DirectoryQuota, error)
+}
+
+// DirectoryQuotaAtomicIncrementer is the optional DirectoryQuotaRepository
+// capability that checks the directory limit and increments the count in one
+// statement.
+//
+// It collapses the manager's read-then-write pair into a single transaction:
+// the check and the increment see the same row, so a concurrent increment can
+// never slip between them, and the write path pays one statement instead of two.
+// A repository without the capability keeps the historical GetOrCreate plus
+// IncrementCount sequence.
+type DirectoryQuotaAtomicIncrementer interface {
+	// IncrementCountIfAllowed increments the count when the directory limit
+	// allows one more file and returns core.ErrDirectoryQuotaExceeded when the
+	// limit is reached. A missing row is created with count 1.
+	IncrementCountIfAllowed(ctx context.Context, tenantID string, directoryPath string) error
+}
+
+// DirectoryQuotaCountSetter is the optional DirectoryQuotaRepository capability
+// that replaces several directory counts in one transaction.
+//
+// It exists for quota reconciliation, which may touch thousands of logical
+// directories: one transaction per tenant is substantially cheaper than the
+// historical GetOrCreate plus Update pair per directory, and a count that did not
+// change is not rewritten at all.
+type DirectoryQuotaCountSetter interface {
+	// SetFileCounts sets the current count of every named directory, creating a
+	// missing row with the domain defaults (unlimited, disabled). An empty map
+	// is a no-op.
+	SetFileCounts(ctx context.Context, tenantID string, counts map[string]int) error
 }
 
 // PostImportAction defines what to do with files after successful import.

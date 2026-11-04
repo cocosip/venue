@@ -58,6 +58,17 @@ func (m *directoryQuotaManager) IncrementFileCount(ctx context.Context, tenantID
 	unlock := m.lock(tenantID, normalizedPath)
 	defer unlock()
 
+	// The atomic path checks the limit and increments in one statement. It is
+	// the only path that is safe against a concurrent writer in another process
+	// or repository handle: the historical read-then-write sequence could pass
+	// the check twice.
+	if incrementer, ok := m.repository.(core.DirectoryQuotaAtomicIncrementer); ok {
+		if err := incrementer.IncrementCountIfAllowed(ctx, tenantID, normalizedPath); err != nil {
+			return err
+		}
+		return nil
+	}
+
 	// Get current quota
 	quota, err := m.repository.GetOrCreate(ctx, tenantID, normalizedPath)
 	if err != nil {

@@ -56,6 +56,10 @@ func TestIsHealthy_CachesProbeResults(t *testing.T) {
 }
 
 // TestIsHealthy_ProbeCacheExpires verifies TTL expiry with an injected clock.
+//
+// An expired verdict is refreshed in the background (stale-while-revalidate), so
+// the first call past the TTL keeps the previous answer while the refresh runs,
+// and the next call observes the refreshed verdict.
 func TestIsHealthy_ProbeCacheExpires(t *testing.T) {
 	ctx := context.Background()
 
@@ -64,13 +68,24 @@ func TestIsHealthy_ProbeCacheExpires(t *testing.T) {
 	current := time.Unix(1_700_000_000, 0)
 	vol.now = func() time.Time { return current }
 
+	var healthy atomic.Bool
+	healthy.Store(true)
+	probes := make(chan struct{}, 4)
+	vol.probeHealth = func(context.Context) bool {
+		healthyNow := healthy.Load()
+		probes <- struct{}{}
+		return healthyNow
+	}
+
 	if !vol.IsHealthy(ctx) {
 		t.Fatal("expected the fresh volume to be healthy")
 	}
+	<-probes
 
 	if err := os.RemoveAll(mountDir); err != nil {
 		t.Fatalf("failed to remove mount path: %v", err)
 	}
+	healthy.Store(false)
 
 	// Still inside the TTL window: the cached (healthy) result is reused.
 	current = current.Add(DefaultHealthCheckCacheTTL - time.Second)
@@ -78,19 +93,104 @@ func TestIsHealthy_ProbeCacheExpires(t *testing.T) {
 		t.Error("expected the cached result to be reused before the TTL expires")
 	}
 
-	// Past the TTL window: the probe runs again and observes the broken mount.
+	// Past the TTL window: the stale verdict is returned immediately and the
+	// probe runs in the background.
 	current = current.Add(2 * time.Second)
-	if vol.IsHealthy(ctx) {
-		t.Error("expected a fresh probe after the TTL expired")
+	if !vol.IsHealthy(ctx) {
+		t.Error("expected the stale verdict while the background refresh runs")
+	}
+	select {
+	case <-probes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background health refresh did not run")
+	}
+	// Wait for the refresh to publish before observing the new verdict.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		vol.healthMu.Lock()
+		refreshing := vol.healthRefreshing
+		vol.healthMu.Unlock()
+		if !refreshing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background health refresh did not publish")
+		}
+		time.Sleep(time.Millisecond)
 	}
 
-	// The fresh failed result is cached in turn.
+	// The refreshed failed verdict is cached in turn and observed on the next
+	// call (the entry is still fresh, so no second probe is needed).
+	if vol.IsHealthy(ctx) {
+		t.Error("expected the refreshed, unhealthy verdict after the background refresh")
+	}
+
 	if err := os.MkdirAll(mountDir, 0755); err != nil {
 		t.Fatalf("failed to recreate mount path: %v", err)
 	}
+	healthy.Store(true)
 	current = current.Add(DefaultHealthCheckCacheTTL - time.Second)
 	if vol.IsHealthy(ctx) {
 		t.Error("expected the failed probe result to stay cached before the TTL expires")
+	}
+}
+
+// TestProbeHealthWinsOverInFlightRefresh verifies that an explicit probe is not
+// overwritten by a background refresh that started before it.
+func TestProbeHealthWinsOverInFlightRefresh(t *testing.T) {
+	ctx := context.Background()
+	vol, _ := createTestVolume(t, 0)
+
+	current := time.Unix(1_700_000_000, 0)
+	vol.now = func() time.Time { return current }
+
+	refreshEntered := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var calls atomic.Int64
+	vol.probeHealth = func(context.Context) bool {
+		switch calls.Add(1) {
+		case 1:
+			return true
+		case 2:
+			close(refreshEntered)
+			<-releaseRefresh
+			return true
+		default:
+			return false
+		}
+	}
+
+	if !vol.IsHealthy(ctx) {
+		t.Fatal("first IsHealthy() = false, want true")
+	}
+	current = current.Add(DefaultHealthCheckCacheTTL + time.Second)
+	if !vol.IsHealthy(ctx) {
+		t.Fatal("expired IsHealthy() = false, want the stale healthy verdict")
+	}
+	<-refreshEntered
+
+	// The forced probe runs while the refresh is blocked and publishes false.
+	if vol.ProbeHealth(ctx) {
+		t.Fatal("ProbeHealth() = true, want false")
+	}
+	close(releaseRefresh)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		vol.healthMu.Lock()
+		refreshing := vol.healthRefreshing
+		vol.healthMu.Unlock()
+		if !refreshing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background health refresh did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if vol.IsHealthy(ctx) {
+		t.Fatal("the stale refresh overwrote the forced probe verdict")
 	}
 }
 

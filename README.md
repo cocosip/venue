@@ -169,6 +169,7 @@ The configuration lifecycle is:
 | `AutoCreateTenants` | `autoCreateTenants` | Allow unknown tenants to be created on demand |
 | `DefaultTenantQuota` | `defaultTenantQuota` | Default maximum file count; `0` is unlimited |
 | `EnableDatabaseHealthCheck` | `enableDatabaseHealthCheck` | Start database and volume health checks |
+| `SkipDirectoryQuotaReconciliationOnStartup` | `skipDirectoryQuotaReconciliationOnStartup` | Skip the startup directory-count rebuild; tenant counts are always rebuilt |
 | `FailFastOnStartupRecoveryFailure` | `failFastOnStartupRecoveryFailure` | Fail startup when a metadata database was quarantined and no backup could be restored |
 | `RetryPolicy` | `retryPolicy` | Retry count, delay, and backoff behavior |
 | `TenantManager` | `tenantManagerOptions` | Tenant metadata path and cache TTL |
@@ -190,9 +191,14 @@ The configuration lifecycle is:
 Tenant and directory quotas count managed files, not bytes. Pending,
 processing, completed-but-not-yet-cleaned, retryable-failed, and permanently
 failed records continue to consume quota. Venue reconstructs both tenant and
-directory counts from persisted metadata during startup, while retaining
-explicit directory limits. A tenant quota of `0` is unlimited; a nil tenant
-quota inherits `DefaultTenantQuota`.
+directory counts from persisted metadata during startup with aggregate SQL
+queries, while retaining explicit directory limits. Tenant counts are always
+rebuilt because they live in memory; set
+`skipDirectoryQuotaReconciliationOnStartup` to skip the directory pass on a
+large, already-reconciled store, then call `Venue.ReconcileQuotaCounts` with
+ingest paused during maintenance (absolute counts can race concurrent writes).
+A tenant quota of `0` is unlimited; a nil tenant quota inherits
+`DefaultTenantQuota`.
 
 ### Nested Fluent Configuration
 
@@ -923,6 +929,16 @@ can select one, and performs the optional warm-up write:
 Both delays are validated as non-negative. They are `time.Duration` fields on
 `VolumeConfig`, so set them by direct assignment or in the configuration file
 (there is no fluent setter for them).
+
+The write path itself is buffered: `volumes[].writeBufferSize` (default
+`128 KiB`) batches payload writes, and `volumes[].copyBufferSize` (default
+`256 KiB`) is a pooled staging buffer reused across writes. Health and capacity
+readings are cached as well: `volumes[].healthCheckCacheTTL` (default `30s`)
+reuses a probe result, and `volumes[].spaceCacheTTL` (default `5s`) shares one
+capacity/available-space reading between `TotalCapacity` and `AvailableSpace`.
+An expired entry returns its previous value immediately and refreshes in the
+background, so a slow or hung filesystem probe never queues every concurrent
+writer behind it; a negative TTL disables that cache.
 
 `DatabaseHealthChecker` verifies the real metadata and quota databases with a
 cross-platform structural check of each tenant's

@@ -357,6 +357,70 @@ func TestGetNextBatchForProcessingPropagatesClaimFailures(t *testing.T) {
 	}
 }
 
+// TestGetNextBatchForProcessingReturnsClaimedPrefixOnFailure pins the partial
+// batch contract: files claimed before the failing candidate are returned so the
+// caller does not strand their leases in Processing until the timeout reclaim.
+func TestGetNextBatchForProcessingReturnsClaimedPrefixOnFailure(t *testing.T) {
+	ctx := context.Background()
+
+	claimErr := errors.New("repository is closed")
+	repo := &stubMetadataRepository{
+		pendingFiles: func(context.Context, string, int) ([]*core.FileMetadata, error) {
+			return []*core.FileMetadata{
+				createTestFileMetadata("a", core.FileStatusPending),
+				createTestFileMetadata("b", core.FileStatusPending),
+			}, nil
+		},
+		transitionResult: func(_ context.Context, _ string, fileKey string) (*core.FileMetadata, error) {
+			if fileKey == "b" {
+				return nil, claimErr
+			}
+			claimed := createTestFileMetadata(fileKey, core.FileStatusProcessing)
+			started := time.Now()
+			claimed.ProcessingStartTime = &started
+			return claimed, nil
+		},
+	}
+	scheduler, err := NewFileScheduler(repo, createTestVolumes(t), nil)
+	if err != nil {
+		t.Fatalf("new scheduler: %v", err)
+	}
+
+	locations, err := scheduler.GetNextBatchForProcessing(ctx, createTestTenant(), 5)
+	if !errors.Is(err, claimErr) {
+		t.Fatalf("error = %v, want wrapped %v", err, claimErr)
+	}
+	if len(locations) != 1 {
+		t.Fatalf("locations = %d, want the one claimed prefix entry", len(locations))
+	}
+	if locations[0].FileKey != "a" {
+		t.Fatalf("locations[0].FileKey = %q, want %q", locations[0].FileKey, "a")
+	}
+	if locations[0].Lease == nil {
+		t.Fatal("claimed prefix lost its lease")
+	}
+}
+
+// TestNewFileSchedulerDoesNotMutateCallerOptions pins that construction repairs
+// unset values on a copy. Reusing one options value (or reading it concurrently)
+// must not observe scheduler defaults.
+func TestNewFileSchedulerDoesNotMutateCallerOptions(t *testing.T) {
+	opts := &FileSchedulerOptions{}
+	repo, _ := createTestRepository(t)
+	defer func() { _ = repo.Close() }()
+
+	scheduler, err := NewFileScheduler(repo, createTestVolumes(t), opts)
+	if err != nil {
+		t.Fatalf("new scheduler: %v", err)
+	}
+	defer func() { _ = CloseFileScheduler(scheduler) }()
+
+	if opts.RetryPolicy != nil || opts.ProcessingTimeout != 0 ||
+		opts.TimedOutReclaimCooldown != 0 || opts.EmptyQueueReclaimBatchSize != 0 {
+		t.Fatalf("NewFileScheduler mutated caller options: %+v", opts)
+	}
+}
+
 // TestClaimLoopsHonorContextCancellation pins the AGENTS.md rule
 // "Check context.Context cancellation in loops".
 func TestClaimLoopsHonorContextCancellation(t *testing.T) {
