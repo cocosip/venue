@@ -222,43 +222,10 @@ func (s *cleanupService) volumeSnapshot() map[string]core.StorageVolume {
 	return volumes
 }
 
-// forEachStatusRecord visits every record with the given status in bounded
-// pages, so a large store is never materialised at once. It uses the optional
-// paging capability when the repository provides it and falls back to the
-// unbounded query otherwise.
-//
-// The scan is forward-only over the repository's key-ordered status index, so a
-// visitor that deletes the record it was given cannot make the scan skip a
-// later record or revisit an earlier one. Context cancellation is honoured
-// before the first page, between pages and between records. Repository and
-// visitor errors stop the scan and are returned unwrapped, so each caller can
-// add its own tenant/status context.
-func (s *cleanupService) forEachStatusRecord(
-	ctx context.Context,
-	tenantID string,
-	status core.FileProcessingStatus,
-	visit func(*core.FileMetadata) error,
-) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return s.forEachStatusPage(ctx, tenantID, status, func(records []*core.FileMetadata) error {
-		for _, record := range records {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := visit(record); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-// forEachStatusPage is forEachStatusRecord with page-grained delivery. A caller
-// that removes the visited records can delete one page in a single metadata
-// transaction instead of one transaction per record. The same forward-only
-// ordering, cancellation and cursor checks apply.
+// forEachStatusPage is forEachStatusRecordBefore with page-grained delivery. A
+// caller that removes the visited records can delete one page in a single
+// metadata transaction instead of one transaction per record. The same
+// forward-only ordering, cancellation and cursor checks apply.
 func (s *cleanupService) forEachStatusPage(
 	ctx context.Context,
 	tenantID string,
@@ -313,6 +280,99 @@ func (s *cleanupService) forEachStatusPage(
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// statusWindowPageReader is the optional metadata repository capability that
+// pages one status partition up to a time boundary.
+//
+// It is the windowed counterpart of core.StatusPageReader: a retention sweep only
+// ever touches records whose expiry instant has passed, so letting the repository
+// filter on its (status, completed_at) or (status, last_failed_at) index avoids
+// reading the whole partition and discarding the ineligible rows in Go. Callers
+// type-assert it and fall back to StatusPageReader otherwise:
+//
+//	if reader, ok := repo.(statusWindowPageReader); ok { ... } else { ... }
+//
+// The time is inclusive: a record whose expiry instant equals before is
+// eligible.
+type statusWindowPageReader interface {
+	GetByStatusPageBefore(ctx context.Context, tenantID string, status core.FileProcessingStatus, before time.Time, cursor string, limit int) (*core.MetadataPage, error)
+}
+
+// forEachStatusPageBefore is forEachStatusPage restricted to the records whose
+// status expiry instant is at or before before.
+//
+// When the repository implements the windowed capability the whole window is
+// read straight from its status/time index. Otherwise the current behaviour is
+// preserved: the status partition is paged (or read unbounded) as before, and the
+// visitor applies its own time-window check.
+func (s *cleanupService) forEachStatusPageBefore(
+	ctx context.Context,
+	tenantID string,
+	status core.FileProcessingStatus,
+	before time.Time,
+	visit func([]*core.FileMetadata) error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	reader, windowed := s.metadataRepo.(statusWindowPageReader)
+	if !windowed {
+		return s.forEachStatusPage(ctx, tenantID, status, visit)
+	}
+
+	cursor := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		page, err := reader.GetByStatusPageBefore(ctx, tenantID, status, before, cursor, cleanupPageSize)
+		if err != nil {
+			return err
+		}
+		if page == nil {
+			return nil
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := visit(page.Records); err != nil {
+			return err
+		}
+
+		if page.NextCursor == "" {
+			return nil
+		}
+		if page.NextCursor == cursor {
+			return fmt.Errorf("metadata repository returned a non-advancing status page cursor for tenant %s with status %s", tenantID, status)
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// forEachStatusRecordBefore is forEachStatusRecord restricted to the records
+// whose status expiry instant is at or before before.
+func (s *cleanupService) forEachStatusRecordBefore(
+	ctx context.Context,
+	tenantID string,
+	status core.FileProcessingStatus,
+	before time.Time,
+	visit func(*core.FileMetadata) error,
+) error {
+	return s.forEachStatusPageBefore(ctx, tenantID, status, before, func(records []*core.FileMetadata) error {
+		for _, record := range records {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := visit(record); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // emit logs one structured cleanup event through the injected runtime.
@@ -405,6 +465,73 @@ func (s *cleanupService) CleanupEmptyDirectoriesForTenant(ctx context.Context, t
 	return stats, nil
 }
 
+// volumeSweeper is the in-package capability the background cleanup service uses
+// to run the empty-directory and junk-file sweeps in one traversal per volume.
+//
+// It is deliberately unexported: it is an internal optimization, not part of the
+// public CleanupService contract. A CleanupService implementation without it
+// keeps the two documented separate sweeps.
+type volumeSweeper interface {
+	sweepVolumes(ctx context.Context) (*core.CleanupStatistics, error)
+}
+
+// sweepVolumes removes empty directories and OS junk files on every configured
+// volume in one walk per volume instead of one walk per sweep.
+//
+// The counters are the same as calling CleanupEmptyDirectories and
+// CleanupJunkFiles separately. Junk files are removed before the directory
+// attempts, so a directory that only held a junk file is reclaimed in this cycle
+// rather than the next one.
+func (s *cleanupService) sweepVolumes(ctx context.Context) (*core.CleanupStatistics, error) {
+	stats := &core.CleanupStatistics{}
+	defer s.recordCumulative(stats)
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for volumeID, volume := range s.volumeSnapshot() {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+
+		removed, err := s.sweepVolume(ctx, volumeID, volume, stats)
+		stats.EmptyDirectoriesRemoved += removed
+		if err != nil {
+			return stats, err
+		}
+	}
+
+	return stats, nil
+}
+
+// sweepVolume performs one traversal of a whole volume and applies both sweeps.
+func (s *cleanupService) sweepVolume(
+	ctx context.Context,
+	volumeID string,
+	volume core.StorageVolume,
+	stats *core.CleanupStatistics,
+) (int, error) {
+	mountPath := volume.MountPath()
+
+	candidates, junkFiles, err := walkVolumeTree(ctx, mountPath, mountPath, volumeShardDepth(volume), volumeWalkOptions{
+		collectDirectories: true,
+		collectJunkFiles:   true,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	removed, freed, removeErr := s.removeJunkFiles(ctx, volumeID, junkFiles)
+	stats.JunkFilesRemoved += removed
+	stats.SpaceFreed += freed
+	if removeErr != nil {
+		return 0, removeErr
+	}
+
+	return s.removeEmptyDirectories(ctx, candidates)
+}
+
 // cleanupEmptyDirsInVolume removes empty directories in a specific volume.
 //
 // scopeTenantID restricts the sweep to that tenant's directory below the volume
@@ -436,26 +563,35 @@ func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume co
 		}
 	}
 
-	removed := 0
-
 	// One walk per sweep instead of one walk per removal pass: every
 	// unprotected directory is collected once and then attempted deepest-first.
 	// A parent is only attempted after its children, so a nested chain of
 	// now-empty parents is reclaimed in the same pass without re-walking the
 	// tree or reading every directory twice.
-	candidates, err := s.unprotectedDirectories(ctx, volume, rootPath)
+	candidates, _, err := walkVolumeTree(ctx, mountPath, rootPath, volumeShardDepth(volume), volumeWalkOptions{
+		collectDirectories: true,
+	})
 	if err != nil {
 		return 0, err
 	}
+
+	return s.removeEmptyDirectories(ctx, candidates)
+}
+
+// removeEmptyDirectories attempts the collected directories deepest-first and
+// returns how many were removed. A directory that still holds files, or that
+// cannot be removed right now, is skipped: removal is best-effort per directory.
+// A cancelled context is reported so a partial sweep never looks like success.
+func (s *cleanupService) removeEmptyDirectories(ctx context.Context, candidates []string) (int, error) {
 	sort.Slice(candidates, func(i, j int) bool {
 		return pathDepth(candidates[i]) > pathDepth(candidates[j])
 	})
+
+	removed := 0
 	for _, path := range candidates {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return removed, ctxErr
 		}
-		// A directory that still holds files, or that cannot be removed right
-		// now, is skipped: removal is best-effort per directory.
 		if removeErr := os.Remove(path); removeErr == nil {
 			removed++
 		}
@@ -464,19 +600,33 @@ func (s *cleanupService) cleanupEmptyDirsInVolume(ctx context.Context, volume co
 	return removed, nil
 }
 
-// unprotectedDirectories walks one subtree of a volume and returns every
-// directory that is not structural protection.
+// volumeWalkOptions selects what one volume walk collects.
+type volumeWalkOptions struct {
+	collectDirectories bool
+	collectJunkFiles   bool
+}
+
+// walkVolumeTree walks one subtree of a volume once and returns the removable
+// directories and, when requested, the junk files it found.
 //
-// rootPath is the volume mount for an all-tenant sweep, or one tenant's
-// directory for a tenant-scoped sweep. Protection is always evaluated relative
-// to the volume mount, so neither the volume root, nor the tenant level, nor a
-// shard directory is ever a candidate. The walk skips the removal decision and
-// lets the caller try os.Remove deepest-first; a directory that still contains
-// files simply fails that call, so no separate emptiness read is needed.
-func (s *cleanupService) unprotectedDirectories(ctx context.Context, volume core.StorageVolume, rootPath string) ([]string, error) {
-	mountPath := volume.MountPath()
-	shards := volumeShardDepth(volume)
-	candidates := make([]string, 0)
+// rootPath is the volume mount for an all-tenant sweep, or one tenant's directory
+// for a tenant-scoped sweep. Protection is always evaluated relative to the
+// volume mount, so neither the volume root, nor the tenant level, nor a shard
+// directory is ever a directory candidate.
+//
+// WalkDir is used instead of Walk so no stat is paid per entry: only a matched
+// junk file reads its size. Directory removal is left to the caller, which
+// attempts it deepest-first; a directory that still contains files simply fails
+// that call, so no separate emptiness read is needed.
+func walkVolumeTree(
+	ctx context.Context,
+	mountPath string,
+	rootPath string,
+	shards shardDepthProtection,
+	options volumeWalkOptions,
+) ([]string, []junkFile, error) {
+	directories := make([]string, 0)
+	junkFiles := make([]junkFile, 0)
 
 	walkErr := filepath.WalkDir(rootPath, func(path string, entry fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -490,20 +640,36 @@ func (s *cleanupService) unprotectedDirectories(ctx context.Context, volume core
 			}
 			return nil
 		}
-		if entry == nil || !entry.IsDir() {
+		if entry == nil {
 			return nil
 		}
-		if isProtectedSystemDirectory(mountPath, path, shards) {
+
+		if entry.IsDir() {
+			if !options.collectDirectories || isProtectedSystemDirectory(mountPath, path, shards) {
+				return nil
+			}
+			directories = append(directories, path)
 			return nil
 		}
-		candidates = append(candidates, path)
+
+		if !options.collectJunkFiles || !isJunkFileName(entry.Name()) {
+			return nil
+		}
+
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			// Best-effort: a junk file that cannot be inspected is retried by a
+			// later sweep.
+			return nil
+		}
+		junkFiles = append(junkFiles, junkFile{path: path, size: info.Size()})
 		return nil
 	})
 	if walkErr != nil {
-		return nil, walkErr
+		return nil, nil, walkErr
 	}
 
-	return candidates, nil
+	return directories, junkFiles, nil
 }
 
 func pathDepth(path string) int {
@@ -754,13 +920,16 @@ func (s *cleanupService) CleanupPermanentlyFailedFiles(ctx context.Context, rete
 	// stable set instead of re-copying the map for every record.
 	volumes := s.volumeSnapshot()
 	for _, tenant := range tenants {
-		if err := s.forEachStatusRecord(ctx, tenant.ID, core.FileStatusPermanentlyFailed, func(file *core.FileMetadata) error {
+		if err := s.forEachStatusRecordBefore(ctx, tenant.ID, core.FileStatusPermanentlyFailed, cutoff, func(file *core.FileMetadata) error {
 			// A row that is already dead-lettered was never scanned by status, but
 			// guard anyway: its quota was released by the transition, so applying a
 			// disposition again would release it twice.
 			if file.Status == core.FileStatusDeadLettered {
 				return nil
 			}
+			// The window is applied in the Go visitor as well: it preserves the
+			// exact boundary (inclusive) and keeps the sweep correct even if a
+			// repository implementation is loose about its window.
 			// A row without a failure timestamp is not eligible yet: the retention
 			// period cannot be evaluated, and Locus blocks such rows too
 			// (StorageCleanupService.cs:1435-1439).
@@ -878,13 +1047,16 @@ func (s *cleanupService) CleanupCompletedFiles(ctx context.Context, retention ti
 	cutoff := time.Now().Add(-retention)
 	volumes := s.volumeSnapshot()
 	for _, tenant := range tenants {
-		if err := s.forEachStatusPage(ctx, tenant.ID, core.FileStatusCompleted, func(records []*core.FileMetadata) error {
+		if err := s.forEachStatusPageBefore(ctx, tenant.ID, core.FileStatusCompleted, cutoff, func(records []*core.FileMetadata) error {
 			// Physical deletion and quota release happen per file, but the
 			// metadata delete is one transaction per page. Keeping the page's
 			// prepared records lets a failed batch transaction restore exactly
 			// the quota it released, instead of restoring it one record at a time.
 			pending := make([]completedFileDeletion, 0, len(records))
 			for _, file := range records {
+				// The window is applied in the Go visitor as well: it preserves
+				// the exact boundary (inclusive) and keeps the sweep correct even
+				// if a repository implementation is loose about its window.
 				if file.CompletedAt == nil || file.CompletedAt.After(cutoff) {
 					continue
 				}

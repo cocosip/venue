@@ -29,10 +29,9 @@ const (
 	defaultVolumeHealthCheckDelay = 500 * time.Millisecond
 
 	// Volume capacity and write-path defaults. They mirror Locus: a short
-	// capacity cache, a buffered payload writer and a pooled staging buffer.
-	defaultVolumeSpaceCacheTTL   = 5 * time.Second
-	defaultVolumeWriteBufferSize = 128 * 1024
-	defaultVolumeCopyBufferSize  = 256 * 1024
+	// capacity cache and a pooled staging buffer.
+	defaultVolumeSpaceCacheTTL  = 5 * time.Second
+	defaultVolumeCopyBufferSize = 256 * 1024
 )
 
 // Advanced watcher defaults, applied by ApplyDefaults only to zero values.
@@ -136,8 +135,9 @@ type SqliteConfig struct {
 	// BusyTimeoutMs is how long a statement waits for a lock before failing.
 	BusyTimeoutMs int `json:"busyTimeoutMs" yaml:"busyTimeoutMs" mapstructure:"busyTimeoutMs"`
 
-	// CheckpointAfterBatch runs PRAGMA wal_checkpoint(PASSIVE) after every
-	// committed write batch. It bounds WAL growth at the cost of extra I/O.
+	// CheckpointAfterBatch runs PRAGMA wal_checkpoint(PASSIVE) every 64 committed
+	// write transactions instead of on every commit, so a single-row claim or
+	// completion never pays a WAL truncation while the WAL stays bounded.
 	CheckpointAfterBatch bool `json:"checkpointAfterBatch" yaml:"checkpointAfterBatch" mapstructure:"checkpointAfterBatch"`
 
 	// MaxOpenDatabases bounds how many tenant database handles stay open at the
@@ -223,10 +223,6 @@ type VolumeConfig struct {
 	// Zero selects the runtime default (5s); a negative value asks the
 	// filesystem on every call.
 	SpaceCacheTTL time.Duration `json:"spaceCacheTTL" yaml:"spaceCacheTTL" mapstructure:"spaceCacheTTL"`
-
-	// WriteBufferSize is the buffered writer size used for payload writes.
-	// Zero selects the runtime default (128 KiB).
-	WriteBufferSize int `json:"writeBufferSize" yaml:"writeBufferSize" mapstructure:"writeBufferSize"`
 
 	// CopyBufferSize is the staging buffer size used to stream one payload.
 	// Zero selects the runtime default (256 KiB); the buffer is reused through a
@@ -970,9 +966,6 @@ func (c *Config) ApplyDefaults() {
 		if c.Volumes[i].SpaceCacheTTL == 0 {
 			c.Volumes[i].SpaceCacheTTL = defaultVolumeSpaceCacheTTL
 		}
-		if c.Volumes[i].WriteBufferSize == 0 {
-			c.Volumes[i].WriteBufferSize = defaultVolumeWriteBufferSize
-		}
 		if c.Volumes[i].CopyBufferSize == 0 {
 			c.Volumes[i].CopyBufferSize = defaultVolumeCopyBufferSize
 		}
@@ -1127,9 +1120,6 @@ func (c *Config) Validate() error {
 		}
 		if volume.HealthCheckDelay < 0 {
 			return fmt.Errorf("volume[%d]: HealthCheckDelay cannot be negative", i)
-		}
-		if volume.WriteBufferSize < 0 {
-			return fmt.Errorf("volume[%d]: WriteBufferSize cannot be negative", i)
 		}
 		if volume.CopyBufferSize < 0 {
 			return fmt.Errorf("volume[%d]: CopyBufferSize cannot be negative", i)

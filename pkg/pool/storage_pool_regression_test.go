@@ -38,11 +38,12 @@ type fakeVolume struct {
 	// before reporting writeErr, simulating a partial write.
 	consumeBeforeWriteFailure int
 
-	writeCalls     atomic.Int64
-	deleteCalls    atomic.Int64
-	healthyCalls   atomic.Int64
-	totalCalls     atomic.Int64
-	availableCalls atomic.Int64
+	writeCalls      atomic.Int64
+	deleteCalls     atomic.Int64
+	healthyCalls    atomic.Int64
+	totalCalls      atomic.Int64
+	availableCalls  atomic.Int64
+	invalidateCalls atomic.Int64
 
 	mu      sync.Mutex
 	written map[string][]byte
@@ -76,6 +77,13 @@ func (v *fakeVolume) TotalCapacity(context.Context) (int64, error) {
 func (v *fakeVolume) AvailableSpace(context.Context) (int64, error) {
 	v.availableCalls.Add(1)
 	return v.available, v.availableErr
+}
+
+// InvalidateSpaceCache makes the fake volume implement the pool's optional
+// space-cache invalidation capability, so the post-failure invalidation is
+// observable.
+func (v *fakeVolume) InvalidateSpaceCache() {
+	v.invalidateCalls.Add(1)
 }
 
 func (v *fakeVolume) WriteFile(_ context.Context, relativePath string, content io.Reader) (int64, error) {
@@ -555,6 +563,12 @@ func TestWriteFile_RetriesNextVolumeWhenFirstFails(t *testing.T) {
 	if backup.writeCalls.Load() != 1 {
 		t.Errorf("backup volume write calls = %d, want 1", backup.writeCalls.Load())
 	}
+	if got := failing.invalidateCalls.Load(); got != 1 {
+		t.Errorf("failing volume space cache invalidations = %d, want 1", got)
+	}
+	if got := backup.invalidateCalls.Load(); got != 0 {
+		t.Errorf("successful volume space cache invalidations = %d, want 0", got)
+	}
 
 	metadata, err := repo.Get(ctx, "test-tenant", fileKey)
 	if err != nil {
@@ -1009,6 +1023,46 @@ func TestWriteFile_NonSeekableContentSkipsSizeConstraint(t *testing.T) {
 	}
 }
 
+// countingSeeker counts Seek calls so a test can pin how often the write path
+// probes a seekable reader.
+type countingSeeker struct {
+	reader *bytes.Reader
+	seeks  atomic.Int64
+}
+
+func (s *countingSeeker) Read(p []byte) (int, error) { return s.reader.Read(p) }
+
+func (s *countingSeeker) Seek(offset int64, whence int) (int64, error) {
+	s.seeks.Add(1)
+	return s.reader.Seek(offset, whence)
+}
+
+// TestWriteFile_ProbesSeekableContentOnce verifies the write path reuses the
+// reader position it already obtained while measuring the payload instead of
+// seeking a second time before the first write attempt.
+func TestWriteFile_ProbesSeekableContentOnce(t *testing.T) {
+	ctx := context.Background()
+
+	vol := newFakeVolume("v1", true, 4096)
+	pool := newRegressionPool(map[string]core.StorageVolume{"v1": vol}, newFakeMetadataRepo(), nil, nil)
+
+	content := &countingSeeker{reader: bytes.NewReader([]byte("0123456789"))}
+	if _, err := content.Seek(4, io.SeekStart); err != nil {
+		t.Fatalf("failed to position the reader: %v", err)
+	}
+	seeksBefore := content.seeks.Load()
+
+	if _, err := pool.WriteFile(ctx, createTestTenant(), content, nil); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// One current-position probe, one end probe, and one restore. The position
+	// is reused for the first attempt and for any retry rewind.
+	if got := content.seeks.Load() - seeksBefore; got != 3 {
+		t.Errorf("seek calls during one write = %d, want 3", got)
+	}
+}
+
 // TestRemainingContentSize_DoesNotConsumeReader verifies the size probe.
 func TestRemainingContentSize_DoesNotConsumeReader(t *testing.T) {
 	reader := bytes.NewReader([]byte("0123456789"))
@@ -1016,19 +1070,56 @@ func TestRemainingContentSize_DoesNotConsumeReader(t *testing.T) {
 		t.Fatalf("failed to position reader: %v", err)
 	}
 
-	if got := remainingContentSize(reader); got != 6 {
-		t.Errorf("remainingContentSize = %d, want 6", got)
+	remaining, position, seekable := remainingContentSize(reader)
+	if remaining != 6 {
+		t.Errorf("remainingContentSize = %d, want 6", remaining)
+	}
+	if position != 4 {
+		t.Errorf("remainingContentSize position = %d, want 4", position)
+	}
+	if !seekable {
+		t.Error("remainingContentSize seekable = false, want true")
 	}
 
-	position, err := reader.Seek(0, io.SeekCurrent)
+	current, err := reader.Seek(0, io.SeekCurrent)
 	if err != nil {
 		t.Fatalf("failed to read position: %v", err)
 	}
-	if position != 4 {
-		t.Errorf("reader position after probing = %d, want 4", position)
+	if current != 4 {
+		t.Errorf("reader position after probing = %d, want 4", current)
 	}
 
-	if got := remainingContentSize(io.LimitReader(reader, 3)); got != 0 {
-		t.Errorf("remainingContentSize for a non-seekable reader = %d, want 0", got)
+	remaining, position, seekable = remainingContentSize(io.LimitReader(reader, 3))
+	if remaining != 0 || position != 0 || seekable {
+		t.Errorf("remainingContentSize for a non-seekable reader = (%d, %d, %v), want (0, 0, false)",
+			remaining, position, seekable)
+	}
+}
+
+// TestIdempotentWriteGuard_HashMatchesConcatenatedPair verifies the stripe hash
+// kept its exact FNV mapping after the temporary pair string was removed, so the
+// same tenant/operation pair still lands on the same guard.
+func TestIdempotentWriteGuard_HashMatchesConcatenatedPair(t *testing.T) {
+	pool := &storagePool{}
+
+	pairs := [][2]string{
+		{"tenant", "operation"},
+		{"a", "bc"},
+		{"ab", "c"},
+		{"", ""},
+		{"tenant-1", "op-1"},
+	}
+
+	for _, pair := range pairs {
+		var want uint32 = 2166136261
+		for _, value := range pair[0] + "\n" + pair[1] {
+			want ^= uint32(value)
+			want *= 16777619
+		}
+		wantGuard := &pool.idempotentWriteGuards[want%idempotentWriteGuardCount]
+
+		if got := pool.idempotentWriteGuard(pair[0], pair[1]); got != wantGuard {
+			t.Errorf("idempotentWriteGuard(%q, %q) = %p, want %p", pair[0], pair[1], got, wantGuard)
+		}
 	}
 }

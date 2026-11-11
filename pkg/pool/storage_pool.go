@@ -188,18 +188,26 @@ func NewStoragePool(opts *StoragePoolOptions) (core.StoragePool, error) {
 	return pool, nil
 }
 
-// recordStatistic forwards one statistics delta when a recorder is configured.
-//
-// The recorder is optional: a nil recorder is the documented "recording
-// disabled" state, and recording never affects the storage operation.
-func (p *storagePool) recordStatistic(name string, value int64, tenantID, volumeID string) {
+// statisticDimensions returns the dimension map for one operation, or nil when
+// recording is disabled. Callers build it once per operation and reuse it for
+// every delta of that operation, so an enabled recorder needs one map instead
+// of one per metric and a disabled recorder needs none.
+func (p *storagePool) statisticDimensions(tenantID, volumeID string) map[string]string {
 	if !core.StatisticsRecordingEnabled(p.statistics) {
-		return
+		return nil
 	}
 
-	dimensions := map[string]string{
+	return map[string]string{
 		core.StatisticsDimensionTenantID: tenantID,
 		core.StatisticsDimensionVolumeID: volumeID,
+	}
+}
+
+// recordStatistic forwards one statistics delta to the recorder. A nil
+// dimensions map means recording is disabled and the call is dropped.
+func (p *storagePool) recordStatistic(name string, value int64, dimensions map[string]string) {
+	if dimensions == nil {
+		return
 	}
 
 	p.statistics.Record(name, value, time.Now().UTC(), dimensions)
@@ -256,8 +264,17 @@ func (p *storagePool) WriteFileIdempotently(
 }
 
 func (p *storagePool) idempotentWriteGuard(tenantID string, operationID string) *sync.Mutex {
+	// FNV-1a over the two identifiers in sequence: the separator byte keeps the
+	// pair unambiguous, and hashing in place avoids building a temporary
+	// concatenated string on every idempotent write.
 	var hash uint32 = 2166136261
-	for _, value := range tenantID + "\n" + operationID {
+	for _, value := range tenantID {
+		hash ^= uint32(value)
+		hash *= 16777619
+	}
+	hash ^= '\n'
+	hash *= 16777619
+	for _, value := range operationID {
 		hash ^= uint32(value)
 		hash *= 16777619
 	}
@@ -343,8 +360,13 @@ func (p *storagePool) writeFile(
 		resources.tenantQuotaTaken = true
 	}
 
+	// Measure the payload and remember the reader position once: the selection
+	// size constraint and a retry rewind both reuse it, so a seekable reader is
+	// not positioned twice per write.
+	requiredBytes, contentPosition, contentSeekable := remainingContentSize(content)
+
 	// Select storage volume candidates in preference order
-	candidates, err := p.selectWriteCandidates(ctx, content)
+	candidates, err := p.selectWriteCandidates(ctx, requiredBytes)
 	if err != nil {
 		return "", err
 	}
@@ -358,7 +380,17 @@ func (p *storagePool) writeFile(
 	}
 
 	// Write file to volume
-	volume, relativePath, fileSize, err := p.writeToVolumes(ctx, candidates, tenant.ID, fileKey, fileExtension, content, &resources)
+	volume, relativePath, fileSize, err := p.writeToVolumes(
+		ctx,
+		candidates,
+		tenant.ID,
+		fileKey,
+		fileExtension,
+		content,
+		contentPosition,
+		contentSeekable,
+		&resources,
+	)
 	if err != nil {
 		return "", err
 	}
@@ -387,9 +419,11 @@ func (p *storagePool) writeFile(
 	}
 
 	// Success path only: a rollback above means nothing durable was written, so
-	// the write statistics must not be inflated by a failed attempt.
-	p.recordStatistic(core.StatisticStorageWriteSuccessCount, 1, tenant.ID, volume.VolumeID())
-	p.recordStatistic(core.StatisticStorageWriteBytes, fileSize, tenant.ID, volume.VolumeID())
+	// the write statistics must not be inflated by a failed attempt. Both deltas
+	// share one dimension map.
+	dimensions := p.statisticDimensions(tenant.ID, volume.VolumeID())
+	p.recordStatistic(core.StatisticStorageWriteSuccessCount, 1, dimensions)
+	p.recordStatistic(core.StatisticStorageWriteBytes, fileSize, dimensions)
 
 	return fileKey, nil
 }
@@ -406,19 +440,10 @@ func (p *storagePool) writeToVolumes(
 	fileKey string,
 	fileExtension string,
 	content io.Reader,
+	contentPosition int64,
+	contentSeekable bool,
 	resources *writeResources,
 ) (core.StorageVolume, string, int64, error) {
-	seeker, seekable := content.(io.Seeker)
-	initialPosition := int64(0)
-	if seekable {
-		position, err := seeker.Seek(0, io.SeekCurrent)
-		if err != nil {
-			seekable = false
-		} else {
-			initialPosition = position
-		}
-	}
-
 	var lastErr error
 	for index, candidate := range candidates {
 		relativePath, err := p.buildPhysicalPath(candidate, tenantID, fileKey, fileExtension)
@@ -426,8 +451,8 @@ func (p *storagePool) writeToVolumes(
 			return nil, "", 0, fmt.Errorf("failed to build physical path: %w", err)
 		}
 
-		if seekable && index > 0 {
-			if _, err := seeker.Seek(initialPosition, io.SeekStart); err != nil {
+		if contentSeekable && index > 0 {
+			if _, err := content.(io.Seeker).Seek(contentPosition, io.SeekStart); err != nil {
 				return nil, "", 0, fmt.Errorf("failed to rewind content for retry: %w", err)
 			}
 		}
@@ -456,15 +481,28 @@ func (p *storagePool) writeToVolumes(
 		resources.physicalPath = ""
 
 		// Forget cached selection state so the failing volume is re-evaluated
-		// before it is chosen again.
+		// before it is chosen again. The aggregate capacity cache feeds
+		// GetTotalCapacity; the volume's own space cache is what the selector
+		// reads, so both are invalidated.
 		p.invalidateCapacityCache()
+		if invalidator, ok := candidate.(spaceCacheInvalidator); ok {
+			invalidator.InvalidateSpaceCache()
+		}
 
-		if !seekable || index+1 >= len(candidates) {
+		if !contentSeekable || index+1 >= len(candidates) {
 			break
 		}
 	}
 
 	return nil, "", 0, fmt.Errorf("failed to write file to volume: %w", lastErr)
+}
+
+// spaceCacheInvalidator is an optional volume capability: a volume that caches
+// its capacity reading can drop that reading after a failed write, so the next
+// selection sees the real free space instead of the stale one. Volumes without
+// the capability keep their existing behavior.
+type spaceCacheInvalidator interface {
+	InvalidateSpaceCache()
 }
 
 // rollbackWrite releases the resources tracked by a failed write. Quotas are
@@ -507,12 +545,10 @@ func (p *storagePool) rollbackWrite(
 	return cleanupErr
 }
 
-// selectWriteCandidates resolves the ordered list of volumes to try. A seekable
-// content reader constrains the selection to volumes that can hold the
-// remaining payload; the reader position is restored before returning.
-func (p *storagePool) selectWriteCandidates(ctx context.Context, content io.Reader) ([]core.StorageVolume, error) {
-	requiredBytes := remainingContentSize(content)
-
+// selectWriteCandidates resolves the ordered list of volumes to try. A
+// requiredBytes > 0 constrains the selection to volumes that can hold the
+// payload.
+func (p *storagePool) selectWriteCandidates(ctx context.Context, requiredBytes int64) ([]core.StorageVolume, error) {
 	if selector, ok := p.volumeSelector.(VolumeCandidateSelector); ok {
 		candidates, err := selector.SelectVolumeCandidates(ctx, p.volumes, requiredBytes)
 		if err != nil {
@@ -532,40 +568,42 @@ func (p *storagePool) selectWriteCandidates(ctx context.Context, content io.Read
 }
 
 // remainingContentSize reports how many bytes are left in a seekable reader
-// without consuming it. It returns 0 when the size is unknown.
-func remainingContentSize(content io.Reader) int64 {
+// without consuming it, together with the reader position it observed and
+// whether the reader is seekable. The position is returned so the write path can
+// rewind for a retry without positioning the reader a second time. remaining is
+// 0 when the size is unknown.
+func remainingContentSize(content io.Reader) (remaining int64, position int64, seekable bool) {
 	seeker, ok := content.(io.Seeker)
 	if !ok {
-		return 0
+		return 0, 0, false
 	}
 
 	current, err := seeker.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return 0
+		return 0, 0, false
 	}
 
 	end, err := seeker.Seek(0, io.SeekEnd)
 	if err != nil {
 		_, _ = seeker.Seek(current, io.SeekStart)
-		return 0
+		return 0, current, true
 	}
 
 	if _, err := seeker.Seek(current, io.SeekStart); err != nil {
-		return 0
+		return 0, current, true
 	}
 
 	if end <= current {
-		return 0
+		return 0, current, true
 	}
-	return end - current
+	return end - current, current, true
 }
 
 func (p *storagePool) buildPhysicalPath(volume core.StorageVolume, tenantID, fileKey, fileExtension string) (string, error) {
-	// Every derived path is tenant-scoped, so validate the identifier even when
-	// a custom path generator is configured.
-	if err := core.ValidateTenantID(tenantID); err != nil {
-		return "", fmt.Errorf("invalid tenant identifier: %w", err)
-	}
+	// The tenant-scoped path is derived from an identifier that the write path
+	// validates once, before any resource is acquired. A volume's own
+	// BuildPhysicalPath keeps its boundary check for callers that build a path
+	// without going through the pool.
 	if p.pathGenerator != nil {
 		return p.pathGenerator.GeneratePath(tenantID, fileKey, fileExtension), nil
 	}
@@ -612,7 +650,8 @@ func (p *storagePool) ReadFile(ctx context.Context, tenant core.TenantContext, f
 		// TryCorrectMetadataPhysicalPathAsync).
 		if correctedPath, corrected := p.tryCorrectPhysicalPath(ctx, volume, metadata); corrected {
 			if retryReader, retryErr := volume.ReadFile(ctx, correctedPath); retryErr == nil {
-				p.recordStatistic(core.StatisticStorageFileReadCount, 1, metadata.TenantID, metadata.VolumeID)
+				readDimensions := p.statisticDimensions(metadata.TenantID, metadata.VolumeID)
+				p.recordStatistic(core.StatisticStorageFileReadCount, 1, readDimensions)
 
 				return retryReader, nil
 			}
@@ -620,7 +659,8 @@ func (p *storagePool) ReadFile(ctx context.Context, tenant core.TenantContext, f
 		return nil, fmt.Errorf("failed to read file from volume: %w", err)
 	}
 
-	p.recordStatistic(core.StatisticStorageFileReadCount, 1, metadata.TenantID, metadata.VolumeID)
+	readDimensions := p.statisticDimensions(metadata.TenantID, metadata.VolumeID)
+	p.recordStatistic(core.StatisticStorageFileReadCount, 1, readDimensions)
 
 	return reader, nil
 }
@@ -639,6 +679,13 @@ func (p *storagePool) tryCorrectPhysicalPath(
 	volume core.StorageVolume,
 	metadata *core.FileMetadata,
 ) (string, bool) {
+	// The path here is derived from stored metadata rather than from a validated
+	// caller argument, so validate the identifier before it becomes a path
+	// segment: a damaged or foreign record must not shape a physical path.
+	if err := core.ValidateTenantID(metadata.TenantID); err != nil {
+		return "", false
+	}
+
 	canonicalPath, err := p.buildPhysicalPath(volume, metadata.TenantID, metadata.FileKey, metadata.FileExtension)
 	if err != nil || canonicalPath == "" || canonicalPath == metadata.PhysicalPath {
 		return "", false
@@ -750,7 +797,8 @@ func (p *storagePool) recordDequeue(location *core.FileLocation) {
 		return
 	}
 
-	p.recordStatistic(core.StatisticStorageFileDequeuedCount, 1, location.TenantID, location.VolumeID)
+	dimensions := p.statisticDimensions(location.TenantID, location.VolumeID)
+	p.recordStatistic(core.StatisticStorageFileDequeuedCount, 1, dimensions)
 }
 
 // MarkAsCompleted marks a file as successfully processed.
@@ -768,7 +816,8 @@ func (p *storagePool) MarkAsCompleted(ctx context.Context, lease core.FileProces
 		volumeID = metadata.VolumeID
 	}
 
-	p.recordStatistic(core.StatisticStorageFileCompletedCount, 1, lease.TenantID, volumeID)
+	dimensions := p.statisticDimensions(lease.TenantID, volumeID)
+	p.recordStatistic(core.StatisticStorageFileCompletedCount, 1, dimensions)
 
 	return nil
 }

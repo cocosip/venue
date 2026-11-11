@@ -329,34 +329,10 @@ func (s *BackgroundCleanupService) executeCleanup() {
 
 	totalStats := &core.CleanupStatistics{}
 
-	// 1. Cleanup empty directories
-	if s.cleanupEmptyDirectories {
-		stats, err := s.cleanupService.CleanupEmptyDirectories(s.ctx)
-		if err != nil {
-			s.emitStepError(s.ctx, "empty_directories_failed", "Failed to cleanup empty directories", err)
-		} else {
-			totalStats.EmptyDirectoriesRemoved += stats.EmptyDirectoriesRemoved
-			if stats.EmptyDirectoriesRemoved > 0 {
-				s.emit(s.ctx, slog.LevelInfo, "empty_directories_removed", "Cleaned up empty directories", slog.Int("count", stats.EmptyDirectoriesRemoved))
-			}
-		}
-	}
-
-	// 2. Cleanup OS junk files on their own cadence: this is a recursive volume
-	// scan, so it is throttled independently of the lighter status cleanup.
-	if s.cleanupJunkFiles && s.shouldCleanupJunkFiles() {
-		stats, err := s.cleanupService.CleanupJunkFiles(s.ctx)
-		if err != nil {
-			s.emitStepError(s.ctx, "junk_files_failed", "Failed to cleanup junk files", err)
-		} else {
-			totalStats.JunkFilesRemoved += stats.JunkFilesRemoved
-			totalStats.SpaceFreed += stats.SpaceFreed
-			s.recordJunkSweep()
-			if stats.JunkFilesRemoved > 0 {
-				s.emit(s.ctx, slog.LevelInfo, "junk_files_removed", "Removed OS junk files", slog.Int("count", stats.JunkFilesRemoved))
-			}
-		}
-	}
+	// 1 & 2. Empty-directory and OS junk-file sweeps. Both walk the same volume
+	// trees, so when both are due they share one traversal per volume; the junk
+	// sweep keeps its own cadence through shouldCleanupJunkFiles.
+	s.cleanupVolumeTrees(totalStats)
 
 	// 3. Cleanup timed-out processing files
 	if s.cleanupTimedOutFiles {
@@ -465,6 +441,76 @@ func (s *BackgroundCleanupService) executeCleanup() {
 		slog.Int("metadata_databases_optimized", totalStats.MetadataDatabasesOptimized),
 		slog.Int("quota_databases_optimized", totalStats.QuotaDatabasesOptimized),
 		slog.Int64("space_freed_bytes", totalStats.SpaceFreed))
+}
+
+// cleanupVolumeTrees runs the empty-directory and junk-file sweeps.
+//
+// The two sweeps walk the same volume trees, so when both are due and the cleanup
+// service supports the combined traversal, one walk per volume feeds both. The
+// junk sweep keeps its own cadence: when it is not due, only the directory sweep
+// runs, and a CleanupService without the combined traversal keeps the two
+// documented separate calls.
+func (s *BackgroundCleanupService) cleanupVolumeTrees(totalStats *core.CleanupStatistics) {
+	emptyDirectoriesDue := s.cleanupEmptyDirectories
+	junkFilesDue := s.cleanupJunkFiles && s.shouldCleanupJunkFiles()
+
+	if emptyDirectoriesDue && junkFilesDue {
+		if sweeper, ok := s.cleanupService.(volumeSweeper); ok {
+			stats, err := sweeper.sweepVolumes(s.ctx)
+			if err != nil {
+				// One traversal served both sweeps, so an incomplete walk means
+				// both categories are incomplete.
+				s.emitStepError(s.ctx, "empty_directories_failed", "Failed to cleanup empty directories", err)
+				s.emitStepError(s.ctx, "junk_files_failed", "Failed to cleanup junk files", err)
+				return
+			}
+
+			s.recordJunkSweep()
+			s.applyVolumeSweepStats(totalStats, stats)
+			return
+		}
+	}
+
+	if emptyDirectoriesDue {
+		stats, err := s.cleanupService.CleanupEmptyDirectories(s.ctx)
+		if err != nil {
+			s.emitStepError(s.ctx, "empty_directories_failed", "Failed to cleanup empty directories", err)
+		} else {
+			totalStats.EmptyDirectoriesRemoved += stats.EmptyDirectoriesRemoved
+			if stats.EmptyDirectoriesRemoved > 0 {
+				s.emit(s.ctx, slog.LevelInfo, "empty_directories_removed", "Cleaned up empty directories", slog.Int("count", stats.EmptyDirectoriesRemoved))
+			}
+		}
+	}
+
+	if junkFilesDue {
+		stats, err := s.cleanupService.CleanupJunkFiles(s.ctx)
+		if err != nil {
+			s.emitStepError(s.ctx, "junk_files_failed", "Failed to cleanup junk files", err)
+		} else {
+			totalStats.JunkFilesRemoved += stats.JunkFilesRemoved
+			totalStats.SpaceFreed += stats.SpaceFreed
+			s.recordJunkSweep()
+			if stats.JunkFilesRemoved > 0 {
+				s.emit(s.ctx, slog.LevelInfo, "junk_files_removed", "Removed OS junk files", slog.Int("count", stats.JunkFilesRemoved))
+			}
+		}
+	}
+}
+
+// applyVolumeSweepStats folds one combined sweep into the cycle totals and emits
+// the same per-category events the separate sweeps emitted.
+func (s *BackgroundCleanupService) applyVolumeSweepStats(totalStats *core.CleanupStatistics, stats *core.CleanupStatistics) {
+	totalStats.EmptyDirectoriesRemoved += stats.EmptyDirectoriesRemoved
+	totalStats.JunkFilesRemoved += stats.JunkFilesRemoved
+	totalStats.SpaceFreed += stats.SpaceFreed
+
+	if stats.EmptyDirectoriesRemoved > 0 {
+		s.emit(s.ctx, slog.LevelInfo, "empty_directories_removed", "Cleaned up empty directories", slog.Int("count", stats.EmptyDirectoriesRemoved))
+	}
+	if stats.JunkFilesRemoved > 0 {
+		s.emit(s.ctx, slog.LevelInfo, "junk_files_removed", "Removed OS junk files", slog.Int("count", stats.JunkFilesRemoved))
+	}
 }
 
 func (s *BackgroundCleanupService) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {

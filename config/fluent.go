@@ -702,8 +702,8 @@ func (c *SqliteConfig) WithBusyTimeout(value time.Duration) *SqliteConfig {
 	return c
 }
 
-// WithCheckpointAfterBatch enables or disables a passive WAL checkpoint after a
-// committed write batch.
+// WithCheckpointAfterBatch enables or disables a passive WAL checkpoint every 64
+// committed write transactions.
 func (c *SqliteConfig) WithCheckpointAfterBatch(enabled bool) *SqliteConfig {
 	c.CheckpointAfterBatch = enabled
 	return c
@@ -826,13 +826,6 @@ func (c *VolumeConfig) WithHealthCheckCacheTTL(value time.Duration) *VolumeConfi
 // every call.
 func (c *VolumeConfig) WithSpaceCacheTTL(value time.Duration) *VolumeConfig {
 	c.SpaceCacheTTL = value
-	return c
-}
-
-// WithWriteBufferSize sets the buffered writer size used for payload writes.
-// Zero selects the runtime default.
-func (c *VolumeConfig) WithWriteBufferSize(value int) *VolumeConfig {
-	c.WriteBufferSize = value
 	return c
 }
 

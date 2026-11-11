@@ -18,6 +18,34 @@ func selectorVolumes(volumes ...*fakeVolume) map[string]core.StorageVolume {
 	return result
 }
 
+// TestMostAvailableSpaceSelector_OrdersTiesByVolumeID verifies the deterministic
+// tie-break the sort must preserve: equal free space falls back to volume ID,
+// independent of map iteration order.
+func TestMostAvailableSpaceSelector_OrdersTiesByVolumeID(t *testing.T) {
+	ctx := context.Background()
+
+	volumes := selectorVolumes(
+		newFakeVolume("zebra", true, 100),
+		newFakeVolume("alpha", true, 100),
+		newFakeVolume("mango", true, 100),
+	)
+
+	candidates, err := (&MostAvailableSpaceSelector{}).SelectVolumeCandidates(ctx, volumes, 0)
+	if err != nil {
+		t.Fatalf("SelectVolumeCandidates() error = %v", err)
+	}
+
+	want := []string{"alpha", "mango", "zebra"}
+	if len(candidates) != len(want) {
+		t.Fatalf("candidates = %d, want %d", len(candidates), len(want))
+	}
+	for i, id := range want {
+		if candidates[i].VolumeID() != id {
+			t.Errorf("candidate %d = %q, want %q", i, candidates[i].VolumeID(), id)
+		}
+	}
+}
+
 // TestMostAvailableSpaceSelector_SelectsExpectedVolume is the table-driven
 // behavior matrix for the default selector.
 func TestMostAvailableSpaceSelector_SelectsExpectedVolume(t *testing.T) {

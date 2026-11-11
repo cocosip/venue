@@ -275,6 +275,91 @@ func TestStoragePoolRecordsNoStatisticsWithoutRecorder(t *testing.T) {
 	}
 }
 
+// statisticsDisabledRecorder is a recorder that reports itself disabled, which
+// lets a call site skip building dimension maps.
+type statisticsDisabledRecorder struct{}
+
+func (statisticsDisabledRecorder) Record(string, int64, time.Time, map[string]string) {}
+
+func (statisticsDisabledRecorder) StatisticsEnabled() bool { return false }
+
+// TestStatisticDimensionsSkipDisabledRecorder verifies that a disabled recorder
+// needs no dimension map, which is what makes recording allocation free.
+func TestStatisticDimensionsSkipDisabledRecorder(t *testing.T) {
+	disabled := []struct {
+		name     string
+		recorder core.StatisticsRecorder
+	}{
+		{name: "nil recorder", recorder: nil},
+		{name: "disabled recorder", recorder: statisticsDisabledRecorder{}},
+	}
+
+	for _, tc := range disabled {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := &storagePool{statistics: tc.recorder}
+			if dimensions := pool.statisticDimensions("tenant-1", "volume-1"); dimensions != nil {
+				t.Errorf("statisticDimensions() = %v, want nil for a disabled recorder", dimensions)
+			}
+		})
+	}
+
+	pool := &storagePool{statistics: &poolRecorder{}}
+	dimensions := pool.statisticDimensions("tenant-1", "volume-1")
+	if dimensions[core.StatisticsDimensionTenantID] != "tenant-1" {
+		t.Errorf("tenant dimension = %q, want %q", dimensions[core.StatisticsDimensionTenantID], "tenant-1")
+	}
+	if dimensions[core.StatisticsDimensionVolumeID] != "volume-1" {
+		t.Errorf("volume dimension = %q, want %q", dimensions[core.StatisticsDimensionVolumeID], "volume-1")
+	}
+}
+
+// TestStoragePoolReusesWriteDimensionMap verifies that the two deltas of one
+// write share a single dimension map instead of allocating one map per metric.
+func TestStoragePoolReusesWriteDimensionMap(t *testing.T) {
+	ctx := context.Background()
+
+	recorder := &poolRecorder{}
+	repo := newStatisticsTestRepository(t)
+	volumes := newStatisticsTestVolumes(t)
+
+	sched, err := scheduler.NewFileScheduler(repo, volumes, nil)
+	if err != nil {
+		t.Fatalf("NewFileScheduler() error = %v", err)
+	}
+
+	pool, err := NewStoragePool(&StoragePoolOptions{
+		TenantManager:      &mockTenantManager{},
+		MetadataRepository: repo,
+		FileScheduler:      sched,
+		Volumes:            volumes,
+		StatisticsRecorder: recorder,
+	})
+	if err != nil {
+		t.Fatalf("NewStoragePool() error = %v", err)
+	}
+
+	if _, err := pool.WriteFile(ctx, createTestTenant(), bytes.NewReader([]byte("payload")), nil); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	calls := recorder.recorded()
+	if len(calls) != 2 {
+		t.Fatalf("recorded %d deltas, want the two write deltas: %+v", len(calls), calls)
+	}
+	if calls[0].name != core.StatisticStorageWriteSuccessCount || calls[1].name != core.StatisticStorageWriteBytes {
+		t.Fatalf("write delta names = (%q, %q), want (%q, %q)",
+			calls[0].name, calls[1].name,
+			core.StatisticStorageWriteSuccessCount, core.StatisticStorageWriteBytes)
+	}
+
+	// The recorder retains the map it was given, so mutating one recorded map
+	// proves both deltas share it.
+	calls[0].dimensions["shared"] = "yes"
+	if calls[1].dimensions["shared"] != "yes" {
+		t.Error("the two write deltas did not share one dimensions map")
+	}
+}
+
 // assertRecorderCall compares one recorded delta against its expectation.
 func assertRecorderCall(t *testing.T, index int, got, want poolRecorderCall) {
 	t.Helper()

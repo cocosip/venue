@@ -382,13 +382,31 @@ func (s *fileScheduler) GetNextBatchForProcessing(ctx context.Context, tenant co
 	return locations, nil
 }
 
-// claimNextPendingFile inspects one bounded window of pending candidates and
-// tries to claim the first one that is still claimable.
+// pendingBatchClaimer is the optional metadata capability that claims pending
+// records atomically in one write transaction. A repository that provides it lets
+// the scheduler claim without materializing a candidate window and without
+// opening one transaction per candidate.
+type pendingBatchClaimer interface {
+	ClaimPendingFiles(ctx context.Context, tenantID string, limit int) ([]*core.FileMetadata, error)
+}
+
+// claimNextPendingFile claims one pending file.
 //
 // claimed reports whether a file was transitioned to Processing. A false result
-// with a nil error means nothing in the window was claimable, either because the
-// window was empty or because every candidate was lost to a competing worker.
+// with a nil error means nothing was claimable: the queue was empty or every
+// candidate was lost to a competing worker.
 func (s *fileScheduler) claimNextPendingFile(ctx context.Context, tenantID string) (*core.FileLocation, bool, error) {
+	if claimer, ok := s.metadataRepo.(pendingBatchClaimer); ok {
+		claimed, err := claimer.ClaimPendingFiles(ctx, tenantID, 1)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to claim pending file: %w", err)
+		}
+		if len(claimed) == 0 {
+			return nil, false, nil
+		}
+		return claimed[0].ToFileLocation(), true, nil
+	}
+
 	// A bounded candidate window keeps one call from scanning the whole queue.
 	pendingFiles, err := s.metadataRepo.GetPendingFiles(ctx, tenantID, claimCandidateLimit)
 	if err != nil {
@@ -416,17 +434,30 @@ func (s *fileScheduler) claimNextPendingFile(ctx context.Context, tenantID strin
 	return nil, false, nil
 }
 
-// claimPendingBatch claims up to batchSize pending files, walking the pending
-// queue in bounded candidate windows. It returns the claimed files, which may
-// be empty when nothing was claimable, or nil when the pending scan failed.
+// claimPendingBatch claims up to batchSize pending files.
 //
-// A window never exceeds batchCandidateLimit, so one call cannot issue an
-// unbounded query, and the walk continues into the next window (keyset-paged
-// through core.PendingFilesPager) only while it makes progress: the loop stops
-// once batchSize is reached, at the end of the queue, or when a full window
-// yielded no claim, which is what contention looks like. That keeps a bounded
-// claim bounded even when every candidate is being stolen by other workers.
+// A repository that provides pendingBatchClaimer claims the whole batch in one
+// write transaction. Otherwise the pending queue is walked in bounded candidate
+// windows: a window never exceeds batchCandidateLimit, so one call cannot issue
+// an unbounded query, and the walk continues into the next window
+// (keyset-paged through core.PendingFilesPager) only while it makes progress. The
+// loop stops once batchSize is reached, at the end of the queue, or when a full
+// window yielded no claim, which is what contention looks like. That keeps a
+// bounded claim bounded even when every candidate is being stolen by other
+// workers.
 func (s *fileScheduler) claimPendingBatch(ctx context.Context, tenantID string, batchSize int) ([]*core.FileLocation, error) {
+	if claimer, ok := s.metadataRepo.(pendingBatchClaimer); ok {
+		claimed, err := claimer.ClaimPendingFiles(ctx, tenantID, batchSize)
+		if err != nil {
+			return nil, fmt.Errorf("failed to claim pending files: %w", err)
+		}
+		locations := make([]*core.FileLocation, 0, len(claimed))
+		for _, file := range claimed {
+			locations = append(locations, file.ToFileLocation())
+		}
+		return locations, nil
+	}
+
 	// Get pending files (fetch more than needed to account for race conditions)
 	fetchSize := batchFetchSize(batchSize)
 	pager, canPage := s.metadataRepo.(core.PendingFilesPager)
@@ -547,12 +578,15 @@ func (s *fileScheduler) reclaimTimedOutOnEmptyQueue(ctx context.Context, tenantI
 		return false, err
 	}
 
-	if _, err := s.resetTimedOutProcessingFiles(ctx, tenantID, s.processingTimeout, s.emptyQueueReclaimBatchSize); err != nil {
+	resetCount, err := s.resetTimedOutProcessingFiles(ctx, tenantID, s.processingTimeout, s.emptyQueueReclaimBatchSize)
+	if err != nil {
 		s.rollbackTimedOutReclaim(s.reclaimDeadlines, reservation)
 		return false, err
 	}
 
-	return true, nil
+	// Only a pass that actually reset something can make the queue claimable, so
+	// the caller's confirmation scan runs only then.
+	return resetCount > 0, nil
 }
 
 // reserveTimedOutReclaim atomically reserves the reclaim slot of one cooldown

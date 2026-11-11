@@ -300,6 +300,131 @@ func TestWarmWritePathCache_CancelledContextTouchesNothing(t *testing.T) {
 	}
 }
 
+// TestWriteFile_CreatesMissingParentDirectory verifies the ENOENT branch: the
+// create is attempted first and a missing parent directory is created and the
+// create retried.
+func TestWriteFile_CreatesMissingParentDirectory(t *testing.T) {
+	ctx := context.Background()
+	volume, mountDir := createWritePathVolume(t, false)
+
+	relativePath := filepath.Join("tenant", "shard", "deeper", "payload.txt")
+	if _, err := volume.WriteFile(ctx, relativePath, strings.NewReader("payload")); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", relativePath, err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(mountDir, relativePath))
+	if err != nil {
+		t.Fatalf("failed to read the written file: %v", err)
+	}
+	if string(content) != "payload" {
+		t.Errorf("content = %q, want %q", content, "payload")
+	}
+}
+
+// TestWriteFile_CreatesParentDirectoryOnlyWhenMissing verifies the create-first
+// branch: an existing parent directory costs no directory-creation call, and a
+// missing one is created exactly once for every later write in it.
+func TestWriteFile_CreatesParentDirectoryOnlyWhenMissing(t *testing.T) {
+	ctx := context.Background()
+	volume, mountDir := createWritePathVolume(t, false)
+
+	var directoryCalls atomic.Int64
+	volume.mkdirAll = func(dir string, perm os.FileMode) error {
+		directoryCalls.Add(1)
+		return os.MkdirAll(dir, perm)
+	}
+
+	// The volume root already exists, so this write must not attempt mkdir.
+	if _, err := volume.WriteFile(ctx, "root-level.txt", strings.NewReader("payload")); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if got := directoryCalls.Load(); got != 0 {
+		t.Errorf("directory creation calls = %d, want 0 when the parent exists", got)
+	}
+
+	// The first write into a missing shard creates the directory once.
+	if _, err := volume.WriteFile(ctx, "tenant/shard/first.txt", strings.NewReader("payload")); err != nil {
+		t.Fatalf("WriteFile(first) error = %v", err)
+	}
+	if got := directoryCalls.Load(); got != 1 {
+		t.Errorf("directory creation calls = %d, want 1 for a missing parent", got)
+	}
+
+	// The directory now exists, so the second write must not create it again.
+	if _, err := volume.WriteFile(ctx, "tenant/shard/second.txt", strings.NewReader("payload")); err != nil {
+		t.Fatalf("WriteFile(second) error = %v", err)
+	}
+	if got := directoryCalls.Load(); got != 1 {
+		t.Errorf("directory creation calls = %d, want 1 after the directory exists", got)
+	}
+
+	for _, name := range []string{"root-level.txt", "tenant/shard/first.txt", "tenant/shard/second.txt"} {
+		if _, err := os.Stat(filepath.Join(mountDir, name)); err != nil {
+			t.Errorf("expected %q to exist: %v", name, err)
+		}
+	}
+}
+
+// TestWriteFile_ReportsDirectoryCreationFailure verifies that a genuine
+// directory-creation failure keeps its dedicated error class.
+func TestWriteFile_ReportsDirectoryCreationFailure(t *testing.T) {
+	ctx := context.Background()
+	volume, mountDir := createWritePathVolume(t, false)
+
+	volume.mkdirAll = func(string, os.FileMode) error {
+		return os.ErrPermission
+	}
+
+	_, err := volume.WriteFile(ctx, "missing/parent/file.txt", strings.NewReader("payload"))
+	if err == nil {
+		t.Fatal("expected the failed directory creation to be reported")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Errorf("error = %v, want it to wrap os.ErrPermission", err)
+	}
+	if !strings.Contains(err.Error(), "failed to create directory") {
+		t.Errorf("error = %v, want the directory-creation class", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(mountDir, "missing", "parent", "file.txt")); !os.IsNotExist(statErr) {
+		t.Errorf("failed write left a file behind (stat error = %v)", statErr)
+	}
+}
+
+// TestWriteFile_CreateFailureThatIsNotENOENTStaysACreateFailure verifies that
+// the lazy-directory change does not reclassify other create errors: a target
+// that exists as a directory is reported as a create failure, not as a missing
+// directory.
+func TestWriteFile_CreateFailureThatIsNotENOENTStaysACreateFailure(t *testing.T) {
+	ctx := context.Background()
+	volume, mountDir := createWritePathVolume(t, false)
+
+	blockedDir := filepath.Join(mountDir, "blocked")
+	if err := os.MkdirAll(blockedDir, 0755); err != nil {
+		t.Fatalf("failed to create the blocking directory: %v", err)
+	}
+
+	var directoryCalls atomic.Int64
+	volume.mkdirAll = func(string, os.FileMode) error {
+		directoryCalls.Add(1)
+		return nil
+	}
+
+	_, err := volume.WriteFile(ctx, "blocked", strings.NewReader("payload"))
+	if err == nil {
+		t.Fatal("expected creating a file over a directory to fail")
+	}
+	if !strings.Contains(err.Error(), "failed to create file") {
+		t.Errorf("error = %v, want the create-file class", err)
+	}
+	if got := directoryCalls.Load(); got != 0 {
+		t.Errorf("directory creation calls = %d, want 0 for a non-ENOENT create failure", got)
+	}
+
+	if info, statErr := os.Stat(blockedDir); statErr != nil || !info.IsDir() {
+		t.Errorf("the blocking directory was damaged (info = %v, error = %v)", info, statErr)
+	}
+}
+
 // TestWriteCapabilities_ConcurrentProbeWriteAndWarmup exercises the probe, the
 // write path and the warmup together so the race detector can prove the health
 // cache stays consistent under concurrent use.

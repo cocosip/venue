@@ -1,7 +1,6 @@
 package volume
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -40,13 +39,9 @@ const DefaultHealthCheckCacheTTL = 30 * time.Second
 // the next candidate.
 const DefaultSpaceCacheTTL = 5 * time.Second
 
-// DefaultWriteBufferSize and DefaultCopyBufferSize mirror Locus's volume
-// defaults. The write buffer batches the payload into fewer filesystem writes,
-// and the copy buffer is the per-write staging buffer reused through a pool.
-const (
-	DefaultWriteBufferSize = 128 * 1024
-	DefaultCopyBufferSize  = 256 * 1024
-)
+// DefaultCopyBufferSize is the staging buffer size used to stream one payload.
+// The buffer is reused through a pool across writes.
+const DefaultCopyBufferSize = 256 * 1024
 
 // writeWarmupFilePrefix is the volume-internal name prefix of the throwaway file
 // WarmWritePathCache creates. The leading dot keeps it out of every tenant
@@ -91,10 +86,6 @@ type LocalFileSystemVolumeOptions struct {
 	// cache so every call asks the filesystem.
 	SpaceCacheTTL time.Duration
 
-	// WriteBufferSize is the buffered writer size used by WriteFile.
-	// Zero selects DefaultWriteBufferSize.
-	WriteBufferSize int
-
 	// CopyBufferSize is the staging buffer size used to stream one payload.
 	// Zero selects DefaultCopyBufferSize; the buffer is reused through a pool.
 	CopyBufferSize int
@@ -120,12 +111,13 @@ type LocalFileSystemVolume struct {
 	// volume-internal name.
 	warmupName func() string
 
-	// syncFile, syncDirectory and openFileForRead are seams for deterministic
-	// tests: they default to (*os.File).Sync, syncing a directory handle, and
-	// os.Open. Production never replaces them.
+	// syncFile, syncDirectory, openFileForRead and mkdirAll are seams for
+	// deterministic tests: they default to (*os.File).Sync, syncing a directory
+	// handle, os.Open, and os.MkdirAll. Production never replaces them.
 	syncFile        func(*os.File) error
 	syncDirectory   func(string) error
 	openFileForRead func(string) (*os.File, error)
+	mkdirAll        func(string, os.FileMode) error
 
 	// probeSpace is a seam for deterministic tests. It defaults to the
 	// platform-specific probeDiskSpace.
@@ -159,10 +151,9 @@ type LocalFileSystemVolume struct {
 	spaceExpiresAt  time.Time
 	spaceRefreshing bool
 
-	// copyBuffers and writeBuffers reuse the payload buffers across writes so a
-	// large file does not allocate one per write.
-	copyBuffers  sync.Pool
-	writeBuffers sync.Pool
+	// copyBuffers reuses the payload staging buffer across writes so a large
+	// file does not allocate one per write.
+	copyBuffers sync.Pool
 }
 
 // NewLocalFileSystemVolume creates a new local file system volume.
@@ -203,14 +194,6 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 		spaceCacheTTL = DefaultSpaceCacheTTL
 	}
 
-	writeBufferSize := opts.WriteBufferSize
-	if writeBufferSize == 0 {
-		writeBufferSize = DefaultWriteBufferSize
-	}
-	if writeBufferSize < 0 {
-		return nil, fmt.Errorf("write buffer size cannot be negative: %w", core.ErrInvalidArgument)
-	}
-
 	copyBufferSize := opts.CopyBufferSize
 	if copyBufferSize == 0 {
 		copyBufferSize = DefaultCopyBufferSize
@@ -233,9 +216,6 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 		buffer := make([]byte, copyBufferSize)
 		return &buffer
 	}
-	volume.writeBuffers.New = func() any {
-		return bufio.NewWriterSize(io.Discard, writeBufferSize)
-	}
 	volume.probeHealth = volume.performHealthProbe
 	volume.probeSpace = volume.probeDiskSpace
 	volume.warmupName = func() string {
@@ -244,6 +224,7 @@ func NewLocalFileSystemVolume(opts *LocalFileSystemVolumeOptions) (core.StorageV
 	volume.syncFile = func(file *os.File) error { return file.Sync() }
 	volume.syncDirectory = syncDirectory
 	volume.openFileForRead = os.Open
+	volume.mkdirAll = os.MkdirAll
 
 	return volume, nil
 }
@@ -337,6 +318,19 @@ func (v *LocalFileSystemVolume) refreshSpace(ctx context.Context) {
 		v.spaceAvailable = available
 		v.spaceExpiresAt = v.now().Add(v.spaceCacheTTL)
 	}
+	v.spaceMu.Unlock()
+}
+
+// InvalidateSpaceCache drops the cached capacity reading so the next
+// TotalCapacity/AvailableSpace call probes the filesystem again.
+//
+// The storage pool calls it for a volume whose write just failed: the cached
+// reading is what made the volume look writable, and the next selection must
+// observe the real free space instead of reusing the stale one. It is a no-op
+// when capacity caching is disabled.
+func (v *LocalFileSystemVolume) InvalidateSpaceCache() {
+	v.spaceMu.Lock()
+	v.spaceKnown = false
 	v.spaceMu.Unlock()
 }
 
@@ -557,14 +551,19 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 		return 0, err
 	}
 
-	// Ensure directory exists
+	// Create the file first: after the first write to a shard directory its
+	// parent chain already exists, so only a genuinely missing directory pays
+	// for MkdirAll. Any other create failure is reported unchanged, and a
+	// create that failed only because the directory vanished is retried once
+	// after the directory is created.
 	dir := filepath.Dir(fullPath)
-	if mkdirErr := os.MkdirAll(dir, 0755); mkdirErr != nil {
-		return 0, fmt.Errorf("failed to create directory: %w", mkdirErr)
-	}
-
-	// Create file
 	file, err := os.Create(fullPath)
+	if err != nil && os.IsNotExist(err) {
+		if mkdirErr := v.mkdirAll(dir, 0755); mkdirErr != nil {
+			return 0, fmt.Errorf("failed to create directory: %w", mkdirErr)
+		}
+		file, err = os.Create(fullPath)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to create file: %w", err)
 	}
@@ -587,28 +586,17 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 	}()
 
 	// Copy content through a context-aware reader so a cancelled request stops
-	// at the next chunk instead of streaming the whole payload. The payload is
-	// buffered into write-buffer-sized filesystem writes, and the staging buffer
-	// is reused across writes; exposing only Write (not ReaderFrom) keeps
-	// io.CopyBuffer from silently bypassing that buffer.
+	// at the next chunk instead of streaming the whole payload. The staging
+	// buffer is reused across writes; exposing only Write (not ReaderFrom) keeps
+	// io.CopyBuffer from replacing it with its own per-call fallback buffer.
 	buffer := v.copyBuffers.Get().(*[]byte)
 	defer v.copyBuffers.Put(buffer)
 
-	buffered := v.writeBuffers.Get().(*bufio.Writer)
-	buffered.Reset(file)
-	defer func() {
-		buffered.Reset(io.Discard)
-		v.writeBuffers.Put(buffered)
-	}()
-
 	written, copyErr := io.CopyBuffer(
-		struct{ io.Writer }{buffered},
+		struct{ io.Writer }{file},
 		&contextReader{ctx: ctx, reader: content},
 		*buffer,
 	)
-	if copyErr == nil {
-		copyErr = buffered.Flush()
-	}
 	if copyErr != nil {
 		return 0, fmt.Errorf("failed to write file content: %w", copyErr)
 	}

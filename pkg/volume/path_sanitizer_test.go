@@ -1,12 +1,176 @@
 package volume
 
 import (
+	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/cocosip/venue/pkg/core"
 )
+
+// TestSanitizeAndJoin_RejectedEscapeClassesRemainRejected pins every escape
+// class the sanitizer rejected before the dead Rel-based containment check was
+// removed: traversal, platform absolute paths, reserved characters, control
+// bytes, and empty input keep their error class.
+func TestSanitizeAndJoin_RejectedEscapeClassesRemainRejected(t *testing.T) {
+	sanitizer := NewPathSanitizer(filepath.Join("tmp", "test"))
+
+	type rejection struct {
+		name string
+		path string
+		// acceptedErrors lists every error class that proves a rejection; the
+		// platform-specific classes differ for paths that are absolute on one
+		// platform and merely rooted on the other.
+		acceptedErrors []error
+	}
+
+	rejections := []rejection{
+		{
+			name:           "parent",
+			path:           "..",
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "parent file",
+			path:           "../file.txt",
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "deep parent",
+			path:           "../../file.txt",
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "backslash parent",
+			path:           `..\file.txt`,
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "interior escape",
+			path:           "a/../../file.txt",
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "parent followed by separator",
+			path:           "..//file.txt",
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "windows drive absolute",
+			path:           `C:\Windows\win.ini`,
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+		{
+			name:           "windows drive relative",
+			path:           "C:evil",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+		{
+			name:           "alternate data stream",
+			path:           "file:ads",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+		{
+			name:           "unc share",
+			path:           `\\server\share\file.txt`,
+			acceptedErrors: []error{core.ErrInvalidArgument, core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "null byte",
+			path:           "file\x00.txt",
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "consecutive dots",
+			path:           "a/.../file.txt",
+			acceptedErrors: []error{core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "empty",
+			path:           "",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+	}
+
+	if runtime.GOOS != "windows" {
+		// A POSIX absolute path is not absolute on Windows, where it is a
+		// rooted path that the join keeps below the volume root.
+		rejections = append(rejections, rejection{
+			name:           "posix absolute",
+			path:           "/etc/passwd",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		})
+	}
+
+	for _, tc := range rejections {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := sanitizer.SanitizeAndJoin(tc.path)
+			if err == nil {
+				t.Fatalf("SanitizeAndJoin(%q) = nil error, want rejection", tc.path)
+			}
+
+			for _, expected := range tc.acceptedErrors {
+				if errors.Is(err, expected) {
+					return
+				}
+			}
+
+			t.Errorf("SanitizeAndJoin(%q) error = %v, want one of %v", tc.path, err, tc.acceptedErrors)
+		})
+	}
+}
+
+// TestSanitizeAndJoin_NoInputEscapesRoot is the property test for the removed
+// Rel-based containment check: any path the sanitizer accepts must still resolve
+// lexically below the volume root, and any path it rejects must fail with a
+// documented domain error.
+func TestSanitizeAndJoin_NoInputEscapesRoot(t *testing.T) {
+	sanitizer := NewPathSanitizer(filepath.Join(t.TempDir(), "volume-root"))
+	rootPath := sanitizer.GetRootPath()
+
+	inputs := []string{
+		"file.txt",
+		"a/b/c/file.txt",
+		"a/../b/file.txt",
+		"a/./b/file.txt",
+		"./file.txt",
+		`a\b\file.txt`,
+		"..data",
+		"a/..b/c/file.txt",
+		"/etc/passwd",
+		"file...txt",
+		"sub/../../x",
+		`..\evil`,
+		"../evil",
+		"..",
+		"C:evil",
+		"",
+	}
+
+	parentPrefix := ".." + string(filepath.Separator)
+
+	for _, input := range inputs {
+		t.Run(input, func(t *testing.T) {
+			joined, err := sanitizer.SanitizeAndJoin(input)
+			if err != nil {
+				if !errors.Is(err, core.ErrInvalidArgument) && !errors.Is(err, core.ErrPathTraversalAttempt) {
+					t.Fatalf("SanitizeAndJoin(%q) error = %v, want a domain error", input, err)
+				}
+				return
+			}
+
+			relative, relErr := filepath.Rel(rootPath, joined)
+			if relErr != nil {
+				t.Fatalf("Rel(%q, %q) error = %v", rootPath, joined, relErr)
+			}
+			if relative == ".." || strings.HasPrefix(relative, parentPrefix) {
+				t.Errorf("SanitizeAndJoin(%q) = %q, which escapes root %q", input, joined, rootPath)
+			}
+		})
+	}
+}
 
 // TestNewPathSanitizer tests creating a new path sanitizer.
 func TestNewPathSanitizer(t *testing.T) {

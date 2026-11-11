@@ -132,8 +132,9 @@ type Options struct {
 	// BusyTimeoutMs is how long a statement waits for a contended lock before
 	// it fails with SQLITE_BUSY. Zero disables waiting.
 	BusyTimeoutMs int
-	// CheckpointAfterBatch requests PRAGMA wal_checkpoint(PASSIVE) after every
-	// committed write batch, which bounds WAL growth at the cost of extra I/O.
+	// CheckpointAfterBatch requests PRAGMA wal_checkpoint(PASSIVE) on a fixed
+	// commit interval (every 64 committed write transactions), which bounds WAL
+	// growth without making a single-row claim or completion pay a checkpoint.
 	//
 	// It is configuration data only: [Open] never reads it. The repository
 	// layer that commits a batch is responsible for calling [Checkpoint] on

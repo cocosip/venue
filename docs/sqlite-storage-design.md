@@ -474,17 +474,19 @@ Then execute the DDL from §6.2 (`CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF
 
 Locus's `CheckpointAfterBatch` (default `false`, `SqliteOptions.cs:44-53`) runs `PRAGMA wal_checkpoint(PASSIVE)` after every batch commit (`MetadataRepository.cs:4585-4600`).
 
-Venue mapping: **after every successful write-transaction `Commit()`**, if `CheckpointAfterBatch == true`, execute on that tenant's connection:
+Venue mapping: after every **64** successfully committed write transactions, if `CheckpointAfterBatch == true`, execute on that tenant's connection:
 
 ```sql
 PRAGMA wal_checkpoint(PASSIVE);
 ```
 
+The commit interval is deliberate: checkpointing after *every* transaction turns a single-row claim or completion into a WAL truncation, which costs more than the commit it follows. The interval bounds WAL growth while keeping the per-operation commit cheap.
+
 Three notes:
 
 1. `PASSIVE` does not block and does not wait for readers; it only merges committed pages into the main database file as far as possible, to suppress WAL growth.
 2. This statement **must run outside a transaction** (`wal_checkpoint` errors inside one); under `maxOpenConns(1)` it naturally follows the transaction.
-3. The PRAGMA's return value `(busy, log, checkpointed)` is recorded to statistics (`core.StatisticsRecorder`) and is not treated as an error.
+3. A checkpoint failure is a logged warning, not a failed write: the transaction is already durable. The PRAGMA's return value `(busy, log, checkpointed)` is not treated as an error.
 
 ### 5.4 Single connection vs. WAL read/write-split pool: trade-off
 
@@ -588,20 +590,25 @@ CREATE TABLE IF NOT EXISTS files (
     import_operation_id             TEXT
 );
 
--- The only index serving both claim scans and keyset pagination: covers the full
--- (status, available, created, key) ordering.
+-- The only index serving both the atomic batch claim and keyset pagination: covers
+-- the full (status, available, created, key) ordering.
 CREATE INDEX IF NOT EXISTS idx_files_status_available
     ON files(status, available_for_processing_at, created_at, file_key);
 
--- Ordered scan without availability grouping (GetByStatus limit semantics and compatibility queries).
-CREATE INDEX IF NOT EXISTS idx_files_status_created_at
-    ON files(status, created_at, file_key);
+-- Dropped in this revision: idx_files_status_created_at (status, created_at, key).
+-- No query shape orders a status group by created_at alone: queue listings and
+-- keyset pages order by (available, created, key), which the index above already
+-- covers, so it only added a B-tree write to every status transition. The schema
+-- script drops it idempotently, so an existing database converges on open.
+DROP INDEX IF EXISTS idx_files_status_created_at;
 
--- Completed-record cleanup (by completed_at time window + pagination).
+-- Completed-record cleanup: the windowed reader filters status = Completed(2) and
+-- completed_at <= cutoff in SQL and pages by (completed_at, file_key).
 CREATE INDEX IF NOT EXISTS idx_files_status_completed_at
     ON files(status, completed_at, file_key);
 
--- Permanently-failed-record cleanup (by last_failed_at time window + pagination).
+-- Permanently-failed-record cleanup: the windowed reader filters status = Failed
+-- terminal and last_failed_at <= cutoff in SQL and pages by (last_failed_at, file_key).
 CREATE INDEX IF NOT EXISTS idx_files_status_last_failed_at
     ON files(status, last_failed_at, file_key);
 
@@ -1000,9 +1007,11 @@ WHERE tenant_id = @tenant AND file_key = @fileKey LIMIT 1;
 | `available_for_processing_at > @now` | `fmt.Errorf("file is not yet available for processing (available at %s): %w", …, core.ErrFileNotClaimable)` | Aligned with `badger_repository.go:1078-1082` |
 | SQLite error (IO/corruption/lock timeout) | `fmt.Errorf("failed to transition file to processing: %w: %w", err, core.ErrDatabaseError)` | Infrastructure failures must not be reported as contention (`pkg/core/errors.go:66-73`) |
 
-**Decision D-16: keep the probe SELECT plus the conditional UPDATE with `RowsAffected`; do not switch to `UPDATE ... RETURNING`.**
+**Decision D-16: keep the probe SELECT plus the conditional UPDATE with `RowsAffected` for the single-record CAS; do not switch it to `UPDATE ... RETURNING`.**
 
-Rationale: the whole `inTx` body runs inside `BEGIN IMMEDIATE` (`_txlock=immediate`), so the transaction already holds the database write lock from its first statement. No other connection or process can commit a change to this row between the conditional `UPDATE` and the probe `SELECT`. The classification is therefore race-free by construction, and the two-statement form keeps the error mapping byte-for-byte identical to the Badger implementation (`badger_repository.go:1073-1082`), which is what the existing contract tests assert. `UPDATE ... RETURNING` would collapse the two statements but would also change the shape of the returned data and require an extra `sql.ErrNoRows`-style branch for the no-row case, for no behavioral gain under the held write lock.
+Rationale: the whole `inTx` body runs inside `BEGIN IMMEDIATE` (`_txlock=immediate`), so the transaction already holds the database write lock from its first statement. No other connection or process can commit a change to this row between the conditional `UPDATE` and the probe `SELECT`. The classification is therefore race-free by construction, and the two-statement form keeps the error mapping byte-for-byte identical to the Badger implementation (`badger_repository.go:1073-1082`), which is what the existing contract tests assert.
+
+The **scheduler's hot path does not use this CAS**: `SQLiteMetadataRepository.ClaimPendingFiles` claims one or a whole batch with a single `UPDATE ... LIMIT ... RETURNING` statement inside the same kind of transaction. That shape needs no failure classification (an empty claim is a normal result, not an error), and it avoids materializing a candidate window and re-reading every candidate in its own transaction. `CompareAndTransitionToProcessing` remains for callers and tests that need the per-file classified error.
 
 **A UNIQUE conflict cannot occur**: the target is a single-row update; there is no insert.
 
@@ -1248,14 +1257,17 @@ Rationale: the current Badger cursor encodes a base64url status-index key (`stat
 
 ### 10.5 Other pagination/window queries
 
+These are the queries behind the optional `GetByStatusPageBefore` capability that the retention sweeps use when the repository provides it (`pkg/metadata/sqlite_paging.go`). The boundary is **inclusive** (`<=`), matching the Go visitor that classifies a record as eligible exactly at the cutoff, and the continuation is a keyset over `(expiry, file_key)` so the `(status, expiry, file_key)` index serves both the filter and the order:
+
 **Cleanup by completion time (aligned with Locus `MetadataRepository.cs:2758-2765`)**
 
 ```sql
 SELECT <column list> FROM files
 WHERE tenant_id = @tenant
-  AND status = 2
+  AND status = 2                             -- Completed
   AND completed_at IS NOT NULL
-  AND completed_at < @cutoff
+  AND completed_at <= @before
+  AND (completed_at, file_key) > (@cursorTime, @cursorFileKey)
 ORDER BY completed_at ASC, file_key ASC
 LIMIT @limit;
 ```
@@ -1265,14 +1277,17 @@ LIMIT @limit;
 ```sql
 SELECT <column list> FROM files
 WHERE tenant_id = @tenant
-  AND status = 4
+  AND status = 4                             -- PermanentlyFailed
   AND last_failed_at IS NOT NULL
-  AND last_failed_at < @cutoff
+  AND last_failed_at <= @before
+  AND (last_failed_at, file_key) > (@cursorTime, @cursorFileKey)
 ORDER BY last_failed_at ASC, file_key ASC
 LIMIT @limit;
 ```
 
-**Optional (in-memory path) exclusion set**: Locus supports `file_key NOT IN @excluded` (`MetadataRepository.cs:2757`). Venue's current cleanup paging does not pass an exclusion set (`pkg/cleanup/cleanup_service.go:224-226`), so this variant is **not implemented**; if it is needed later, bind a JSON array with `NOT IN (SELECT value FROM json_each(@excluded))`.
+A repository without the capability keeps the historical path: page the whole status partition through `core.StatusPageReader` (or the unbounded query) and apply the time window in the visitor.
+
+**Optional (in-memory path) exclusion set**: Locus supports `file_key NOT IN @excluded` (`MetadataRepository.cs:2757`). Venue's cleanup paging does not pass an exclusion set, so this variant is **not implemented**; if it is needed later, bind a JSON array with `NOT IN (SELECT value FROM json_each(@excluded))`.
 
 ---
 
@@ -1551,7 +1566,7 @@ Key points:
 5. `VACUUM INTO` (backup) differs from `VACUUM` (in-place compaction): the former only reads the source and produces a new file and **cannot** be used to compact the current database.
 6. **Three layers of WAL growth control**:
    - SQLite's built-in autocheckpoint (this driver's compile option is `DEFAULT_WAL_AUTOCHECKPOINT=1000` pages) — an automatic checkpoint roughly every 4 MB of WAL;
-   - `SqliteConfig.CheckpointAfterBatch` → `PRAGMA wal_checkpoint(PASSIVE)` after each committed batch (§5.3);
+   - `SqliteConfig.CheckpointAfterBatch` → `PRAGMA wal_checkpoint(PASSIVE)` every 64 committed write transactions (§5.3), so a single-row claim or completion never pays a checkpoint;
    - the cleanup cycle's `Optimize` → `PRAGMA wal_checkpoint(TRUNCATE)` to truncate the WAL to 0 (proactive and exact).
 7. **`PRAGMA optimize`** (SQLite's statistics advice): running `PRAGMA optimize;` before closing a tenant connection is a cheap win (especially for the row-count estimate of `idx_files_status_available`). It is **optional** by design: run it once during `Close()` and during idle-handle reclamation, ignoring failures.
 
@@ -1585,8 +1600,9 @@ type SqliteConfig struct {
     // BusyTimeoutMs is how long a statement waits for a lock before failing.
     BusyTimeoutMs int `json:"busyTimeoutMs" yaml:"busyTimeoutMs" mapstructure:"busyTimeoutMs"`
 
-    // CheckpointAfterBatch runs PRAGMA wal_checkpoint(PASSIVE) after every
-    // committed write batch. It bounds WAL growth at the cost of extra I/O.
+    // CheckpointAfterBatch runs PRAGMA wal_checkpoint(PASSIVE) every 64
+    // committed write transactions instead of on every commit, so a single-row
+    // claim or completion never pays a WAL truncation while the WAL stays bounded.
     CheckpointAfterBatch bool `json:"checkpointAfterBatch" yaml:"checkpointAfterBatch" mapstructure:"checkpointAfterBatch"`
 
     // MaxOpenDatabases bounds how many tenant database handles stay open at the
@@ -2071,7 +2087,7 @@ The following were open items and are now settled. Each decision is normative fo
 | Q1 | Whether `files` keeps Locus's `metadata_json` and `delete_succeeded_at` columns (unwritten) in exchange for column-level isomorphism | **Do not keep them** (D-13, §6.4) | Venue's `core.FileMetadata` has no corresponding fields (`pkg/core/models.go:213-245`), so the columns would be permanently NULL or empty and the upsert would carry dead branches. SQLite can add columns online later with `ALTER TABLE ... ADD COLUMN` (an O(1) schema-only operation), so the option is preserved without paying for it now |
 | Q2 | `quotas.enabled` DDL default | **`DEFAULT 0`**, matching Venue's domain default `Enabled=false` (D-14, §7.4) | The DDL default only protects rows inserted outside the repository; `DEFAULT 1` would make such a row read back as enabled, contradicting the domain. The insert path always binds `enabled` explicitly, so repository-written rows are unaffected |
 | Q3 | Sentinel `0` or NULL for `available_for_processing_at` | **Sentinel `0`** (D-15, §8.3) | Keeps the claim range scan (`WHERE status=0 AND available <= @now ORDER BY available, created, file_key LIMIT n`) served by `idx_files_status_available` as an index-only, ordered scan. NULL would force two branch predicates for keyset pagination or an expression-based `ORDER BY` that abandons the index ordering guarantee |
-| Q4 | Whether `CompareAndTransitionToProcessing` needs race-free failure classification | **Keep the probe SELECT plus the conditional UPDATE with `RowsAffected`; do not use `UPDATE ... RETURNING`** (D-16, §9.3) | The whole transaction runs under `BEGIN IMMEDIATE` (`_txlock=immediate`), so the write lock is held from the first statement and no concurrent commit can slip between the UPDATE and the probe: the classification is race-free by construction. The two-statement shape also keeps the error mapping byte-for-byte identical to Badger (`badger_repository.go:1073-1082`), which the existing contract tests assert |
+| Q4 | Whether `CompareAndTransitionToProcessing` needs race-free failure classification | **Keep the probe SELECT plus the conditional UPDATE with `RowsAffected`** (D-16, §9.3); the scheduler's batch claim uses a separate `UPDATE ... LIMIT ... RETURNING` statement | The whole transaction runs under `BEGIN IMMEDIATE` (`_txlock=immediate`), so the write lock is held from the first statement and no concurrent commit can slip between the UPDATE and the probe: the classification is race-free by construction. The two-statement shape also keeps the error mapping byte-for-byte identical to Badger (`badger_repository.go:1073-1082`), which the existing contract tests assert. `ClaimPendingFiles` does not classify failures at all — an empty claim is a normal result — so `RETURNING` is the cheaper shape there |
 | Q5 | Whether `badgerDBOptions` needs a transition compatibility period | **No**; replace directly, with no compatibility shim and no second runtime configuration model (D-17, §13.3) | `AGENTS.md` explicitly forbids creating a second runtime configuration model. Because the engine change is already a breaking, downtime-based upgrade with a documented key mapping table, a shim would add a long-lived second model for no migration benefit |
 | Q6 | Whether health checks should open SQLite read-only and run `integrity_check` | **Stay structural** (D-18, §18.2 U4/§11.2): read the SQLite file header and size; never open the database | A read-only open interacts with WAL `-shm` locking (R2) and its cost scales with the number of tenant databases, which is unacceptable for a periodic health check. Structural checks give a cheap, lock-free liveness signal; deep integrity verification stays in the backup path (`VerifyBackup`) and in `Optimize` (§12) |
 | Q7 | Whether paging cursors need cross-version or cross-engine compatibility | **No** (D-19, §10.4) | The `core/interfaces.go:479-481` contract only requires the cursor to be passed back verbatim; it promises no persistence or cross-version stability. The Badger and SQLite payloads are structurally different, so compatibility would require designing and maintaining a versioned token read by two engines during a transition that is already a breaking change |
@@ -2120,8 +2136,9 @@ CREATE TABLE IF NOT EXISTS files (
 
 CREATE INDEX IF NOT EXISTS idx_files_status_available
     ON files(status, available_for_processing_at, created_at, file_key);
-CREATE INDEX IF NOT EXISTS idx_files_status_created_at
-    ON files(status, created_at, file_key);
+-- idx_files_status_created_at is dropped: the queue indexes above already cover
+-- every ordering that reads created_at.
+DROP INDEX IF EXISTS idx_files_status_created_at;
 CREATE INDEX IF NOT EXISTS idx_files_status_completed_at
     ON files(status, completed_at, file_key);
 CREATE INDEX IF NOT EXISTS idx_files_status_last_failed_at

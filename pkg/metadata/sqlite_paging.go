@@ -27,22 +27,19 @@ const statusPageCursorInitialCapacity = 1024
 
 // sqliteSelectStatusPageSQL is the keyset page query.
 //
-// The three-part predicate is a strict total order because file_key is the
-// primary key, so pages neither overlap nor skip records. The first page binds
-// the smallest possible triple (available = -1, created = -1, file_key = ""),
-// which makes every part trivially true and keeps the query a plain index-ordered
-// range scan. A branch such as "OR @cursorEmpty = 1" is deliberately avoided: it
+// The row-value comparison is a strict total order because file_key is the
+// primary key, so pages neither overlap nor skip records, and SQLite can use the
+// index's ordering as a range constraint instead of filtering a scan of the whole
+// status group. The first page binds the smallest possible triple
+// (available = -1, created = -1, file_key = ""), which is below every real
+// record. A branch such as "OR @cursorEmpty = 1" is deliberately avoided: it
 // would stop the planner from using the index's ordering.
 const sqliteSelectStatusPageSQL = `
 SELECT ` + sqliteFileMetadataColumns + `
 FROM files
 WHERE tenant_id = @tenant
   AND status = @status
-  AND (
-        available_for_processing_at > @cursorAvailable
-     OR (available_for_processing_at = @cursorAvailable AND created_at > @cursorCreated)
-     OR (available_for_processing_at = @cursorAvailable AND created_at = @cursorCreated AND file_key > @cursorFileKey)
-      )
+  AND (available_for_processing_at, created_at, file_key) > (@cursorAvailable, @cursorCreated, @cursorFileKey)
 ORDER BY available_for_processing_at ASC, created_at ASC, file_key ASC
 LIMIT @limit`
 
@@ -101,7 +98,6 @@ func (r *SQLiteMetadataRepository) GetByStatusPage(ctx context.Context, tenantID
 	if capacity > statusPageCursorInitialCapacity {
 		capacity = statusPageCursorInitialCapacity
 	}
-	page := &core.MetadataPage{Records: make([]*core.FileMetadata, 0, capacity)}
 
 	rows, err := handle.db.QueryContext(ctx, sqliteSelectStatusPageSQL,
 		sql.Named("tenant", tenantID),
@@ -118,14 +114,14 @@ func (r *SQLiteMetadataRepository) GetByStatusPage(ctx context.Context, tenantID
 	}
 	defer func() { _ = rows.Close() }()
 
-	records, err := sqliteScanMetadataRows(ctx, rows)
+	records, err := sqliteScanMetadataRowsCapacity(ctx, rows, capacity)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("failed to get files by status page: %w", err)
 	}
-	page.Records = records
+	page := &core.MetadataPage{Records: records}
 
 	// A short page exhausts the scan, so the caller stops. A full page must
 	// return a token to continue from.
@@ -138,6 +134,198 @@ func (r *SQLiteMetadataRepository) GetByStatusPage(ctx context.Context, tenantID
 		})
 	}
 	return page, nil
+}
+
+// GetByStatusPageBefore pages one status ordered by its own expiry column,
+// returning only records whose expiry is at or before before.
+//
+// It is the windowed counterpart of GetByStatusPage: a maintenance sweep that
+// deletes records older than a cutoff can let SQLite's (status, completed_at) or
+// (status, last_failed_at) index do the filtering instead of reading the whole
+// status partition and discarding the ineligible rows in Go.
+//
+// Only the two statuses with a defined expiry column are supported:
+// Completed (completed_at) and PermanentlyFailed (last_failed_at). Cursor is the
+// NextCursor of the previous page and is opaque to callers.
+//
+// Errors:
+//   - ErrInvalidArgument when tenantID is empty, limit is not positive, the
+//     status has no expiry column, or the cursor was not produced by this method.
+//   - ErrDatabaseError when the repository is closed.
+func (r *SQLiteMetadataRepository) GetByStatusPageBefore(
+	ctx context.Context,
+	tenantID string,
+	status core.FileProcessingStatus,
+	before time.Time,
+	cursor string,
+	limit int,
+) (*core.MetadataPage, error) {
+	r.mu.RLock()
+	closed := r.closed
+	r.mu.RUnlock()
+	if closed {
+		return nil, errRepositoryClosed()
+	}
+
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be positive: %w", core.ErrInvalidArgument)
+	}
+	column, err := statusPageTimeColumn(status)
+	if err != nil {
+		return nil, err
+	}
+
+	position, err := decodeStatusTimePageCursor(cursor)
+	if err != nil {
+		return nil, fmt.Errorf("invalid status page cursor: %w: %v", core.ErrInvalidArgument, err)
+	}
+
+	handle, err := r.begin(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer r.end(handle)
+
+	capacity := limit
+	if capacity > statusPageCursorInitialCapacity {
+		capacity = statusPageCursorInitialCapacity
+	}
+
+	query := `
+SELECT ` + sqliteFileMetadataColumns + `
+FROM files
+WHERE tenant_id = @tenant
+  AND status = @status
+  AND ` + column + ` IS NOT NULL
+  AND ` + column + ` <= @before
+  AND (` + column + `, file_key) > (@cursorTime, @cursorFileKey)
+ORDER BY ` + column + ` ASC, file_key ASC
+LIMIT @limit`
+
+	rows, err := handle.db.QueryContext(ctx, query,
+		sql.Named("tenant", tenantID),
+		sql.Named("status", int(status)),
+		sql.Named("before", before.UTC().UnixNano()),
+		sql.Named("cursorTime", position.at),
+		sql.Named("cursorFileKey", position.fileKey),
+		sql.Named("limit", limit))
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("failed to get files by status page: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	records, err := sqliteScanMetadataRowsCapacity(ctx, rows, capacity)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("failed to get files by status page: %w", err)
+	}
+	page := &core.MetadataPage{Records: records}
+
+	// A short page exhausts the window. A full page continues from its last
+	// record; a record whose expiry column is unexpectedly empty stops the scan
+	// instead of minting a cursor that would repeat the same page.
+	if len(records) == limit {
+		last := records[len(records)-1]
+		at, ok := statusPageRecordTime(status, last)
+		if ok {
+			page.NextCursor = encodeStatusTimePageCursor(statusTimePageCursor{at: at, fileKey: last.FileKey})
+		}
+	}
+	return page, nil
+}
+
+// statusPageTimeColumn maps a paged status onto the column that orders it.
+func statusPageTimeColumn(status core.FileProcessingStatus) (string, error) {
+	switch status {
+	case core.FileStatusCompleted:
+		return "completed_at", nil
+	case core.FileStatusPermanentlyFailed:
+		return "last_failed_at", nil
+	default:
+		return "", fmt.Errorf("status %s does not support time-window paging: %w", status, core.ErrInvalidArgument)
+	}
+}
+
+// statusPageRecordTime reads the expiry instant a windowed page orders by.
+func statusPageRecordTime(status core.FileProcessingStatus, record *core.FileMetadata) (int64, bool) {
+	var at *time.Time
+	switch status {
+	case core.FileStatusCompleted:
+		at = record.CompletedAt
+	case core.FileStatusPermanentlyFailed:
+		at = record.LastFailedAt
+	}
+	if at == nil {
+		return 0, false
+	}
+	return at.UTC().UnixNano(), true
+}
+
+// statusTimePageCursorVersion is the only payload revision the windowed cursor
+// mints. A token declaring any other version is rejected.
+const statusTimePageCursorVersion = byte(0x02)
+
+// statusTimePageCursorHeaderSize is version(1) + expiry(8) + key length(4).
+const statusTimePageCursorHeaderSize = 13
+
+// statusTimePageCursor is the decoded position of one windowed page boundary.
+type statusTimePageCursor struct {
+	at      int64
+	fileKey string
+}
+
+// statusTimePageCursorStart precedes every real record.
+func statusTimePageCursorStart() statusTimePageCursor {
+	return statusTimePageCursor{at: -1, fileKey: ""}
+}
+
+// encodeStatusTimePageCursor renders the opaque windowed continuation token.
+func encodeStatusTimePageCursor(cursor statusTimePageCursor) string {
+	payload := make([]byte, 0, statusTimePageCursorHeaderSize+len(cursor.fileKey))
+	payload = append(payload, statusTimePageCursorVersion)
+	payload = binary.BigEndian.AppendUint64(payload, uint64(cursor.at))
+	payload = binary.BigEndian.AppendUint32(payload, uint32(len(cursor.fileKey)))
+	payload = append(payload, cursor.fileKey...)
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// decodeStatusTimePageCursor parses a token produced by
+// encodeStatusTimePageCursor. An empty token means "start at the window head".
+func decodeStatusTimePageCursor(token string) (statusTimePageCursor, error) {
+	if token == "" {
+		return statusTimePageCursorStart(), nil
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return statusTimePageCursor{}, err
+	}
+	if len(payload) < statusTimePageCursorHeaderSize {
+		return statusTimePageCursor{}, fmt.Errorf("cursor payload is %d bytes, shorter than the %d-byte header",
+			len(payload), statusTimePageCursorHeaderSize)
+	}
+	if payload[0] != statusTimePageCursorVersion {
+		return statusTimePageCursor{}, fmt.Errorf("unsupported cursor version %d", payload[0])
+	}
+
+	declaredLength := int(binary.BigEndian.Uint32(payload[9:13]))
+	if declaredLength != len(payload)-statusTimePageCursorHeaderSize {
+		return statusTimePageCursor{}, fmt.Errorf("cursor declares a %d-byte file key but carries %d bytes",
+			declaredLength, len(payload)-statusTimePageCursorHeaderSize)
+	}
+
+	return statusTimePageCursor{
+		at:      int64(binary.BigEndian.Uint64(payload[1:9])),
+		fileKey: string(payload[statusTimePageCursorHeaderSize:]),
+	}, nil
 }
 
 // encodeSQLiteStatusPageCursor renders the opaque continuation token: base64url

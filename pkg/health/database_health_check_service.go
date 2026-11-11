@@ -210,6 +210,11 @@ func (s *DatabaseHealthCheckService) run() {
 }
 
 // performHealthCheckWithRetry performs health check with retry logic.
+//
+// Only an inspection error is retried: it is the transient failure (a locked or
+// briefly unreadable file) that a second pass can recover from. An unhealthy
+// report is a durable inspection result, so rescanning every tenant database for
+// it cannot change the verdict; it is reported immediately.
 func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 	var lastReport *core.DatabaseHealthReport
 	var lastErr error
@@ -218,6 +223,7 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 		report, err := s.healthChecker.CheckAllDatabases(s.ctx)
 		if err != nil {
 			lastErr = err
+			lastReport = nil
 			s.emit(s.ctx, slog.LevelWarn, "check_failed", "Health check failed",
 				slog.Int("attempt", attempt),
 				slog.Int("max_retries", s.maxRetries),
@@ -237,30 +243,12 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 		lastReport = report
 		lastErr = nil
 
-		// If all healthy, no need to retry
-		if report.AllHealthy {
-			if attempt > 1 {
-				s.emit(s.ctx, slog.LevelInfo, "check_recovered", "Database health check succeeded after retries",
-					slog.Int("attempt", attempt),
-					slog.Int("max_retries", s.maxRetries))
-			}
-			break
-		}
-
-		// If not healthy and not last attempt, retry
-		if attempt < s.maxRetries {
-			s.emit(s.ctx, slog.LevelDebug, "check_retrying", "Health check found issues, retrying",
+		if attempt > 1 {
+			s.emit(s.ctx, slog.LevelInfo, "check_recovered", "Database health check succeeded after retries",
 				slog.Int("attempt", attempt),
-				slog.Int("max_retries", s.maxRetries),
-				slog.Int("corrupted", len(report.CorruptedDatabases)))
-
-			select {
-			case <-time.After(s.retryDelay):
-				continue
-			case <-s.ctx.Done():
-				return
-			}
+				slog.Int("max_retries", s.maxRetries))
 		}
+		break
 	}
 
 	// Report results

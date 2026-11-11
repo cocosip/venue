@@ -67,8 +67,9 @@ venue:
     cacheSizeKb: -4000
     # Milliseconds a statement waits for a lock before failing with "database is locked".
     busyTimeoutMs: 5000
-    # Run PRAGMA wal_checkpoint(PASSIVE) after every committed batch. Bounds WAL growth
-    # at the cost of extra I/O.
+    # Run PRAGMA wal_checkpoint(PASSIVE) every 64 committed write transactions.
+    # Bounds WAL growth without making a single-row claim or completion pay a
+    # checkpoint.
     checkpointAfterBatch: false
     # Upper bound on simultaneously open tenant database handles. 0 = unlimited
     # (the default: handles live until Close).
@@ -103,8 +104,14 @@ venue:
     - volumeId: vol-001
       mountPath: ./venue-data/storage/volume-1
       volumeType: LocalFileSystem
+      # Directory shard depth for physical files: 0 = flat, 2 = xx/yy.
+      # More depth keeps directories small on huge volumes at the cost of
+      # MkdirAll on a write whose shard directory does not exist yet (the most
+      # expensive non-fsync step in a local write profile).
       shardingDepth: 2
-      # Enable fsync after file writes (true = durable but slower)
+      # Enable fsync after file writes (true = durable but slower). The payload
+      # fsync is the largest single cost of a durable local write; disable it
+      # only when the volume itself guarantees durability.
       enableFsync: true
       # Cache the volume health probe for this long (0 = default 30s,
       # negative disables caching so every operation probes the volume)
@@ -114,8 +121,6 @@ venue:
       # selection reads this per write; a stale reading that misses a filling
       # volume costs one failed write, retried on the next candidate.
       spaceCacheTTL: 5s
-      # Buffered writer size for payload writes (0 = default 128 KiB)
-      writeBufferSize: 131072
       # Pooled staging buffer size for streaming one payload (0 = default 256 KiB)
       copyBufferSize: 262144
       # How long startup waits before the first health-check *retry*. A volume
@@ -141,7 +146,6 @@ venue:
       enableFsync: true
       healthCheckCacheTTL: 30s
       spaceCacheTTL: 5s
-      writeBufferSize: 131072
       copyBufferSize: 262144
       initialDelay: 2s
       healthCheckDelay: 500ms

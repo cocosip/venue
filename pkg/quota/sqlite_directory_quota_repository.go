@@ -135,17 +135,9 @@ INSERT INTO quotas (directory_path, current_count, max_count, enabled, last_upda
 VALUES (@directory_path, 0, 0, 0, @last_updated, @created_at)
 ON CONFLICT(directory_path) DO NOTHING`
 
-	// sqliteQuotaIncrementSQL is the atomic increment of an existing row.
-	sqliteQuotaIncrementSQL = `
-UPDATE quotas
-SET current_count = current_count + 1,
-    last_updated  = @last_updated
-WHERE directory_path = @directory_path`
-
-	// sqliteQuotaIncrementCreateSQL creates the row with count 1, or increments
-	// the row a concurrent writer created between the UPDATE and this statement.
-	// `excluded.last_updated` is applied while the count is read from the stored
-	// row, never from the bindings, so no increment is ever lost.
+	// sqliteQuotaIncrementCreateSQL increments an existing row, or creates the
+	// row with count 1. `excluded.last_updated` is applied while the count is read
+	// from the stored row, never from the bindings, so no increment is ever lost.
 	sqliteQuotaIncrementCreateSQL = `
 INSERT INTO quotas (directory_path, current_count, max_count, enabled, last_updated, created_at)
 VALUES (@directory_path, 1, 0, 0, @last_updated, @created_at)
@@ -520,9 +512,9 @@ func (r *sqliteDirectoryQuotaRepository) Update(ctx context.Context, tenantID st
 
 // IncrementCount atomically increments a directory's file count.
 //
-// The count is incremented by the statement itself, never by a read-modify-write
-// in Go, and the create path of a missing row uses the same conditional upsert,
-// so concurrent increments on the same directory can never lose an update.
+// One conditional upsert both creates a missing row (count 1, unlimited,
+// disabled) and increments an existing one, so the first file of a new directory
+// no longer pays an UPDATE that matches nothing followed by an INSERT.
 func (r *sqliteDirectoryQuotaRepository) IncrementCount(ctx context.Context, tenantID string, directoryPath string) error {
 	if directoryPath == "" {
 		return fmt.Errorf("directory path cannot be empty: %w", core.ErrInvalidArgument)
@@ -538,26 +530,12 @@ func (r *sqliteDirectoryQuotaRepository) IncrementCount(ctx context.Context, ten
 	defer handle.mu.Unlock()
 
 	now := timeToNanos(r.now())
-	affected, err := execQuotaStatement(ctx, handle,
-		sqliteQuotaIncrementSQL,
-		sql.Named("last_updated", now),
-		sql.Named("directory_path", directoryPath))
-	if err != nil {
-		return fmt.Errorf("failed to increment directory quota count: %w", err)
-	}
-	if affected > 0 {
-		return nil
-	}
-
-	// The row did not exist. Create it as the Badger implementation does (count
-	// 1, unlimited, disabled) through a conditional upsert, so a concurrent
-	// creator's increment is not lost.
 	if _, err := execQuotaStatement(ctx, handle,
 		sqliteQuotaIncrementCreateSQL,
 		sql.Named("directory_path", directoryPath),
 		sql.Named("last_updated", now),
 		sql.Named("created_at", now)); err != nil {
-		return fmt.Errorf("failed to increment the missing directory quota count: %w", err)
+		return fmt.Errorf("failed to increment directory quota count: %w", err)
 	}
 	return nil
 }
@@ -1027,10 +1005,14 @@ func (r *sqliteDirectoryQuotaRepository) evictLocked(exclude string) []*sqliteQu
 //
 // The handles have already left the table and carry no reference, so no
 // concurrent acquisition can reach them and closing them here cannot stall
-// another tenant's acquisition through the repository lock.
+// another tenant's acquisition through the repository lock. The close is cheap on
+// purpose: the caller is a quota operation that has just exceeded the handle
+// bound, so it must not also pay a WAL truncate (which waits for every WAL reader)
+// or an ANALYZE. SQLite checkpoints and removes the WAL sidecars when the last
+// connection closes, and the maintenance Optimize pass is what compacts the file.
 func (r *sqliteDirectoryQuotaRepository) closeEvicted(handles []*sqliteQuotaTenantDatabase) {
 	for _, handle := range handles {
-		if err := r.closeHandle(handle); err != nil {
+		if err := handle.db.Close(); err != nil {
 			warnQuotaRepositoryEvent(r.logging, "quota_handle_eviction_failed", "close_failed")
 		}
 	}

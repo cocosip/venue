@@ -27,13 +27,20 @@ func NewPathSanitizer(rootPath string) *PathSanitizer {
 // SanitizeAndJoin sanitizes a relative path and joins it with the root path.
 // Returns an error if the resulting path would escape the root directory.
 //
-// The containment check is lexical (Clean plus a Rel-based root check); it does
-// not resolve symlinks. Venue itself never creates symlinks, so an attacker
-// would need pre-existing write access to the volume's local filesystem to plant
-// one — at which point the storage is already compromised independently of this
-// check. That trusted-local-filesystem model is deliberate: resolving every
-// path would put extra syscalls on the hot write path for protection that a
-// local attacker with volume write access does not need to bypass.
+// The containment check is lexical and needs no Rel round trip: once the
+// relative path is clean, not absolute, and does not start with a parent
+// segment, filepath.Join cannot place the result above the root. A path that is
+// rooted but not absolute ("/etc/passwd" on Windows) is joined below the root,
+// which is why the escape rejection comes from the parent/absolute checks and
+// not from the join.
+//
+// It does not resolve symlinks. Venue itself never creates symlinks, so an
+// attacker would need pre-existing write access to the volume's local
+// filesystem to plant one — at which point the storage is already compromised
+// independently of this check. That trusted-local-filesystem model is
+// deliberate: resolving every path would put extra syscalls on the hot write
+// path for protection that a local attacker with volume write access does not
+// need to bypass.
 func (s *PathSanitizer) SanitizeAndJoin(relativePath string) (string, error) {
 	if relativePath == "" {
 		return "", fmt.Errorf("relative path cannot be empty: %w", core.ErrInvalidArgument)
@@ -59,15 +66,9 @@ func (s *PathSanitizer) SanitizeAndJoin(relativePath string) (string, error) {
 		return "", fmt.Errorf("path must not escape parent directory: %s: %w", relativePath, core.ErrPathTraversalAttempt)
 	}
 
-	// Join with root path
-	fullPath := filepath.Join(s.rootPath, cleanRelative)
-
-	// Verify the path doesn't escape root
-	if !s.isWithinRoot(fullPath) {
-		return "", fmt.Errorf("path traversal attempt detected: %s: %w", relativePath, core.ErrPathTraversalAttempt)
-	}
-
-	return fullPath, nil
+	// Join with root path. The checks above prove the result cannot leave the
+	// root, so no separate Rel-based containment check is needed.
+	return filepath.Join(s.rootPath, cleanRelative), nil
 }
 
 // ValidateRelativePath validates a relative path without joining it with root.
@@ -95,24 +96,6 @@ func (s *PathSanitizer) ValidateRelativePath(relativePath string) error {
 	}
 
 	return nil
-}
-
-// isWithinRoot checks if a path is within the root directory.
-func (s *PathSanitizer) isWithinRoot(fullPath string) bool {
-	// Get relative path from root
-	rel, err := filepath.Rel(s.rootPath, fullPath)
-	if err != nil {
-		return false
-	}
-
-	// The relative path escapes only through a real parent segment: a segment
-	// that merely starts with two dots ("..data") is a name inside the root,
-	// not a parent reference.
-	if isParentReference(rel) {
-		return false
-	}
-
-	return true
 }
 
 // checkSuspiciousPatterns checks for common path traversal patterns.

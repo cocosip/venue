@@ -124,7 +124,9 @@ func TestScanNow_PruneThrottleRunsOncePerInterval(t *testing.T) {
 	}))
 
 	// The first scan has no earlier prune to throttle against, so it prunes.
-	firstStale := missingPath(t, "gone-1.csv")
+	// The stale record must live below the watch path: a prune is scoped to the
+	// scanning watcher's directory.
+	firstStale := filepath.Join(watchPath, "gone-1.csv")
 	w.storeImportedRecordSync(firstStale, "1:2", current)
 
 	scanWatcherNow(t, w, "w1")
@@ -133,7 +135,7 @@ func TestScanNow_PruneThrottleRunsOncePerInterval(t *testing.T) {
 		t.Fatalf("stale entry survived the first prune")
 	}
 
-	secondStale := missingPath(t, "gone-2.csv")
+	secondStale := filepath.Join(watchPath, "gone-2.csv")
 	w.storeImportedRecordSync(secondStale, "3:4", current)
 
 	// Inside the interval the prune is throttled.
@@ -170,7 +172,7 @@ func TestScanNow_PruneThrottleUsesDefaultInterval(t *testing.T) {
 
 	scanWatcherNow(t, w, "w1")
 
-	stale := missingPath(t, "gone.csv")
+	stale := filepath.Join(watchPath, "gone.csv")
 	w.storeImportedRecordSync(stale, "1:2", current)
 
 	current = current.Add(4 * time.Minute)
@@ -204,7 +206,7 @@ func TestScanNow_PruneThrottleDisabledPrunesEveryScan(t *testing.T) {
 
 	scanWatcherNow(t, w, "w1")
 
-	stale := missingPath(t, "gone.csv")
+	stale := filepath.Join(watchPath, "gone.csv")
 	w.storeImportedRecordSync(stale, "1:2", current)
 
 	current = current.Add(time.Second)

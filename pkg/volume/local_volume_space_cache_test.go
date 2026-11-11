@@ -104,6 +104,43 @@ func TestCapacityCacheRefreshesInBackground(t *testing.T) {
 	}
 }
 
+// TestInvalidateSpaceCacheForcesFreshReading verifies the capability the storage
+// pool calls after a write fails on a volume: the cached reading is dropped so
+// the next selection observes the real free space instead of the stale value.
+func TestInvalidateSpaceCacheForcesFreshReading(t *testing.T) {
+	vol, _ := createTestVolume(t, 0)
+
+	var available atomic.Int64
+	available.Store(400)
+	var probes atomic.Int64
+	vol.probeSpace = func(context.Context) (int64, int64, error) {
+		probes.Add(1)
+		return 1_000, available.Load(), nil
+	}
+
+	if got, err := vol.AvailableSpace(context.Background()); err != nil || got != 400 {
+		t.Fatalf("AvailableSpace() = (%d, %v), want (400, nil)", got, err)
+	}
+
+	// The warm cache hides the changed reading.
+	available.Store(100)
+	if got, err := vol.AvailableSpace(context.Background()); err != nil || got != 400 {
+		t.Fatalf("AvailableSpace() = (%d, %v), want the cached (400, nil)", got, err)
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("space probes = %d, want the cached reading", got)
+	}
+
+	vol.InvalidateSpaceCache()
+
+	if got, err := vol.AvailableSpace(context.Background()); err != nil || got != 100 {
+		t.Fatalf("AvailableSpace() after invalidation = (%d, %v), want a fresh (100, nil)", got, err)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("space probes after invalidation = %d, want a fresh probe", got)
+	}
+}
+
 // TestCapacityCacheCanBeDisabled verifies the negative TTL escape hatch.
 func TestCapacityCacheCanBeDisabled(t *testing.T) {
 	vol, _ := createTestVolume(t, 0)

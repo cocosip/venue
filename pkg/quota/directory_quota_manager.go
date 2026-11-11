@@ -13,7 +13,12 @@ import (
 // directoryQuotaManager implements DirectoryQuotaManager interface.
 type directoryQuotaManager struct {
 	repository core.DirectoryQuotaRepository
-	locks      [256]sync.Mutex
+	// locks stripes serialize the read-modify-write paths (the conditional
+	// increment fallback, SetQuota and reconciliation). The read paths take the
+	// read side and the SQL-atomic increment/decrement paths take no stripe at
+	// all, so a slow database round trip no longer serializes unrelated
+	// directories (or tenants) that happen to hash to the same stripe.
+	locks [256]sync.RWMutex
 }
 
 // NewDirectoryQuotaManager creates a new directory quota manager.
@@ -36,7 +41,7 @@ func (m *directoryQuotaManager) CanAddFile(ctx context.Context, tenantID string,
 	if err != nil {
 		return false, err
 	}
-	unlock := m.lock(tenantID, normalizedPath)
+	unlock := m.readLock(tenantID, normalizedPath)
 	defer unlock()
 
 	// Get quota for directory
@@ -55,19 +60,17 @@ func (m *directoryQuotaManager) IncrementFileCount(ctx context.Context, tenantID
 	if err != nil {
 		return err
 	}
-	unlock := m.lock(tenantID, normalizedPath)
-	defer unlock()
 
 	// The atomic path checks the limit and increments in one statement. It is
 	// the only path that is safe against a concurrent writer in another process
 	// or repository handle: the historical read-then-write sequence could pass
-	// the check twice.
+	// the check twice. Because the statement is atomic, it needs no stripe lock.
 	if incrementer, ok := m.repository.(core.DirectoryQuotaAtomicIncrementer); ok {
-		if err := incrementer.IncrementCountIfAllowed(ctx, tenantID, normalizedPath); err != nil {
-			return err
-		}
-		return nil
+		return incrementer.IncrementCountIfAllowed(ctx, tenantID, normalizedPath)
 	}
+
+	unlock := m.lock(tenantID, normalizedPath)
+	defer unlock()
 
 	// Get current quota
 	quota, err := m.repository.GetOrCreate(ctx, tenantID, normalizedPath)
@@ -94,10 +97,9 @@ func (m *directoryQuotaManager) DecrementFileCount(ctx context.Context, tenantID
 	if err != nil {
 		return err
 	}
-	unlock := m.lock(tenantID, normalizedPath)
-	defer unlock()
 
-	// Decrement count in repository
+	// DecrementCount is atomic by contract (its floor is applied in the
+	// statement), so it needs no stripe lock.
 	if err := m.repository.DecrementCount(ctx, tenantID, normalizedPath); err != nil {
 		return fmt.Errorf("failed to decrement count: %w", err)
 	}
@@ -114,7 +116,7 @@ func (m *directoryQuotaManager) GetFileCount(ctx context.Context, tenantID strin
 	if err != nil {
 		return 0, err
 	}
-	unlock := m.lock(tenantID, normalizedPath)
+	unlock := m.readLock(tenantID, normalizedPath)
 	defer unlock()
 
 	// Get quota
@@ -166,7 +168,7 @@ func (m *directoryQuotaManager) GetQuota(ctx context.Context, tenantID string, d
 	if err != nil {
 		return nil, err
 	}
-	unlock := m.lock(tenantID, normalizedPath)
+	unlock := m.readLock(tenantID, normalizedPath)
 	defer unlock()
 
 	// Get quota
@@ -187,7 +189,10 @@ func (m *directoryQuotaManager) SetFileCount(ctx context.Context, tenantID strin
 	if count < 0 {
 		return fmt.Errorf("count cannot be negative: %w", core.ErrInvalidArgument)
 	}
-	unlock := m.lock(tenantID, directoryPath)
+	// SetFileCount is a read-modify-write, so it takes the write side and it
+	// keys the stripe by the normalized path: two equivalent inputs must not
+	// land on different stripes.
+	unlock := m.lock(tenantID, normalizedPath)
 	defer unlock()
 
 	quota, err := m.repository.GetOrCreate(ctx, tenantID, normalizedPath)
@@ -230,7 +235,24 @@ func validateAndNormalize(tenantID string, directoryPath string) (string, error)
 	return directorypath.Normalize(directoryPath), nil
 }
 
+// lock takes the write side of the stripe that serializes operations for one
+// directory and returns its unlock function.
 func (m *directoryQuotaManager) lock(tenantID string, directoryPath string) func() {
+	mutex := &m.locks[m.stripeIndex(tenantID, directoryPath)]
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+// readLock takes the read side of the same stripe.
+func (m *directoryQuotaManager) readLock(tenantID string, directoryPath string) func() {
+	mutex := &m.locks[m.stripeIndex(tenantID, directoryPath)]
+	mutex.RLock()
+	return mutex.RUnlock
+}
+
+// stripeIndex hashes (tenantID, directoryPath) onto the fixed stripe table with
+// FNV-1a, keeping the two parts distinct with a separator byte.
+func (m *directoryQuotaManager) stripeIndex(tenantID string, directoryPath string) uint32 {
 	const (
 		offset32 = uint32(2166136261)
 		prime32  = uint32(16777619)
@@ -243,7 +265,5 @@ func (m *directoryQuotaManager) lock(tenantID string, directoryPath string) func
 	for i := 0; i < len(directoryPath); i++ {
 		hash = (hash ^ uint32(directoryPath[i])) * prime32
 	}
-	mutex := &m.locks[hash%uint32(len(m.locks))]
-	mutex.Lock()
-	return mutex.Unlock
+	return hash % uint32(len(m.locks))
 }

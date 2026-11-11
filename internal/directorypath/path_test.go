@@ -26,12 +26,37 @@ func TestNormalize(t *testing.T) {
 		{name: "only dot segment", input: ".", want: "/"},
 		{name: "surrounding whitespace", input: "  archive/2024  ", want: "/archive/2024"},
 		{name: "unicode segments", input: "租户/子目录", want: "/租户/子目录"},
+		{name: "already normalized rooted path", input: "/archive/2024", want: "/archive/2024"},
+		{name: "trailing parent pops", input: "/archive/2024/..", want: "/archive"},
+		{name: "trailing dot collapses", input: "/archive/2024/.", want: "/archive/2024"},
+		{name: "dot-prefixed sibling stays", input: "/archive/..2024", want: "/archive/..2024"},
+		{name: "parent-prefixed segment stays", input: "/archive/2024/..data", want: "/archive/2024/..data"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := Normalize(tc.input); got != tc.want {
 				t.Errorf("Normalize(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNormalize_AllocatesNothingForAlreadyNormalizedInput pins the fast path:
+// the root and an already normalized path must not allocate, while the
+// collapsing path still returns the correct result.
+func TestNormalize_AllocatesNothingForAlreadyNormalizedInput(t *testing.T) {
+	inputs := []string{"/", "/archive", "/archive/2024/01", "/租户/子目录"}
+
+	for _, input := range inputs {
+		t.Run(input, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				if got := Normalize(input); got != input {
+					t.Fatalf("Normalize(%q) = %q, want %q", input, got, input)
+				}
+			})
+			if allocs != 0 {
+				t.Errorf("Normalize(%q) allocated %v times, want 0", input, allocs)
 			}
 		})
 	}

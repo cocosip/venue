@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -205,6 +204,11 @@ type BackgroundFileWatcherService struct {
 	scanStateMu   sync.Mutex
 	activeScans   int
 	inFlightScans map[string]bool
+
+	// scanWake receives one signal whenever a scan slot is released. A due
+	// watcher deferred by the parallel bound is re-dispatched on it instead of
+	// polling the schedule.
+	scanWake chan struct{}
 }
 
 // NewBackgroundFileWatcherService creates a new background file watcher service.
@@ -345,6 +349,7 @@ func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) 
 		nextScanDue:   make(map[string]time.Time),
 		warnedClamps:  make(map[string]bool),
 		inFlightScans: make(map[string]bool),
+		scanWake:      make(chan struct{}, 1),
 	}
 
 	service.options.Store(&options)
@@ -627,6 +632,9 @@ func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 		select {
 		case <-time.After(interval):
 			// Continue to next cycle
+		case <-s.scanWake:
+			// A scan slot was released; re-evaluate the deferred watchers now
+			// instead of waiting for the schedule to come around.
 		case <-ctx.Done():
 			return
 		}
@@ -706,6 +714,13 @@ func (s *BackgroundFileWatcherService) releaseWatcherScan(watcherID string) {
 		s.activeScans--
 	}
 	s.scanStateMu.Unlock()
+
+	// Wake the run loop so a watcher deferred by the parallel bound is
+	// re-dispatched immediately. A signal already pending needs no second one.
+	select {
+	case s.scanWake <- struct{}{}:
+	default:
+	}
 }
 
 // scanTotals accumulates the per-watcher scan results of one cycle.
@@ -798,25 +813,32 @@ func (s *BackgroundFileWatcherService) scheduleNext(watcher *core.FileWatcherCon
 }
 
 // delayUntilNextDue returns the delay until the earliest watcher becomes due.
+//
+// A watcher that is already due was deferred by the parallel bound; it is
+// re-dispatched when a scan slot is released (see releaseWatcherScan), so the
+// loop is not polled at a fixed short interval while slots stay busy. The
+// default polling interval is the safety net when every watcher is due.
 func (s *BackgroundFileWatcherService) delayUntilNextDue(watchers []*core.FileWatcherConfiguration, now time.Time) time.Duration {
 	if len(watchers) == 0 {
 		return s.Options().DefaultPollingInterval
 	}
 
-	due := make([]time.Time, 0, len(watchers))
+	var earliest time.Time
 	for _, watcher := range watchers {
-		due = append(due, s.nextDue(watcher, now))
+		due := s.nextDue(watcher, now)
+		if !due.After(now) {
+			continue
+		}
+		if earliest.IsZero() || due.Before(earliest) {
+			earliest = due
+		}
 	}
 
-	sort.Slice(due, func(i, j int) bool { return due[i].Before(due[j]) })
-
-	delay := due[0].Sub(now)
-	if delay <= 0 {
-		// The watcher is already due; re-check promptly without busy-looping.
-		return 200 * time.Millisecond
+	if earliest.IsZero() {
+		return s.Options().DefaultPollingInterval
 	}
 
-	return delay
+	return earliest.Sub(now)
 }
 
 // pruneSchedule drops schedule entries for watchers that are no longer enabled.

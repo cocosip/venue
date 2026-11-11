@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
@@ -66,7 +67,12 @@ const (
 
 // SQLite metadata schema. Every statement is idempotent, so the whole script can
 // run on every first access to a tenant database without a version check. The
-// index set is exactly the design's §6.2 inventory.
+// index set is the design's §6.2 inventory minus idx_files_status_created_at,
+// which no query shape reads: every status listing orders by availability first,
+// so the index only added a B-tree write to every transition. The windowed
+// maintenance queries do use idx_files_status_completed_at and
+// idx_files_status_last_failed_at, and the claim uses
+// idx_files_status_available.
 const (
 	sqliteFilesTableDDL = `
 CREATE TABLE IF NOT EXISTS files (
@@ -101,9 +107,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_files_import_operation
 CREATE INDEX IF NOT EXISTS idx_files_status_available
     ON files(status, available_for_processing_at, created_at, file_key)`
 
-	sqliteFilesStatusCreatedAtIndexDDL = `
-CREATE INDEX IF NOT EXISTS idx_files_status_created_at
-    ON files(status, created_at, file_key)`
+	sqliteFilesStatusCreatedAtIndexDropDDL = `
+DROP INDEX IF EXISTS idx_files_status_created_at`
 
 	sqliteFilesStatusCompletedAtIndexDDL = `
 CREATE INDEX IF NOT EXISTS idx_files_status_completed_at
@@ -315,8 +320,9 @@ type SQLiteMetadataRepository struct {
 	// releaseOps counts handle releases so an idle handle is swept even when no
 	// new tenant database is opened. Without this counter the idle timeout only
 	// took effect on the next cold open, which never happens for a fixed tenant
-	// set. Guarded by mu.
-	releaseOps uint64
+	// set. It is atomic so a release does not take mu exclusively; only the
+	// sampled sweep pass does.
+	releaseOps atomic.Uint64
 
 	dirMu       sync.Mutex
 	dirTenants  []string
@@ -350,18 +356,29 @@ type sqliteTenantDatabase struct {
 	mu sync.Mutex
 
 	// refs counts the operations currently using the handle. Eviction never
-	// closes a handle whose refs is non-zero.
-	refs int64
+	// closes a handle whose refs is non-zero. It is atomic because the hot
+	// acquisition path reads and updates it under the shared side of mu: two
+	// cache hits on different tenants must not serialize on the repository lock.
+	refs atomic.Int32
 
-	// lastUsedNanos is the atomic mirror of lastUsed that the eviction scan
-	// reads without taking mu.
-	lastUsedNanos int64
-	lastUsed      time.Time
+	// lastUsedNanos is the handle's last use in Unix nanoseconds. It is atomic for
+	// the same reason as refs: the eviction scan reads it without the releases
+	// that write it taking mu exclusively.
+	lastUsedNanos atomic.Int64
 
-	// checkpointAfterBatch mirrors Sqlite.CheckpointAfterBatch: after every
-	// committed write transaction the handle runs PRAGMA wal_checkpoint(PASSIVE)
-	// outside the transaction, which the single-connection policy makes safe.
+	// checkpointAfterBatch mirrors Sqlite.CheckpointAfterBatch: once enabled, the
+	// handle runs PRAGMA wal_checkpoint(PASSIVE) every
+	// metadataCheckpointCommitInterval committed write transactions, outside the
+	// transaction. Checkpointing on every commit instead would turn each
+	// single-row claim or completion into a WAL truncation; the periodic pass
+	// still bounds WAL growth.
 	checkpointAfterBatch bool
+
+	// commitsSinceCheckpoint counts committed write transactions when
+	// checkpointAfterBatch is enabled. It is atomic because the pooled
+	// single-connection handle releases the connection at commit, so two callers
+	// can reach the counter between their transaction and this bookkeeping.
+	commitsSinceCheckpoint atomic.Int64
 
 	// logging is the instance-scoped logging runtime, captured so the
 	// post-commit checkpoint can report a failure without reaching back into
@@ -601,6 +618,10 @@ func (r *SQLiteMetadataRepository) Get(ctx context.Context, tenantID string, fil
 		return nil, fmt.Errorf("file key cannot be empty: %w", core.ErrInvalidArgument)
 	}
 
+	// The handle is acquired before the cache is consulted, because acquisition is
+	// what honors a canceled context, rejects a closed repository and refreshes
+	// the tenant's idle-eviction stamp; the cache shortens the work after that,
+	// it does not replace it.
 	handle, err := r.begin(ctx, tenantID)
 	if err != nil {
 		return nil, err
@@ -886,9 +907,7 @@ FROM files
 WHERE tenant_id = @tenant
   AND status = @status
   AND available_for_processing_at <= @now
-  AND (available_for_processing_at > @afterAvailable
-       OR (available_for_processing_at = @afterAvailable AND created_at > @afterCreated)
-       OR (available_for_processing_at = @afterAvailable AND created_at = @afterCreated AND file_key > @afterKey))
+  AND (available_for_processing_at, created_at, file_key) > (@afterAvailable, @afterCreated, @afterKey)
 ORDER BY available_for_processing_at ASC, created_at ASC, file_key ASC
 LIMIT @limit`
 
@@ -1496,6 +1515,24 @@ func (r *SQLiteMetadataRepository) begin(ctx context.Context, tenantID string) (
 		return nil, fmt.Errorf("invalid tenant ID: %w", err)
 	}
 
+	// Fast path: a published handle is taken under the shared side of mu. A cache
+	// hit is the overwhelmingly common case (every claim, completion and read),
+	// and taking mu exclusively for two atomics made unrelated tenants queue
+	// behind one another. Eviction still takes mu exclusively, so a handle cannot
+	// move from refs==0 to closed while this block holds refs>0.
+	now := r.now()
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return nil, errRepositoryClosed()
+	}
+	if handle, ok := r.databases[tenantID]; ok {
+		handle.acquire(now)
+		r.mu.RUnlock()
+		return handle, nil
+	}
+	r.mu.RUnlock()
+
 	for {
 		r.mu.Lock()
 		if r.closed {
@@ -1503,7 +1540,7 @@ func (r *SQLiteMetadataRepository) begin(ctx context.Context, tenantID string) (
 			return nil, errRepositoryClosed()
 		}
 		if handle, ok := r.databases[tenantID]; ok {
-			r.touchLocked(handle)
+			handle.acquire(r.now())
 			r.mu.Unlock()
 			return handle, nil
 		}
@@ -1543,7 +1580,7 @@ func (r *SQLiteMetadataRepository) begin(ctx context.Context, tenantID string) (
 			pending.err = errRepositoryClosed()
 		default:
 			r.databases[tenantID] = handle
-			r.touchLocked(handle)
+			handle.acquire(r.now())
 			r.evictLocked(tenantID)
 		}
 		r.mu.Unlock()
@@ -1570,29 +1607,33 @@ func (r *SQLiteMetadataRepository) end(handle *sqliteTenantDatabase) {
 	if handle == nil {
 		return
 	}
-	r.mu.Lock()
-	if handle.refs > 0 {
-		handle.refs--
-	}
-	handle.lastUsed = r.now()
-	handle.lastUsedNanos = handle.lastUsed.UnixNano()
+	handle.release(r.now())
 
 	// Sample the idle sweep instead of running it on every release: an idle
 	// timeout must not put an O(n log n) handle-table sort on the operation
 	// path. A fixed tenant set keeps its handles open forever otherwise, because
 	// the only other eviction point is a cold open that never happens.
-	r.releaseOps++
-	if r.idleTimeout > 0 && r.releaseOps%metadataIdleSweepInterval == 0 {
+	if r.idleTimeout > 0 && r.releaseOps.Add(1)%metadataIdleSweepInterval == 0 {
+		r.mu.Lock()
 		r.evictLocked("")
+		r.mu.Unlock()
 	}
-	r.mu.Unlock()
 }
 
-// touchLocked refreshes a handle's usage and reference count.
-func (r *SQLiteMetadataRepository) touchLocked(handle *sqliteTenantDatabase) {
-	handle.refs++
-	handle.lastUsed = r.now()
-	handle.lastUsedNanos = handle.lastUsed.UnixNano()
+// acquire registers one reference and refreshes the handle's last-use stamp. The
+// caller must hold at least the shared side of the repository lock, which is what
+// keeps eviction from observing the handle between the two updates.
+func (h *sqliteTenantDatabase) acquire(now time.Time) {
+	h.refs.Add(1)
+	h.lastUsedNanos.Store(now.UnixNano())
+}
+
+// release drops one reference and refreshes the last-use stamp.
+func (h *sqliteTenantDatabase) release(now time.Time) {
+	if h.refs.Load() > 0 {
+		h.refs.Add(-1)
+	}
+	h.lastUsedNanos.Store(now.UnixNano())
 }
 
 // evictLocked closes handles that exceed the bound or sat idle for too long.
@@ -1613,20 +1654,20 @@ func (r *SQLiteMetadataRepository) evictLocked(exclude string) {
 
 	candidates := make([]*sqliteTenantDatabase, 0, len(r.databases))
 	for tenantID, handle := range r.databases {
-		if tenantID == exclude || handle.refs > 0 || handle.db == nil {
+		if tenantID == exclude || handle.refs.Load() > 0 || handle.db == nil {
 			continue
 		}
 		candidates = append(candidates, handle)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].lastUsedNanos < candidates[j].lastUsedNanos
+		return candidates[i].lastUsedNanos.Load() < candidates[j].lastUsedNanos.Load()
 	})
 
 	// Idle eviction can close every candidate.
 	if r.idleTimeout > 0 {
 		cutoff := r.now().Add(-r.idleTimeout).UnixNano()
 		for _, handle := range candidates {
-			if handle.lastUsedNanos > cutoff {
+			if handle.lastUsedNanos.Load() > cutoff {
 				break
 			}
 			r.closeEvictedLocked(handle)
@@ -1854,11 +1895,11 @@ func (r *SQLiteMetadataRepository) applySchema(ctx context.Context, db *sql.DB) 
 	}
 	for _, statement := range []string{
 		sqliteFilesStatusAvailableIndexDDL,
-		sqliteFilesStatusCreatedAtIndexDDL,
 		sqliteFilesStatusCompletedAtIndexDDL,
 		sqliteFilesStatusLastFailedAtIndexDDL,
 		sqliteFilesProcessingStartIndexDDL,
 		sqliteFilesImportOperationIndexDDL,
+		sqliteFilesStatusCreatedAtIndexDropDDL,
 		sqliteSchemaVersionDDL,
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
@@ -1964,17 +2005,24 @@ func tableColumns(ctx context.Context, db *sql.DB, table string) (map[string]boo
 	return columns, nil
 }
 
+// metadataCheckpointCommitInterval is how many committed write transactions pass
+// between two automatic WAL checkpoints when CheckpointAfterBatch is enabled.
+// The value is large enough that a claim or completion never pays a checkpoint,
+// and small enough that an idle-free writer keeps the WAL bounded.
+const metadataCheckpointCommitInterval = 64
+
 // inTx runs fn inside one write transaction.
 //
 // The DSN's _txlock=immediate makes BeginTx issue BEGIN IMMEDIATE, so the write
 // lock is taken when the transaction starts instead of failing on a mid-way lock
 // upgrade. The rollback is deferred and the commit stays explicit.
 //
-// When the handle was configured with CheckpointAfterBatch, a successful commit
-// is followed by PRAGMA wal_checkpoint(PASSIVE) on the same connection. The
-// checkpoint runs after the commit and outside the transaction, which is what
-// the single-connection policy guarantees here; a checkpoint failure is a
-// warning, not a failed write, because the batch itself is already durable.
+// When the handle was configured with CheckpointAfterBatch, every
+// metadataCheckpointCommitInterval-th successful commit is followed by PRAGMA
+// wal_checkpoint(PASSIVE) on the same connection. The checkpoint runs after the
+// commit and outside the transaction, which is what the single-connection policy
+// guarantees here; a checkpoint failure is a warning, not a failed write, because
+// the transaction itself is already durable.
 func (h *sqliteTenantDatabase) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1988,7 +2036,8 @@ func (h *sqliteTenantDatabase) inTx(ctx context.Context, fn func(*sql.Tx) error)
 	if err := tx.Commit(); err != nil {
 		return classifySQLiteError(ctx, err)
 	}
-	if h.checkpointAfterBatch {
+	if h.checkpointAfterBatch &&
+		h.commitsSinceCheckpoint.Add(1)%metadataCheckpointCommitInterval == 0 {
 		if err := sqlite.Checkpoint(ctx, h.db); err != nil {
 			warnRepositoryEvent(h.logging, "metadata_checkpoint_failed", "wal_checkpoint_failed")
 		}
@@ -2181,7 +2230,14 @@ func sqliteScanMetadata(scanner sqliteScanner) (*core.FileMetadata, error) {
 
 // sqliteScanMetadataRows drains a result set in queue order.
 func sqliteScanMetadataRows(ctx context.Context, rows *sql.Rows) ([]*core.FileMetadata, error) {
-	results := make([]*core.FileMetadata, 0)
+	return sqliteScanMetadataRowsCapacity(ctx, rows, 0)
+}
+
+// sqliteScanMetadataRowsCapacity is sqliteScanMetadataRows with a capacity hint,
+// so a caller that already knows the page bound does not allocate a slice it
+// immediately replaces.
+func sqliteScanMetadataRowsCapacity(ctx context.Context, rows *sql.Rows, capacity int) ([]*core.FileMetadata, error) {
+	results := make([]*core.FileMetadata, 0, capacity)
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err

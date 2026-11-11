@@ -82,6 +82,11 @@ type databaseHealthChecker struct {
 	directoryQuotaDataPath string
 	volumePaths            []string
 	logger                 *logging.Runtime
+
+	// enumerateTenants reads the tenant set below the metadata root. It is a
+	// field so a test can observe the single enumeration the check performs; a
+	// nil value falls back to GetTenantIDsFromMetadata.
+	enumerateTenants func(metadataDataPath string) ([]string, error)
 }
 
 // NewDatabaseHealthChecker creates a new database health checker.
@@ -112,7 +117,16 @@ func NewDatabaseHealthChecker(opts *DatabaseHealthCheckerOptions) (core.Database
 		directoryQuotaDataPath: opts.DirectoryQuotaDataPath,
 		volumePaths:            opts.VolumePaths,
 		logger:                 logger,
+		enumerateTenants:       GetTenantIDsFromMetadata,
 	}, nil
+}
+
+// tenantIDs reads the tenant set below the metadata root.
+func (c *databaseHealthChecker) tenantIDs(metadataDataPath string) ([]string, error) {
+	if c.enumerateTenants != nil {
+		return c.enumerateTenants(metadataDataPath)
+	}
+	return GetTenantIDsFromMetadata(metadataDataPath)
 }
 
 // CheckAllDatabases checks the health of all databases.
@@ -134,20 +148,18 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 		return nil, err
 	}
 
-	tenantIDs, err := GetTenantIDsFromMetadata(c.metadataDataPath)
-	if err != nil {
+	tenantIDs, enumerateErr := c.tenantIDs(c.metadataDataPath)
+	if enumerateErr != nil {
 		// Enumeration failure must not read as health: an unreadable metadata
 		// root means zero databases were inspected, and reporting AllHealthy
 		// would hide every potentially corrupted database behind a green flag.
-		c.emit(ctx, slog.LevelWarn, "metadata_tenant_enumeration_failed", "Error enumerating tenants from the metadata root", errorTypeAttr(err))
+		c.emit(ctx, slog.LevelWarn, "metadata_tenant_enumeration_failed", "Error enumerating tenants from the metadata root", errorTypeAttr(enumerateErr))
 		report.AllHealthy = false
 	}
 
 	metadataDatabases := tenantDatabasePaths(c.metadataDataPath, metadataDatabaseFileName, tenantIDs)
 
-	checkedDatabases := make([]string, 0, len(metadataDatabases))
-	metadataChecked, metadataErr := c.checkMetadataDatabases(ctx, metadataDatabases, report)
-	checkedDatabases = append(checkedDatabases, metadataChecked...)
+	metadataErr := c.checkMetadataDatabases(ctx, metadataDatabases, report)
 	// A cancelled or timed-out check inspected only part of the tenant set. That
 	// is not health: without this the report would read as a clean pass over
 	// databases that were never opened.
@@ -156,7 +168,7 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 	if c.directoryQuotaDataPath != "" {
 		quotaDatabases := tenantDatabasePaths(c.directoryQuotaDataPath, directoryQuotaDatabaseFileName, tenantIDs)
 
-		healthy, corrupted, quotaErr := c.checkDirectoryQuotaDatabases(ctx, quotaDatabases)
+		healthy, corrupted, quotaErr := c.checkDirectoryQuotaDatabases(ctx, quotaDatabases, report.DatabaseSizes)
 		if quotaErr != nil {
 			c.emit(ctx, slog.LevelWarn, "quota_check_failed", "Error checking directory quota databases", errorTypeAttr(quotaErr))
 			// A quota scan that could not run says nothing about the databases
@@ -171,24 +183,31 @@ func (c *databaseHealthChecker) CheckAllDatabases(ctx context.Context) (*core.Da
 			report.AllHealthy = false
 		}
 
-		checkedDatabases = append(checkedDatabases, quotaDatabases...)
 		c.markIncomplete(ctx, report, "directory quota", quotaErr)
 	}
 
 	// Orphan detection is independent from the database counts: a deployment can
-	// have healthy databases and still have volume content without metadata.
-	orphaned, err := c.DetectOrphanedFiles(ctx)
-	if err != nil {
-		c.emit(ctx, slog.LevelWarn, "orphan_detection_failed", "Error detecting orphaned files", errorTypeAttr(err))
-		// A phase that did not run leaves the report incomplete, so it must not
-		// read as an all-clear. Cancellation in particular surfaces here rather
-		// than in the database loops.
+	// have healthy databases and still have volume content without metadata. It
+	// reuses the tenant set enumerated above: a second directory read is pure
+	// overhead, and it could disagree with the paths that were just checked.
+	switch {
+	case enumerateErr != nil:
+		// The phase could not run without the tenant set, so it must not read as
+		// an all-clear either.
+		c.emit(ctx, slog.LevelWarn, "orphan_detection_failed", "Error detecting orphaned files", errorTypeAttr(enumerateErr))
 		report.AllHealthy = false
-	} else {
-		report.OrphanedTenants = orphaned
+	default:
+		orphaned, err := c.detectOrphanedFiles(ctx, tenantIDs)
+		if err != nil {
+			c.emit(ctx, slog.LevelWarn, "orphan_detection_failed", "Error detecting orphaned files", errorTypeAttr(err))
+			// A phase that did not run leaves the report incomplete, so it must
+			// not read as an all-clear. Cancellation in particular surfaces here
+			// rather than in the database loops.
+			report.AllHealthy = false
+		} else {
+			report.OrphanedTenants = orphaned
+		}
 	}
-
-	c.collectDatabaseSizes(ctx, report, checkedDatabases)
 
 	return report, nil
 }
@@ -217,8 +236,7 @@ func (c *databaseHealthChecker) markIncomplete(ctx context.Context, report *core
 		errorTypeAttr(phaseErr))
 }
 
-// checkMetadataDatabases checks every tenant metadata database and returns the
-// database paths that were inspected (present or not), in enumeration order.
+// checkMetadataDatabases checks every tenant metadata database.
 //
 // A non-nil error means the phase stopped before every database was inspected,
 // so the caller can mark the report incomplete instead of presenting a partial
@@ -227,20 +245,16 @@ func (c *databaseHealthChecker) checkMetadataDatabases(
 	ctx context.Context,
 	databases []string,
 	report *core.DatabaseHealthReport,
-) ([]string, error) {
-	checked := make([]string, 0, len(databases))
-
+) error {
 	for _, dbPath := range databases {
 		if err := ctx.Err(); err != nil {
-			return checked, err
+			return err
 		}
 
-		checked = append(checked, dbPath)
-
-		status := c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantIDFromDatabasePath(c.metadataDataPath, dbPath), dbPath)
+		status := c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantIDFromDatabasePath(c.metadataDataPath, dbPath), dbPath, report.DatabaseSizes)
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return checked, ctxErr
+			return ctxErr
 		}
 
 		switch {
@@ -252,7 +266,7 @@ func (c *databaseHealthChecker) checkMetadataDatabases(
 		}
 	}
 
-	return checked, nil
+	return nil
 }
 
 // CheckMetadataDatabase checks one tenant's metadata database.
@@ -290,7 +304,7 @@ func (c *databaseHealthChecker) CheckMetadataDatabase(ctx context.Context, tenan
 
 	dbPath := filepath.Join(c.metadataDataPath, tenantID, metadataDatabaseFileName)
 
-	return c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantID, dbPath), nil
+	return c.checkDatabase(ctx, core.DatabaseTypeMetadata, tenantID, dbPath, nil), nil
 }
 
 // CheckDirectoryQuotaDatabase checks every tenant directory quota database.
@@ -311,12 +325,12 @@ func (c *databaseHealthChecker) CheckDirectoryQuotaDatabase(ctx context.Context)
 		return status, nil
 	}
 
-	tenantIDs, err := GetTenantIDsFromMetadata(c.metadataDataPath)
+	tenantIDs, err := c.tenantIDs(c.metadataDataPath)
 	if err != nil {
 		return nil, err
 	}
 
-	healthy, corrupted, err := c.checkDirectoryQuotaDatabases(ctx, tenantDatabasePaths(c.directoryQuotaDataPath, directoryQuotaDatabaseFileName, tenantIDs))
+	healthy, corrupted, err := c.checkDirectoryQuotaDatabases(ctx, tenantDatabasePaths(c.directoryQuotaDataPath, directoryQuotaDatabaseFileName, tenantIDs), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -339,10 +353,13 @@ func (c *databaseHealthChecker) CheckDirectoryQuotaDatabase(ctx context.Context)
 }
 
 // checkDirectoryQuotaDatabases inspects every quota database and returns the
-// healthy count plus every corrupted status.
+// healthy count plus every corrupted status. When sizes is non-nil it receives
+// the size each inspection already measured, so the report does not re-stat the
+// same files.
 func (c *databaseHealthChecker) checkDirectoryQuotaDatabases(
 	ctx context.Context,
 	databases []string,
+	sizes map[string]int64,
 ) (healthy int, corrupted []*core.DatabaseHealthStatus, err error) {
 	corrupted = make([]*core.DatabaseHealthStatus, 0)
 
@@ -351,7 +368,7 @@ func (c *databaseHealthChecker) checkDirectoryQuotaDatabases(
 			return healthy, corrupted, ctxErr
 		}
 
-		status := c.checkDatabase(ctx, core.DatabaseTypeDirectoryQuota, tenantIDFromDatabasePath(c.directoryQuotaDataPath, dbPath), dbPath)
+		status := c.checkDatabase(ctx, core.DatabaseTypeDirectoryQuota, tenantIDFromDatabasePath(c.directoryQuotaDataPath, dbPath), dbPath, sizes)
 
 		// A cancellation that landed during the inspection is reported as the
 		// phase error rather than as corruption, so the caller marks the report
@@ -388,11 +405,15 @@ func (c *databaseHealthChecker) checkDirectoryQuotaDatabases(
 // database yet" and is reported as healthy with an empty Error; only a file that
 // exists but fails the SQLite structure rules is reported as corrupted, with a
 // path-free reason (DatabasePath already carries the location).
+//
+// When sizes is non-nil, the size the structural inspection already stat'ed is
+// recorded there, so a report does not stat every database a second time.
 func (c *databaseHealthChecker) checkDatabase(
 	ctx context.Context,
 	databaseType core.DatabaseType,
 	tenantID string,
 	dbPath string,
+	sizes map[string]int64,
 ) *core.DatabaseHealthStatus {
 	status := &core.DatabaseHealthStatus{
 		DatabaseType: databaseType,
@@ -401,7 +422,11 @@ func (c *databaseHealthChecker) checkDatabase(
 		IsHealthy:    false,
 	}
 
-	healthy, err := inspectSQLiteFile(ctx, dbPath)
+	healthy, size, sizeKnown, err := inspectSQLiteFile(ctx, dbPath)
+	if sizeKnown && sizes != nil {
+		sizes[dbPath] = size
+	}
+
 	switch {
 	case err == nil && healthy:
 		status.IsHealthy = true
@@ -422,26 +447,31 @@ func (c *databaseHealthChecker) checkDatabase(
 	return status
 }
 
-// collectDatabaseSizes records the on-disk size of every inspected database
-// file so the report carries an operational signal without extra I/O for
-// missing files. Databases that do not exist are omitted.
-func (c *databaseHealthChecker) collectDatabaseSizes(ctx context.Context, report *core.DatabaseHealthReport, databases []string) {
-	for _, dbPath := range databases {
-		if err := ctx.Err(); err != nil {
-			return
-		}
-
-		size, err := contextualDatabaseSize(ctx, dbPath)
-		if err != nil {
-			continue
-		}
-
-		report.DatabaseSizes[dbPath] = size
-	}
-}
-
 // DetectOrphanedFiles detects tenants with physical files but no metadata.
 func (c *databaseHealthChecker) DetectOrphanedFiles(ctx context.Context) ([]string, error) {
+	if len(c.volumePaths) == 0 || c.metadataDataPath == "" {
+		return make([]string, 0), nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	tenantIDs, err := c.tenantIDs(c.metadataDataPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.detectOrphanedFiles(ctx, tenantIDs)
+}
+
+// detectOrphanedFiles reports the tenants that have physical volume content but
+// no entry in tenantIDs.
+//
+// tenantIDs is the enumeration the caller already performed: re-reading the
+// metadata root per health cycle is a second directory scan, and a fresh read
+// could disagree with the set the database checks just ran against.
+func (c *databaseHealthChecker) detectOrphanedFiles(ctx context.Context, tenantIDs []string) ([]string, error) {
 	orphanedTenants := make([]string, 0)
 
 	if len(c.volumePaths) == 0 || c.metadataDataPath == "" {
@@ -449,12 +479,6 @@ func (c *databaseHealthChecker) DetectOrphanedFiles(ctx context.Context) ([]stri
 	}
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	// Get existing tenant IDs from the metadata root.
-	tenantIDs, err := GetTenantIDsFromMetadata(c.metadataDataPath)
-	if err != nil {
 		return nil, err
 	}
 
@@ -580,7 +604,7 @@ func contextualDatabaseSize(ctx context.Context, dbPath string) (int64, error) {
 // that does not exist is not reported as corrupted: no database yet is a normal
 // state.
 func IsDatabaseCorrupted(dbPath string) bool {
-	healthy, err := inspectSQLiteFile(context.Background(), dbPath)
+	healthy, _, _, err := inspectSQLiteFile(context.Background(), dbPath)
 
 	return err != nil && !healthy
 }
@@ -674,47 +698,53 @@ func tenantIDFromDatabasePath(root, dbPath string) string {
 // the database through a driver.
 //
 // It returns:
-//   - (false, nil) when dbPath is absent: there is no database file yet.
-//   - (true, nil) when the file is regular, at least minimumSQLiteFileSize
-//     bytes long and starts with the 16-byte SQLite header.
-//   - (false, err) when the path exists but fails one of those rules, including
-//     a non-regular entry such as a directory. err is a safe, path-free reason
-//     that names the precise defect.
-func inspectSQLiteFile(ctx context.Context, dbPath string) (healthy bool, err error) {
+//   - (false, 0, true, nil) when dbPath is absent: there is no database file yet.
+//   - (true, size, true, nil) when the file is regular, at least
+//     minimumSQLiteFileSize bytes long and starts with the 16-byte SQLite header.
+//   - (false, size, true, err) when the path exists but fails one of those rules,
+//     including a non-regular entry such as a directory. err is a safe, path-free
+//     reason that names the precise defect. size is 0 for a non-regular entry,
+//     matching what a plain size read could report for it.
+//   - (false, 0, false, err) when the file could not be stat'ed: the size is
+//     unknown and must not be reported.
+//
+// size is the size the classification already stat'ed, so a caller that reports
+// on-disk database sizes does not have to stat every file again.
+func inspectSQLiteFile(ctx context.Context, dbPath string) (healthy bool, size int64, sizeKnown bool, err error) {
 	if dbPath == "" {
-		return false, nil
+		return false, 0, false, nil
 	}
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, ctxErr
+		return false, 0, false, ctxErr
 	}
 
 	info, statErr := os.Stat(dbPath)
 	switch {
 	case errors.Is(statErr, os.ErrNotExist):
-		return false, nil
+		return false, 0, true, nil
 	case statErr != nil:
-		return false, fmt.Errorf("failed to stat database file: %w", statErr)
+		return false, 0, false, fmt.Errorf("failed to stat database file: %w", statErr)
 	case !info.Mode().IsRegular():
-		return false, fmt.Errorf("database path is not a regular file, so it cannot hold a SQLite database")
+		return false, 0, true, fmt.Errorf("database path is not a regular file, so it cannot hold a SQLite database")
 	}
 
 	if info.Size() < minimumSQLiteFileSize {
-		return false, fmt.Errorf(
+		return false, info.Size(), true, fmt.Errorf(
 			"database file is %d bytes; a SQLite database needs at least %d bytes for its header page",
 			info.Size(), minimumSQLiteFileSize)
 	}
 
 	header, readErr := readSQLiteHeader(dbPath)
 	if readErr != nil {
-		return false, readErr
+		return false, info.Size(), true, readErr
 	}
 
 	if string(header) != sqliteHeader {
-		return false, fmt.Errorf("file does not start with the %d-byte SQLite format 3 header", len(sqliteHeader))
+		return false, info.Size(), true, fmt.Errorf("file does not start with the %d-byte SQLite format 3 header", len(sqliteHeader))
 	}
 
-	return true, nil
+	return true, info.Size(), true, nil
 }
 
 // readSQLiteHeader reads the leading SQLite magic bytes without using a

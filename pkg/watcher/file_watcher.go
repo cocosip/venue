@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,11 @@ const (
 	// would make a restart drop records this process still trusts, and the next
 	// scan would re-import those files.
 	maxImportedFilesHistory = 10000
+
+	// importedHistoryEvictionTarget is how far below maxImportedFilesHistory one
+	// eviction pass trims. Trimming a whole batch amortizes the pass over many
+	// inserts instead of rescanning the history on every insert at the cap.
+	importedHistoryEvictionTarget = maxImportedFilesHistory * 9 / 10
 
 	// maxRecordedErrorsPerScanResult caps the errors carried by one scan result.
 	maxRecordedErrorsPerScanResult = 100
@@ -163,10 +169,13 @@ type fileWatcher struct {
 	// default is time.AfterFunc, which never invokes fn inline.
 	scheduleHistoryFlush func(delay time.Duration, fn func()) *time.Timer
 
-	// tenantCacheMu guards tenantCache.
+	// tenantCacheMu guards tenantCache and tenantDirCache.
 	tenantCacheMu sync.Mutex
 	// tenantCache holds the cached tenant enumeration per watcher ID.
 	tenantCache map[string]cachedTenantList
+	// tenantDirCache holds the tenant directories confirmed present per watcher,
+	// so a steady-state scan does not stat each of them again.
+	tenantDirCache map[string]cachedTenantDirectories
 
 	// pruneMu guards prunedOnce and lastPrunedAt.
 	pruneMu sync.Mutex
@@ -175,11 +184,15 @@ type fileWatcher struct {
 	// lastPrunedAt is when the throttled history prune last ran.
 	lastPrunedAt time.Time
 
-	// importedFilesMu guards importedCount and the flush bookkeeping, and
-	// serializes history writes.
+	// importedFilesMu guards importedCount and the flush bookkeeping. It is
+	// never held across history serialization or file I/O.
 	importedFilesMu sync.Mutex
 	importedFiles   sync.Map // map[string]importedFileRecord
 	importedCount   int
+
+	// historyWriteMu serializes history document writes so callers cannot race
+	// on the fixed staging file.
+	historyWriteMu sync.Mutex
 
 	// inFlightImports tracks the durable source-cleanup reservations whose
 	// import is currently running in this process, keyed by
@@ -223,6 +236,15 @@ type cachedTenantList struct {
 	tenants []core.TenantContext
 
 	// expiresAt is the instant the entry stops being reusable.
+	expiresAt time.Time
+}
+
+// cachedTenantDirectories is one watcher's set of tenant directories already
+// confirmed present, with the watch path it was collected for: an updated
+// watch path must not reuse another directory's confirmation.
+type cachedTenantDirectories struct {
+	watchPath string
+	confirmed map[string]struct{}
 	expiresAt time.Time
 }
 
@@ -274,6 +296,7 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 		stabilityWait:        waitForStabilityDelay,
 		scheduleHistoryFlush: time.AfterFunc,
 		tenantCache:          make(map[string]cachedTenantList),
+		tenantDirCache:       make(map[string]cachedTenantDirectories),
 	}
 
 	// Load imported files history
@@ -682,6 +705,36 @@ func (w *fileWatcher) GetAllWatchers(ctx context.Context) ([]*core.FileWatcherCo
 	sort.Slice(configs, func(i, j int) bool { return configs[i].WatcherID < configs[j].WatcherID })
 
 	return configs, nil
+}
+
+// HasEnabledWatcher reports whether at least one configured watcher is
+// currently enabled.
+//
+// It reads the watcher table directly, without copying configurations or
+// sorting, so a periodic caller does not pay the GetAllWatchers cost.
+func (w *fileWatcher) HasEnabledWatcher() bool {
+	enabled := false
+
+	w.watchers.Range(func(_, value any) bool {
+		entry, ok := value.(*watcherEntry)
+		if !ok {
+			return true
+		}
+
+		entry.mu.Lock()
+		configEnabled := entry.config != nil && entry.config.Enabled
+		entry.mu.Unlock()
+
+		if configEnabled {
+			enabled = true
+
+			return false
+		}
+
+		return true
+	})
+
+	return enabled
 }
 
 // GetWatchersForTenant returns the watchers that import for one tenant, sorted
@@ -1097,6 +1150,12 @@ func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config 
 				continue
 			}
 
+			// Match the name before the stat: a candidate that cannot match is
+			// never touched.
+			if !matchesAnyPattern(entry.Name(), config.FilePatterns) {
+				continue
+			}
+
 			info, err := entry.Info()
 			if err != nil {
 				continue
@@ -1201,7 +1260,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 		return outcome, nil
 	}
 
-	token := fmt.Sprintf("%d-%d", time.Now().UnixNano(), nextReservationSequence())
+	token := importToken("")
 	if !w.reserveImportSlot(filePath, token, fingerprint) {
 		return outcome, nil
 	}
@@ -1319,7 +1378,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 			pending.MoveTargetPath = filepath.Join(config.MoveToDirectory, filepath.Base(filePath))
 		}
 	}
-	if err := w.storeImportedStateSync(filePath, pending); err != nil {
+	if err := w.storeImportedStateSync(filePath, pending, config); err != nil {
 		return outcome, fmt.Errorf("failed to persist pending post-import action: %w", err)
 	}
 
@@ -1330,7 +1389,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 		return outcome, fmt.Errorf("post-import action failed: %w", err)
 	}
 
-	if err := w.removeImportedStateSync(filePath); err != nil {
+	if err := w.removeImportedStateSync(filePath, config); err != nil {
 		w.emit(ctx, slog.LevelWarn, "history_save_failed", "Failed to remove completed post-import state", errorTypeAttr(err))
 	}
 
@@ -1661,7 +1720,7 @@ func (w *fileWatcher) tryProcessPendingPostImportAction(
 		}
 
 		claim := record
-		claim.InFlightToken = fmt.Sprintf("action-%d-%d", time.Now().UnixNano(), nextReservationSequence())
+		claim.InFlightToken = importToken("action-")
 		if !w.importedFiles.CompareAndSwap(filePath, value, claim) {
 			continue
 		}
@@ -1669,7 +1728,7 @@ func (w *fileWatcher) tryProcessPendingPostImportAction(
 		outcome.postImportActionsRetried = 1
 		err := w.performPostImportAction(ctx, filePath, record.PostImportAction, record.MoveTargetPath)
 		if err == nil {
-			if persistErr := w.removeImportedStateSync(filePath); persistErr != nil {
+			if persistErr := w.removeImportedStateSync(filePath, config); persistErr != nil {
 				return true, outcome, persistErr
 			}
 			return true, outcome, nil
@@ -1701,7 +1760,7 @@ func (w *fileWatcher) recordPostImportActionFailure(
 	} else {
 		record.NextAttemptUnixNano = w.now().Add(postImportActionRetryDelay(config, record.FailureCount)).UnixNano()
 	}
-	return record.Quarantined, w.storeImportedStateSync(filePath, record)
+	return record.Quarantined, w.storeImportedStateSync(filePath, record, config)
 }
 
 func postImportActionRetryDelay(config *core.FileWatcherConfiguration, failureCount int) time.Duration {
@@ -1760,7 +1819,8 @@ func filesHaveEquivalentContent(firstPath string, secondPath string) (bool, erro
 //
 // The tenant enumeration comes from tenantList, so it is reused for the
 // watcher's AutoCreateTenantDirectoriesCacheTTL instead of being repeated on
-// every scan.
+// every scan. A directory confirmed present is reused for the same TTL, so the
+// steady state does not stat every tenant directory either.
 func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.FileWatcherConfiguration) error {
 	if !config.MultiTenantMode {
 		return nil
@@ -1772,26 +1832,95 @@ func (w *fileWatcher) createTenantDirectories(ctx context.Context, config *core.
 		return err
 	}
 
+	ttl := config.AutoCreateTenantDirectoriesCacheTTL
+	if ttl == 0 {
+		ttl = defaultAutoCreateTenantDirectoriesCacheTTL
+	}
+	if ttl > 0 {
+		w.resetExpiredTenantDirectoryCache(config, ttl)
+	}
+
 	// Create directory for each tenant
 	for _, tenant := range tenants {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
+		if ttl > 0 && w.tenantDirectoryConfirmed(config, tenant.ID) {
+			continue
+		}
+
 		tenantPath := filepath.Join(config.WatchPath, tenant.ID)
 		if info, statErr := os.Stat(tenantPath); statErr == nil && info.IsDir() {
 			// The directory already exists, which is the normal steady state.
 			// Reporting "created" on every scan made the event meaningless.
+			w.confirmTenantDirectory(config, tenant.ID)
 			continue
 		}
 		if err := os.MkdirAll(tenantPath, 0755); err != nil {
 			w.emit(ctx, slog.LevelWarn, "tenant_directory_create_failed", "Failed to create tenant directory", slog.String("tenant_id", tenant.ID), errorTypeAttr(err))
 		} else {
 			w.emit(ctx, slog.LevelInfo, "tenant_directory_created", "Created tenant directory", slog.String("tenant_id", tenant.ID))
+			w.confirmTenantDirectory(config, tenant.ID)
 		}
 	}
 
 	return nil
+}
+
+// resetExpiredTenantDirectoryCache installs a fresh confirmation set for the
+// watcher when the cached one expired or was collected for another watch path.
+// The caller must have resolved a positive TTL.
+func (w *fileWatcher) resetExpiredTenantDirectoryCache(config *core.FileWatcherConfiguration, ttl time.Duration) {
+	now := w.now()
+
+	w.tenantCacheMu.Lock()
+	defer w.tenantCacheMu.Unlock()
+
+	cached, ok := w.tenantDirCache[config.WatcherID]
+	if ok && cached.watchPath == config.WatchPath && now.Before(cached.expiresAt) {
+		return
+	}
+
+	w.tenantDirCache[config.WatcherID] = cachedTenantDirectories{
+		watchPath: config.WatchPath,
+		confirmed: make(map[string]struct{}),
+		expiresAt: now.Add(ttl),
+	}
+}
+
+// tenantDirectoryConfirmed reports whether the watcher's current cache already
+// confirmed the tenant directory present.
+func (w *fileWatcher) tenantDirectoryConfirmed(config *core.FileWatcherConfiguration, tenantID string) bool {
+	w.tenantCacheMu.Lock()
+	defer w.tenantCacheMu.Unlock()
+
+	cached, ok := w.tenantDirCache[config.WatcherID]
+	if !ok || cached.watchPath != config.WatchPath {
+		return false
+	}
+
+	_, confirmed := cached.confirmed[tenantID]
+
+	return confirmed
+}
+
+// confirmTenantDirectory records a tenant directory as present for the current
+// TTL window. A negative TTL disables the cache, so nothing is recorded.
+func (w *fileWatcher) confirmTenantDirectory(config *core.FileWatcherConfiguration, tenantID string) {
+	if config.AutoCreateTenantDirectoriesCacheTTL < 0 {
+		return
+	}
+
+	w.tenantCacheMu.Lock()
+	defer w.tenantCacheMu.Unlock()
+
+	cached, ok := w.tenantDirCache[config.WatcherID]
+	if !ok || cached.watchPath != config.WatchPath {
+		return
+	}
+
+	cached.confirmed[tenantID] = struct{}{}
 }
 
 // tenantList returns the tenant enumeration used by AutoCreateTenantDirectories,
@@ -1970,6 +2099,16 @@ func matchPattern(name, pattern string) bool {
 	return matched
 }
 
+// fingerprintSamplePool recycles the scratch buffer used by contentSampleHash.
+// The buffer is only used inside the call, so no ownership crosses the pool.
+var fingerprintSamplePool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, fingerprintSampleSize)
+
+		return &buffer
+	},
+}
+
 // fileFingerprint identifies one content revision of a file. ReadAt leaves the
 // stream position at zero for the subsequent storage write.
 func fileFingerprint(file *os.File, info os.FileInfo) (string, error) {
@@ -1985,43 +2124,84 @@ func fileFingerprint(file *os.File, info os.FileInfo) (string, error) {
 		return "", err
 	}
 	modified := info.ModTime().UTC().UnixNano()
-	return fmt.Sprintf("fp:v3:%d:%d:%d:%s", info.Size(), modified, modified, contentHash), nil
+
+	builder := make([]byte, 0, 48+len(contentHash))
+	builder = append(builder, "fp:v3:"...)
+	builder = strconv.AppendInt(builder, info.Size(), 10)
+	builder = append(builder, ':')
+	builder = strconv.AppendInt(builder, modified, 10)
+	builder = append(builder, ':')
+	builder = strconv.AppendInt(builder, modified, 10)
+	builder = append(builder, ':')
+	builder = append(builder, contentHash...)
+
+	return string(builder), nil
 }
 
+// contentSampleHash hashes the beginning, middle and end samples of a file.
+//
+// The three sample positions are non-decreasing, so a position equal to the
+// previous one (a short file rounds the middle and end together) is skipped
+// without a de-duplication map.
 func contentSampleHash(file *os.File, size int64) (string, error) {
-	positions := []int64{
+	bufferPointer := fingerprintSamplePool.Get().(*[]byte)
+	buffer := *bufferPointer
+	defer fingerprintSamplePool.Put(bufferPointer)
+
+	hasher := sha256.New()
+	previousPosition := int64(-1)
+
+	for _, position := range [3]int64{
 		0,
 		max(0, (size-fingerprintSampleSize)/2),
 		max(0, size-fingerprintSampleSize),
-	}
-	hasher := sha256.New()
-	visited := make(map[int64]struct{}, len(positions))
-	buffer := make([]byte, fingerprintSampleSize)
-	for _, position := range positions {
-		if _, ok := visited[position]; ok {
+	} {
+		if position == previousPosition {
 			continue
 		}
-		visited[position] = struct{}{}
+		previousPosition = position
 
 		remaining := min(int64(fingerprintSampleSize), max(0, size-position))
-		for remaining > 0 {
-			readSize := min(int64(len(buffer)), remaining)
-			n, err := file.ReadAt(buffer[:readSize], position)
-			if n > 0 {
-				_, _ = hasher.Write(buffer[:n])
-				position += int64(n)
-				remaining -= int64(n)
-			}
-			if err != nil && !errors.Is(err, io.EOF) {
-				return "", err
-			}
-			if n == 0 {
-				break
-			}
+		if err := hashFileRange(file, hasher, buffer, position, remaining); err != nil {
+			return "", err
 		}
 	}
 
 	return base64.StdEncoding.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// hashFileRange feeds up to remaining bytes at position into hasher, reading
+// through buffer. Short reads are retried; end of file ends the range.
+func hashFileRange(file *os.File, hasher io.Writer, buffer []byte, position, remaining int64) error {
+	for remaining > 0 {
+		readSize := min(int64(len(buffer)), remaining)
+		n, err := file.ReadAt(buffer[:readSize], position)
+		if n > 0 {
+			_, _ = hasher.Write(buffer[:n])
+			position += int64(n)
+			remaining -= int64(n)
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+	}
+
+	return nil
+}
+
+// importToken builds an in-flight claim token from the current time and the
+// process-wide claim sequence.
+func importToken(prefix string) string {
+	builder := make([]byte, 0, len(prefix)+24)
+	builder = append(builder, prefix...)
+	builder = strconv.AppendInt(builder, time.Now().UnixNano(), 10)
+	builder = append(builder, '-')
+	builder = strconv.AppendUint(builder, nextReservationSequence(), 10)
+
+	return string(builder)
 }
 
 func createImportOperationID(tenantID string, filePath string, fingerprint string) (string, error) {
@@ -2165,13 +2345,21 @@ func (w *fileWatcher) storeImportedRecordSync(filePath, fingerprint string, impo
 // saveImportedFilesHistory persists the history atomically, dropping the oldest
 // entries beyond maxImportedFilesHistory.
 //
-// Writes are serialized and publish through a temp file + rename, so a crash or
-// concurrent caller can never leave a truncated history behind.
+// The snapshot is taken under the history mutex, but serialization and file I/O
+// run outside it: imports must never block on formatting up to
+// maxImportedFilesHistory records. Writes are serialized by historyWriteMu and
+// publish through a temp file + rename, so a crash or concurrent caller can
+// never leave a truncated history behind.
 func (w *fileWatcher) saveImportedFilesHistory() error {
-	w.importedFilesMu.Lock()
-	defer w.importedFilesMu.Unlock()
+	// The write lock is taken before the snapshot, so two saves cannot publish
+	// out of order: a save that snapshotted earlier always writes earlier.
+	w.historyWriteMu.Lock()
+	defer w.historyWriteMu.Unlock()
 
+	w.importedFilesMu.Lock()
 	records := w.snapshotImportedRecords()
+	w.importedFilesMu.Unlock()
+
 	if len(records) > maxImportedFilesHistory {
 		sort.Slice(records, func(i, j int) bool {
 			return records[i].record.ImportedAtUnix < records[j].record.ImportedAtUnix
@@ -2356,35 +2544,29 @@ func (w *fileWatcher) storeImportedRecord(filePath, fingerprint string, imported
 // evictOldestImportedRecordsLocked drops the oldest history entries until the
 // cap holds. The caller must hold importedFilesMu.
 //
-// Eviction is bounded by maxImportedFilesHistory and ordered by ImportedAtUnix,
-// with the path as a deterministic tie-break, so the entries that survive the
-// cap are always the newest ones. An in-flight claim is never evicted: its
-// import is still running, and dropping the claim would let a concurrent scan
-// import the same revision twice.
-func (w *fileWatcher) evictOldestImportedRecordsLocked() {
-	for w.importedCount > maxImportedFilesHistory {
-		if !w.evictOldestImportedRecordLocked() {
-			return
-		}
-	}
-}
-
-// evictOldestImportedRecordLocked drops exactly one oldest entry and reports
-// whether it removed anything. The caller must hold importedFilesMu.
+// One pass trims the history down to importedHistoryEvictionTarget, so the next
+// inserts at the cap do not each rescan the whole history: the eviction cost is
+// amortized over the records between the target and the cap. Entries are
+// ordered by ImportedAtUnix, with the path as a deterministic tie-break, so the
+// survivors are always the newest ones.
 //
-// A record that still owes a post-import Delete/Move is only evicted when no
-// plain de-duplication record is left: it is the in-memory half of a durable
-// retry, and dropping it would re-import a file whose source action never ran.
-func (w *fileWatcher) evictOldestImportedRecordLocked() bool {
-	var (
-		plainPath string
-		plain     importedFileRecord
-		plainOK   bool
+// An in-flight claim is never evicted: its import is still running, and dropping
+// the claim would let a concurrent scan import the same revision twice. A record
+// that still owes a post-import Delete/Move is only evicted when no plain
+// de-duplication record is left: it is the in-memory half of a durable retry,
+// and dropping it would re-import a file whose source action never ran.
+func (w *fileWatcher) evictOldestImportedRecordsLocked() {
+	if w.importedCount <= maxImportedFilesHistory {
+		return
+	}
 
-		pendingPath string
-		pending     importedFileRecord
-		pendingOK   bool
-	)
+	type candidate struct {
+		path   string
+		record importedFileRecord
+	}
+
+	plain := make([]candidate, 0, w.importedCount)
+	pending := make([]candidate, 0)
 
 	w.importedFiles.Range(func(key, value interface{}) bool {
 		record, ok := value.(importedFileRecord)
@@ -2398,36 +2580,36 @@ func (w *fileWatcher) evictOldestImportedRecordLocked() bool {
 		}
 
 		if record.PendingPostImportAction {
-			if !pendingOK || olderImportedRecord(record, path, pending, pendingPath) {
-				pendingPath, pending, pendingOK = path, record, true
-			}
+			pending = append(pending, candidate{path: path, record: record})
 
 			return true
 		}
 
-		if !plainOK || olderImportedRecord(record, path, plain, plainPath) {
-			plainPath, plain, plainOK = path, record, true
-		}
+		plain = append(plain, candidate{path: path, record: record})
 
 		return true
 	})
 
-	switch {
-	case plainOK:
-		if !w.importedFiles.CompareAndDelete(plainPath, plain) {
-			return false
-		}
-	case pendingOK:
-		if !w.importedFiles.CompareAndDelete(pendingPath, pending) {
-			return false
-		}
-	default:
-		return false
+	oldestFirst := func(entries []candidate) {
+		sort.Slice(entries, func(i, j int) bool {
+			return olderImportedRecord(entries[i].record, entries[i].path, entries[j].record, entries[j].path)
+		})
 	}
+	oldestFirst(plain)
+	oldestFirst(pending)
 
-	w.importedCount--
-
-	return true
+	remaining := w.importedCount - importedHistoryEvictionTarget
+	for _, entries := range [][]candidate{plain, pending} {
+		for _, entry := range entries {
+			if remaining <= 0 {
+				return
+			}
+			if w.importedFiles.CompareAndDelete(entry.path, entry.record) {
+				w.importedCount--
+				remaining--
+			}
+		}
+	}
 }
 
 // olderImportedRecord orders two history entries: oldest ImportedAtUnix first,
@@ -2440,9 +2622,13 @@ func olderImportedRecord(record importedFileRecord, path string, than importedFi
 	return path < thanPath
 }
 
-// storeImportedStateSync persists pending post-import work before the action is
+// storeImportedStateSync records pending post-import work before the action is
 // attempted, closing the crash window between storage and source cleanup.
-func (w *fileWatcher) storeImportedStateSync(filePath string, record importedFileRecord) error {
+//
+// The persistence policy is the watcher's history policy: a debounce-enabled
+// watcher coalesces this change with the surrounding import state, while a
+// watcher without the debounce keeps the immediate synchronous write.
+func (w *fileWatcher) storeImportedStateSync(filePath string, record importedFileRecord, config *core.FileWatcherConfiguration) error {
 	if record.ImportedAtUnix == 0 {
 		record.ImportedAtUnix = w.now().Unix()
 	}
@@ -2453,14 +2639,30 @@ func (w *fileWatcher) storeImportedStateSync(filePath string, record importedFil
 	}
 	w.importedFiles.Store(filePath, record)
 	w.importedFilesMu.Unlock()
-	return w.saveImportedFilesHistory()
+	return w.persistImportedState(config)
 }
 
-func (w *fileWatcher) removeImportedStateSync(filePath string) error {
+// removeImportedStateSync drops a completed entry using the same persistence
+// policy as storeImportedStateSync.
+func (w *fileWatcher) removeImportedStateSync(filePath string, config *core.FileWatcherConfiguration) error {
 	value, exists := w.importedFiles.Load(filePath)
 	if exists {
 		w.deleteImportedRecord(filePath, value)
 	}
+	return w.persistImportedState(config)
+}
+
+// persistImportedState persists one pending-action change. A debounce-enabled
+// watcher routes it through the single debounced write, so a delete/move import
+// no longer rewrites the whole history twice; a watcher without the debounce
+// keeps the synchronous write the pending work relies on.
+func (w *fileWatcher) persistImportedState(config *core.FileWatcherConfiguration) error {
+	if config != nil && config.EnableImportedFilesHistoryFlushDebounce {
+		w.scheduleDebouncedHistoryFlush(config)
+
+		return nil
+	}
+
 	return w.saveImportedFilesHistory()
 }
 
@@ -2482,6 +2684,12 @@ func (w *fileWatcher) importedEntryCount() int {
 // pruneStaleImportedRecords drops history entries whose source path no longer
 // exists and persists the history when something was dropped.
 //
+// The prune is scoped to the scanning watcher and its watch directory: another
+// watcher's records, and paths outside config.WatchPath, are left to their
+// owner, so one watcher's schedule does not stat the whole shared history. A
+// record without an owner (legacy de-duplication records) is scoped by path
+// only, and an empty watch path keeps the unscoped behavior.
+//
 // A watcher that enables EnableImportedFilesPruneThrottle prunes at most once
 // per ImportedFilesPruneInterval (default five minutes); the throttled prune
 // always runs on the first opportunity after the interval elapsed, so it is
@@ -2498,6 +2706,13 @@ func (w *fileWatcher) pruneStaleImportedRecords(ctx context.Context, config *cor
 
 	pruned := 0
 
+	watcherID := ""
+	watchPath := ""
+	if config != nil {
+		watcherID = config.WatcherID
+		watchPath = config.WatchPath
+	}
+
 	w.importedFiles.Range(func(key, value interface{}) bool {
 		if ctx.Err() != nil {
 			return false
@@ -2510,6 +2725,14 @@ func (w *fileWatcher) pruneStaleImportedRecords(ctx context.Context, config *cor
 
 		record, ok := value.(importedFileRecord)
 		if !ok || record.InFlightToken != "" {
+			return true
+		}
+
+		if record.WatcherID != "" && watcherID != "" && record.WatcherID != watcherID {
+			return true
+		}
+
+		if watchPath != "" && !pathWithinRoot(watchPath, filePath) {
 			return true
 		}
 
@@ -2531,6 +2754,23 @@ func (w *fileWatcher) pruneStaleImportedRecords(ctx context.Context, config *cor
 	w.persistHistory(config)
 
 	return pruned
+}
+
+// pathWithinRoot reports whether target is the root itself or below it. A
+// relative comparison that crosses volumes or parents is never "within".
+func pathWithinRoot(root, target string) bool {
+	relative, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+
+	if relative == "." {
+		return true
+	}
+
+	return relative != ".." &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator)) &&
+		!filepath.IsAbs(relative)
 }
 
 // pruneDue reports whether the history prune may run now, recording the run so

@@ -4,9 +4,9 @@ package recovery
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,6 +22,31 @@ import (
 // defaultBatchSize bounds how many files one scan recovers, so a large orphan
 // backlog is drained gradually instead of in one unbounded pass.
 const defaultBatchSize = 1000
+
+// orphanLookupBatchSize bounds how many candidate file keys one batched metadata
+// existence query carries, so a full-volume scan buffers a bounded batch instead
+// of the whole walk.
+const orphanLookupBatchSize = 256
+
+// existingFileKeyChecker is the optional metadata repository capability that
+// checks a batch of file keys in one query.
+//
+// It is the batch counterpart of Get for a volume scan: one bounded query per
+// batch instead of one point select per physical file. Callers type-assert it and
+// keep the per-key Get path otherwise.
+type existingFileKeyChecker interface {
+	ExistingFileKeys(ctx context.Context, tenantID string, fileKeys []string) (map[string]bool, error)
+}
+
+// pendingOrphan is one physically present candidate file whose metadata has not
+// been checked yet.
+type pendingOrphan struct {
+	fullPath     string
+	relativePath string
+	tenantID     string
+	fileKey      string
+	info         fs.FileInfo
+}
 
 // errorTypeName reduces an error to its Go type. Recovery report errors are
 // part of the public report surface, and filesystem errors carry full paths,
@@ -405,7 +430,18 @@ func (s *OrphanRecoveryService) recoverVolume(
 	}
 
 	limit := s.batchSize
-	return filepath.Walk(walkRoot, func(path string, info os.FileInfo, walkErr error) error {
+	pending := make(map[string][]pendingOrphan)
+
+	// flush resolves one tenant's buffered candidates and reports whether the
+	// recovery limit was reached.
+	flush := func(tenantID string) (bool, error) {
+		if err := s.recoverPendingBatch(ctx, volumeID, pending, tenantID, limit, report); err != nil {
+			return false, err
+		}
+		return limit > 0 && report.FilesRecovered >= limit, nil
+	}
+
+	walkErr := filepath.WalkDir(walkRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		// Cancellation outranks entry errors: a cancelled scan must stop
 		// immediately instead of being recorded as skipped entries.
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -420,11 +456,21 @@ func (s *OrphanRecoveryService) recoverVolume(
 			}
 			return nil
 		}
-		if info.IsDir() {
+		if entry.IsDir() {
 			return nil
 		}
 		if limit > 0 && report.FilesRecovered >= limit {
 			return filepath.SkipAll
+		}
+
+		// WalkDir does not stat per entry (that is the point of the switch from
+		// Walk), so the size and modification time the rebuild needs are read
+		// only for a candidate file.
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			// A file that cannot be inspected is retried on the next scan, and
+			// is not counted as scanned, matching the Walk-based behaviour.
+			return nil
 		}
 
 		report.FilesScanned++
@@ -448,32 +494,173 @@ func (s *OrphanRecoveryService) recoverVolume(
 			return nil
 		}
 
-		existing, err := s.metadataRepo.Get(ctx, tenantID, fileKey)
+		pending[tenantID] = append(pending[tenantID], pendingOrphan{
+			fullPath:     path,
+			relativePath: relativePath,
+			tenantID:     tenantID,
+			fileKey:      fileKey,
+			info:         info,
+		})
+
+		if len(pending[tenantID]) < s.lookupBatchCapacity(limit, report.FilesRecovered) {
+			return nil
+		}
+
+		reachedLimit, flushErr := flush(tenantID)
+		if flushErr != nil {
+			return flushErr
+		}
+		if reachedLimit {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return walkErr
+	}
+
+	// Flush every remaining batch in a deterministic tenant order.
+	tenantIDs := make([]string, 0, len(pending))
+	for tenantID := range pending {
+		tenantIDs = append(tenantIDs, tenantID)
+	}
+	sort.Strings(tenantIDs)
+	for _, tenantID := range tenantIDs {
+		if _, err := flush(tenantID); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// lookupBatchCapacity is how many candidates one existence batch may hold.
+//
+// It never lets a batch span more files than the recovery limit still allows, so
+// a capped scan stops at exactly the file it stopped at file-by-file: if the
+// limit is large the batch is bounded by orphanLookupBatchSize, and if the limit
+// is small the batch is exactly the remaining allowance.
+func (s *OrphanRecoveryService) lookupBatchCapacity(limit int, recovered int) int {
+	capacity := orphanLookupBatchSize
+	if limit > 0 {
+		if remaining := limit - recovered; remaining < capacity {
+			capacity = remaining
+		}
+	}
+	if capacity < 1 {
+		capacity = 1
+	}
+	return capacity
+}
+
+// recoverPendingBatch resolves the buffered candidates of one tenant and rebuilds
+// the missing metadata.
+//
+// The existence check is one batched query when the repository provides it. A
+// failed batch falls back to the per-key Get path, so every file keeps the
+// failure accounting the point-query scan produced.
+func (s *OrphanRecoveryService) recoverPendingBatch(
+	ctx context.Context,
+	volumeID string,
+	pending map[string][]pendingOrphan,
+	tenantID string,
+	limit int,
+	report *core.OrphanRecoveryReport,
+) error {
+	batch := pending[tenantID]
+	delete(pending, tenantID)
+	if len(batch) == 0 {
+		return nil
+	}
+
+	if checker, ok := s.metadataRepo.(existingFileKeyChecker); ok && len(batch) > 1 {
+		keys := make([]string, 0, len(batch))
+		for _, entry := range batch {
+			keys = append(keys, entry.fileKey)
+		}
+
+		existing, batchErr := checker.ExistingFileKeys(ctx, tenantID, keys)
+		if batchErr != nil {
+			// A cancelled context must stop the scan instead of being replayed
+			// as one failing point query per file.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			// Another batch failure falls through to the per-key path below.
+		} else {
+			for _, entry := range batch {
+				if limit > 0 && report.FilesRecovered >= limit {
+					return nil
+				}
+				if existing[entry.fileKey] {
+					report.FilesSkipped++
+					continue
+				}
+				if err := s.rebuildPending(ctx, volumeID, entry, report); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	for _, entry := range batch {
+		if limit > 0 && report.FilesRecovered >= limit {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		existing, err := s.metadataRepo.Get(ctx, entry.tenantID, entry.fileKey)
 		switch {
 		case err == nil && existing != nil:
 			report.FilesSkipped++
-			return nil
+			continue
 		case err != nil && !errors.Is(err, core.ErrFileNotFound):
 			report.FilesFailed++
-			report.AddError("metadata lookup failed for tenant %s", tenantID)
-			return nil
+			report.AddError("metadata lookup failed for tenant %s", entry.tenantID)
+			continue
 		}
 
-		recovered, err := s.rebuild(ctx, volumeID, path, relativePath, tenantID, fileKey, info)
-		if err != nil {
-			report.FilesFailed++
-			report.AddError("recover failed for tenant %s: %v", tenantID, err)
-			return nil
+		if err := s.rebuildPending(ctx, volumeID, entry, report); err != nil {
+			return err
 		}
-		if !recovered {
-			report.FilesSkipped++
-			return nil
-		}
+	}
 
-		report.FilesRecovered++
-		report.BytesRecovered += info.Size()
+	return nil
+}
+
+// rebuildPending rebuilds one candidate's metadata and folds the outcome into the
+// report. A non-nil error is a cancellation only: rebuild failures are counted.
+func (s *OrphanRecoveryService) rebuildPending(
+	ctx context.Context,
+	volumeID string,
+	entry pendingOrphan,
+	report *core.OrphanRecoveryReport,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	recovered, err := s.rebuild(ctx, volumeID, entry.fullPath, entry.relativePath, entry.tenantID, entry.fileKey, entry.info)
+	if err != nil {
+		report.FilesFailed++
+		report.AddError("recover failed for tenant %s: %v", entry.tenantID, err)
 		return nil
-	})
+	}
+	if !recovered {
+		report.FilesSkipped++
+		return nil
+	}
+
+	report.FilesRecovered++
+	report.BytesRecovered += entry.info.Size()
+	return nil
 }
 
 // stableFile re-stats path and reports whether the file is unchanged since it
@@ -602,17 +789,20 @@ const recoveredDirectoryPath = "/"
 // are rejected so recovery never guesses ownership.
 func ParsePhysicalPath(relativePath string) (tenantID string, fileKey string, ok bool) {
 	cleaned := filepath.ToSlash(relativePath)
-	segments := strings.Split(cleaned, "/")
-	if len(segments) < 2 {
+
+	// The first segment is the tenant. Slicing at the separators avoids the
+	// []string a split allocates for every walked file.
+	firstSeparator := strings.IndexByte(cleaned, '/')
+	if firstSeparator <= 0 {
 		return "", "", false
 	}
 
-	tenantID = segments[0]
+	tenantID = cleaned[:firstSeparator]
 	if core.ValidateTenantID(tenantID) != nil {
 		return "", "", false
 	}
 
-	fileName := segments[len(segments)-1]
+	fileName := cleaned[strings.LastIndexByte(cleaned, '/')+1:]
 	if extension := strings.IndexByte(fileName, '.'); extension >= 0 {
 		fileName = fileName[:extension]
 	}
@@ -625,15 +815,23 @@ func ParsePhysicalPath(relativePath string) (tenantID string, fileKey string, ok
 
 // isFileKey reports whether value is a 32-character lowercase hexadecimal key,
 // the exact shape produced by the storage pool.
+//
+// The validation is a byte range check: it rejects uppercase (and every
+// non-ASCII byte) without the string copy ToLower and the decoding allocation
+// hex.DecodeString paid per walked file.
 func isFileKey(value string) bool {
 	if len(value) != 32 {
 		return false
 	}
-	if strings.ToLower(value) != value {
-		return false
+
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
 	}
-	_, err := hex.DecodeString(value)
-	return err == nil
+
+	return true
 }
 
 func sortedVolumeIDs(volumes map[string]core.StorageVolume) []string {

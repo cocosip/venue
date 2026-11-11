@@ -527,19 +527,28 @@ func TestSaveImportedFilesHistory_CapsHistorySize(t *testing.T) {
 	// assertion used to demand maxImportedFilesHistory+25 live entries, which
 	// encoded the unbounded-growth defect: the in-process history then grew for
 	// the whole process lifetime while only the persisted copy was trimmed.
-	if got := w.importedEntryCount(); got != maxImportedFilesHistory {
-		t.Fatalf("in-memory entries = %d, want the cap %d", got, maxImportedFilesHistory)
+	//
+	// Eviction trims a whole batch down to importedHistoryEvictionTarget, so the
+	// resident size is bounded by the cap but not pinned to it.
+	resident := w.importedEntryCount()
+	if resident > maxImportedFilesHistory {
+		t.Fatalf("in-memory entries = %d, want at most the cap %d", resident, maxImportedFilesHistory)
+	}
+	if resident < importedHistoryEvictionTarget {
+		t.Fatalf("in-memory entries = %d, want at least the batch-trim target %d", resident, importedHistoryEvictionTarget)
 	}
 
-	// The entries retained by the cap are the newest ones: the oldest 25 are
-	// evicted, so a restart cannot silently re-import them.
-	for i := 0; i < 25; i++ {
+	// The entries retained by the cap are the newest ones: the oldest entries
+	// are evicted, so a restart cannot silently re-import them.
+	total := maxImportedFilesHistory + 25
+	dropped := total - resident
+	for i := 0; i < dropped; i++ {
 		if _, ok := w.importedFiles.Load(filepath.Join(root, fmt.Sprintf("file-%05d.csv", i))); ok {
 			t.Fatalf("oldest entry %d survived the cap, want the oldest entries evicted", i)
 		}
 	}
-	if _, ok := w.importedFiles.Load(filepath.Join(root, "file-00025.csv")); !ok {
-		t.Fatalf("entry 25 was evicted, want only the oldest 25 dropped by the cap")
+	if _, ok := w.importedFiles.Load(filepath.Join(root, fmt.Sprintf("file-%05d.csv", dropped))); !ok {
+		t.Fatalf("entry %d was evicted, want only the oldest %d dropped by the cap", dropped, dropped)
 	}
 	if _, ok := w.importedFiles.Load(filepath.Join(root, fmt.Sprintf("file-%05d.csv", maxImportedFilesHistory+24))); !ok {
 		t.Fatalf("newest entry was dropped by the cap")
@@ -556,8 +565,8 @@ func TestSaveImportedFilesHistory_CapsHistorySize(t *testing.T) {
 		t.Fatalf("loadImportedFilesHistory() error = %v", err)
 	}
 
-	if got := w.importedEntryCount(); got != maxImportedFilesHistory {
-		t.Fatalf("persisted entries = %d, want %d", got, maxImportedFilesHistory)
+	if got := w.importedEntryCount(); got != resident {
+		t.Fatalf("persisted entries = %d, want the %d resident entries", got, resident)
 	}
 
 	// Oldest entries are dropped; the newest survive.

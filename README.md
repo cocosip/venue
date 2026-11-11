@@ -851,7 +851,10 @@ runtime.StatisticsRecorder().Record("app.batch.size", int64(len(batch)), time.No
 ```
 
 `Statistics.Dimensions` selects which low-cardinality dimensions are retained;
-`tenant_id` is off by default because it is high-cardinality.
+`tenant_id` is off by default because it is high-cardinality. A measurement that
+retains no dimension reports a `nil` `Dimensions` map (ranging over a nil map or
+indexing it is safe); the measurements are ordered by name and dimension value so
+a snapshot is deterministic.
 `Statistics.MaxSeries` (default `16,384`, valid range `1024`–`262144`) bounds the
 retained series so a high-cardinality workload cannot grow memory without limit,
 and `Statistics.Retention` must be greater than or equal to
@@ -930,9 +933,9 @@ Both delays are validated as non-negative. They are `time.Duration` fields on
 `VolumeConfig`, so set them by direct assignment or in the configuration file
 (there is no fluent setter for them).
 
-The write path itself is buffered: `volumes[].writeBufferSize` (default
-`128 KiB`) batches payload writes, and `volumes[].copyBufferSize` (default
-`256 KiB`) is a pooled staging buffer reused across writes. Health and capacity
+The write path streams each payload through a pooled staging buffer
+(`volumes[].copyBufferSize`, default `256 KiB`) that is reused across writes
+instead of being allocated per file. Health and capacity
 readings are cached as well: `volumes[].healthCheckCacheTTL` (default `30s`)
 reuses a probe result, and `volumes[].spaceCacheTTL` (default `5s`) shares one
 capacity/available-space reading between `TotalCapacity` and `AvailableSpace`.
@@ -1126,10 +1129,17 @@ Median results from three local runs on 2026-09-17:
 | `BenchmarkCompleteWorkflow-22` | 3,327,882 | 27,576 | 435 |
 
 The file benchmarks use small byte readers, temporary local directories, and
-the durable default with volume fsync enabled.
-Results depend on storage hardware, antivirus scanning, power policy, Go
-version, and other host activity. They are regression evidence for this
-implementation, not a cross-machine performance guarantee.
+the durable default with volume fsync enabled. Results depend on storage
+hardware, antivirus scanning, power policy, Go version, and other host activity.
+They are regression evidence for this implementation, not a cross-machine
+performance guarantee.
+
+The two largest costs of a durable local write are deliberate: the payload
+`fsync` (`volumes[].enableFsync`) and creating the shard directory of a new file
+(`volumes[].shardingDepth`). A local CPU profile attributes roughly a third of a
+default `WriteFile` to `fsync` and about an eighth to `MkdirAll`. Turning either
+one off changes durability or the on-disk layout, so the defaults stay as
+documented; tune them only against a measured workload.
 
 ## Repository Layout
 

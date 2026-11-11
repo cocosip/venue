@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -240,6 +241,14 @@ type Recorder struct {
 	// separate timer.
 	recorded atomic.Int64
 
+	// pruning is the single-flight gate of the background prune: only one pass
+	// scans the series table at a time.
+	pruning atomic.Bool
+
+	// lastPrune is the Unix-nano instant of the last background prune start, so
+	// a burst of record counters cannot start one scan per burst.
+	lastPrune atomic.Int64
+
 	// now is the clock seam used by record-time pruning. Nil means time.Now.
 	now func() time.Time
 }
@@ -295,9 +304,46 @@ func (r *Recorder) Record(name string, value int64, timestamp time.Time, dimensi
 
 	cell.value.Add(value)
 
-	if r.recorded.Add(1)%pruneInterval == 0 {
-		r.prune(r.timeNow())
+	r.maybePrune()
+}
+
+// maybePrune starts the periodic prune in the background when the record counter
+// crosses the probe interval, the time gate allows it, and no prune is already
+// running.
+//
+// The scan never runs on the recording goroutine: prune is O(series) and the
+// record path is a storage hot path, so a scan here would stall the caller (and
+// every new series creation, which takes the same mutex) once per burst. The
+// single-flight gate and the elapsed-time gate keep the number of background
+// passes bounded; Snapshot still prunes synchronously so an idle recorder cannot
+// accumulate expired buckets.
+func (r *Recorder) maybePrune() {
+	if r.recorded.Add(1)%pruneInterval != 0 {
+		return
 	}
+
+	now := r.timeNow()
+	last := r.lastPrune.Load()
+	if last != 0 && now.UnixNano()-last < int64(r.pruneSpacing()) {
+		return
+	}
+	if !r.pruning.CompareAndSwap(false, true) {
+		return
+	}
+
+	r.lastPrune.Store(now.UnixNano())
+
+	go func() {
+		defer r.pruning.Store(false)
+		r.prune(now)
+	}()
+}
+
+// pruneSpacing is the minimum interval between two background prunes. One
+// window is frequent enough to keep the retained bucket count bounded by
+// Retention/WindowSize, and it scales with the configured resolution.
+func (r *Recorder) pruneSpacing() time.Duration {
+	return r.opts.WindowSize
 }
 
 // StatisticsEnabled reports that this recorder retains deltas.
@@ -433,24 +479,37 @@ func (r *Recorder) Snapshot(query core.StatisticsQuery) core.StatisticsSnapshot 
 		return true
 	})
 
-	measurements := make([]core.StatisticsMeasurement, 0, len(totals)+1)
-
 	// Deterministic order: the series table iterates in an unspecified order,
-	// so measurements are sorted by name and then by dimension value.
-	aggregates := make([]aggregateKey, 0, len(totals))
-	for aggregate := range totals {
-		aggregates = append(aggregates, aggregate)
+	// so measurements are sorted by name and then by dimension value. The order
+	// key is rendered once per aggregate instead of once per sort comparison,
+	// and each entry carries its total so the value is not looked up during the
+	// second pass.
+	type aggregateEntry struct {
+		orderKey  string
+		aggregate aggregateKey
+		value     float64
 	}
 
-	sort.Slice(aggregates, func(i, j int) bool {
-		return aggregateOrderKey(aggregates[i]) < aggregateOrderKey(aggregates[j])
+	entries := make([]aggregateEntry, 0, len(totals))
+	for aggregate, value := range totals {
+		entries = append(entries, aggregateEntry{
+			orderKey:  aggregateOrderKey(aggregate),
+			aggregate: aggregate,
+			value:     value,
+		})
+	}
+
+	slices.SortFunc(entries, func(a, b aggregateEntry) int {
+		return strings.Compare(a.orderKey, b.orderKey)
 	})
 
-	for _, aggregate := range aggregates {
+	measurements := make([]core.StatisticsMeasurement, 0, len(entries)+1)
+
+	for _, entry := range entries {
 		measurements = append(measurements, core.StatisticsMeasurement{
-			Name:       aggregate.name,
-			Value:      totals[aggregate],
-			Dimensions: aggregate.dimensions(),
+			Name:       entry.aggregate.name,
+			Value:      entry.value,
+			Dimensions: entry.aggregate.dimensions(),
 		})
 	}
 
@@ -469,15 +528,15 @@ func (r *Recorder) Snapshot(query core.StatisticsQuery) core.StatisticsSnapshot 
 
 	snapshot.WriteMegabytesPerSecond = megabytesPerSecond(writeBytes, throughputSeconds)
 
-	for _, aggregate := range aggregates {
-		if aggregate.name != core.StatisticStorageWriteBytes {
+	for _, entry := range entries {
+		if entry.aggregate.name != core.StatisticStorageWriteBytes {
 			continue
 		}
 
 		measurements = append(measurements, core.StatisticsMeasurement{
 			Name:       core.StatisticStorageWriteMegabytesPerSecond,
-			Value:      megabytesPerSecond(int64(totals[aggregate]), throughputSeconds),
-			Dimensions: aggregate.dimensions(),
+			Value:      megabytesPerSecond(int64(entry.value), throughputSeconds),
+			Dimensions: entry.aggregate.dimensions(),
 		})
 	}
 
@@ -486,8 +545,15 @@ func (r *Recorder) Snapshot(query core.StatisticsQuery) core.StatisticsSnapshot 
 	return snapshot
 }
 
-// dimensions returns the aggregate's dimensions as a fresh map.
+// dimensions returns the aggregate's dimensions as a fresh map, or nil when the
+// aggregate carries none. A nil map is the compact representation of "no
+// dimensions" and the common case, so a query does not allocate an empty map per
+// undimensioned measurement.
 func (a aggregateKey) dimensions() map[string]string {
+	if a.tenantID == "" && a.volumeID == "" && a.watcherID == "" && a.operation == "" {
+		return nil
+	}
+
 	dimensions := make(map[string]string, 4)
 
 	if a.tenantID != "" {
@@ -821,7 +887,15 @@ func (s *OutputService) run(ctx context.Context, done chan struct{}) {
 }
 
 // emitSummary aggregates the configured query window and logs it.
+//
+// The logging gate is checked before the aggregation: a summary that cannot be
+// emitted (no runtime, or a handler that rejects the level) must not pay for a
+// full Snapshot.
 func (s *OutputService) emitSummary(ctx context.Context) {
+	if s.rt == nil || !s.rt.Enabled(ctx, slog.LevelInfo) {
+		return
+	}
+
 	now := time.Now().UTC()
 
 	snapshot := s.reader.Snapshot(core.StatisticsQuery{
@@ -830,10 +904,6 @@ func (s *OutputService) emitSummary(ctx context.Context) {
 	})
 
 	if !s.opts.Output.IncludeEmptySnapshots && isEmpty(snapshot) {
-		return
-	}
-
-	if s.rt == nil {
 		return
 	}
 

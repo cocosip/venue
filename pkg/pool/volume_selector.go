@@ -1,9 +1,10 @@
 package pool
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/cocosip/venue/pkg/core"
 )
@@ -45,6 +46,12 @@ func (s *MostAvailableSpaceSelector) SelectVolume(ctx context.Context, volumes m
 	return candidates[0], nil
 }
 
+// volumeCandidate is one writable volume and the free space that ranked it.
+type volumeCandidate struct {
+	volume core.StorageVolume
+	space  int64
+}
+
 // SelectVolumeCandidates returns the writable volumes ordered from the most to
 // the least available space. Ties are broken by volume ID so the order is
 // deterministic.
@@ -57,12 +64,7 @@ func (s *MostAvailableSpaceSelector) SelectVolumeCandidates(
 		return nil, fmt.Errorf("no volumes available: %w", core.ErrInsufficientStorage)
 	}
 
-	type candidate struct {
-		volume core.StorageVolume
-		space  int64
-	}
-
-	candidates := make([]candidate, 0, len(volumes))
+	candidates := make([]volumeCandidate, 0, len(volumes))
 	for _, volume := range volumes {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -81,19 +83,22 @@ func (s *MostAvailableSpaceSelector) SelectVolumeCandidates(
 		if requiredBytes > 0 && space < requiredBytes {
 			continue
 		}
-		candidates = append(candidates, candidate{volume: volume, space: space})
+		candidates = append(candidates, volumeCandidate{volume: volume, space: space})
 	}
 
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no healthy volumes with available space: %w", core.ErrInsufficientStorage)
 	}
 
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].space != candidates[j].space {
-			return candidates[i].space > candidates[j].space
-		}
-		return candidates[i].volume.VolumeID() < candidates[j].volume.VolumeID()
-	})
+	// A single writable volume is already in preference order.
+	if len(candidates) > 1 {
+		slices.SortFunc(candidates, func(a, b volumeCandidate) int {
+			if a.space != b.space {
+				return cmp.Compare(b.space, a.space)
+			}
+			return cmp.Compare(a.volume.VolumeID(), b.volume.VolumeID())
+		})
+	}
 
 	result := make([]core.StorageVolume, len(candidates))
 	for i := range candidates {

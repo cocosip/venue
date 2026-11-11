@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/cocosip/venue/pkg/core"
@@ -77,7 +76,7 @@ func (s *cleanupService) CleanupJunkFiles(ctx context.Context) (*core.CleanupSta
 			return stats, err
 		}
 
-		removed, freed, err := s.cleanupJunkFilesInVolume(ctx, volumeID, volume.MountPath())
+		removed, freed, err := s.cleanupJunkFilesInVolume(ctx, volumeID, volume)
 		stats.JunkFilesRemoved += removed
 		stats.SpaceFreed += freed
 		if err != nil {
@@ -93,42 +92,48 @@ func (s *cleanupService) CleanupJunkFiles(ctx context.Context) (*core.CleanupSta
 // The walk root is not optional: an unavailable volume is reported so a broken
 // mount is distinguishable from a clean one. Every deeper failure (an unreadable
 // directory, a file that disappeared mid-walk) is best-effort.
-func (s *cleanupService) cleanupJunkFilesInVolume(ctx context.Context, volumeID string, mountPath string) (int, int64, error) {
+func (s *cleanupService) cleanupJunkFilesInVolume(ctx context.Context, volumeID string, volume core.StorageVolume) (int, int64, error) {
+	mountPath := volume.MountPath()
+
+	_, junkFiles, walkErr := walkVolumeTree(ctx, mountPath, mountPath, volumeShardDepth(volume), volumeWalkOptions{
+		collectJunkFiles: true,
+	})
+	if walkErr != nil {
+		return 0, 0, walkErr
+	}
+
+	return s.removeJunkFiles(ctx, volumeID, junkFiles)
+}
+
+// junkFile is one OS junk file discovered by a volume walk, with the size the
+// walk already read.
+type junkFile struct {
+	path string
+	size int64
+}
+
+// removeJunkFiles deletes the collected junk files and returns how many were
+// removed and how many bytes that freed. Removal is best-effort per file: a
+// locked junk file is reported and retried by a later sweep. Context cancellation
+// stops the removal and is reported, so a cancelled sweep never reports success.
+func (s *cleanupService) removeJunkFiles(ctx context.Context, volumeID string, junkFiles []junkFile) (int, int64, error) {
 	removed := 0
 	var freed int64
 
-	walkErr := filepath.Walk(mountPath, func(path string, info os.FileInfo, err error) error {
+	for _, junk := range junkFiles {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if err != nil {
-			if path == mountPath {
-				return err
-			}
-			return nil
-		}
-		if info == nil || info.IsDir() {
-			return nil
-		}
-		if !isJunkFileName(info.Name()) {
-			return nil
+			return removed, freed, ctxErr
 		}
 
-		size := info.Size()
-		if removeErr := os.Remove(path); removeErr != nil {
-			// Best-effort: a locked junk file is retried on a later sweep.
+		if removeErr := os.Remove(junk.path); removeErr != nil {
 			s.emit(ctx, slog.LevelWarn, "junk_file_delete_failed",
 				"Failed to remove a junk file",
 				slog.String("volume_id", volumeID), errorTypeAttr(removeErr))
-			return nil
+			continue
 		}
 
 		removed++
-		freed += size
-		return nil
-	})
-	if walkErr != nil {
-		return removed, freed, walkErr
+		freed += junk.size
 	}
 
 	return removed, freed, nil
