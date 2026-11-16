@@ -118,18 +118,21 @@ func NewFileWatcherAutoManager(opts *FileWatcherAutoManagerOptions) (core.FileWa
 	return manager, nil
 }
 
-// ApplyRootConfiguration creates or updates one watcher per tenant directory
-// found under root.RootPath and returns how many watchers it created or updated.
+// ApplyRootConfiguration creates or updates the watcher(s) described by a root
+// template and returns how many watchers it created or updated.
 //
 // Multi-tenant roots derive one watcher per immediate subdirectory: the watcher
-// ID is "auto-<root base name>-<directory name>", the tenant ID is the directory
-// name, and the watch path is the directory itself. A directory name that fails
-// core.ValidateTenantID is never registered: it is counted as an error and
-// reported back to the caller.
+// ID is "auto-<root base name>-<path hash>-<directory name>", the tenant ID is
+// the directory name, and the watch path is the directory itself. A directory
+// name that fails core.ValidateTenantID is never registered: it is counted as an
+// error and reported back to the caller.
 //
-// A non-multi-tenant root is rejected with core.ErrInvalidArgument, because a
-// FileWatcherRootConfiguration carries no tenant ID and root.RootPath alone
-// cannot name the tenant the watcher would import for.
+// A non-multi-tenant root becomes exactly one watcher for the root itself. The
+// root template carries no tenant ID, so the root's base name is both the
+// derived tenant ID and the tenant segment of the generated watcher ID, matching
+// the "the generated watcher ID and tenant ID come from the directory name" rule
+// the root configuration documents. A base name that fails core.ValidateTenantID
+// is never registered and is reported as an error.
 //
 // Applying the same root twice updates the generated watchers instead of
 // duplicating them, and never resurrects a watcher an operator disabled.
@@ -156,24 +159,51 @@ func (m *fileWatcherAutoManager) ApplyRootConfiguration(ctx context.Context, roo
 		return 0, fmt.Errorf("root path is not a directory: %w", core.ErrInvalidArgument)
 	}
 
-	if !rootCopy.MultiTenantMode {
-		// Defence in depth: the frozen config validation already rejects this
-		// shape, and the runtime cannot derive a tenant from a root path alone.
-		return 0, fmt.Errorf("root path %q requires MultiTenantMode: a non-multi-tenant root carries no tenant ID to import for: %w", rootCopy.RootPath, core.ErrInvalidArgument)
-	}
-
 	// Remember the root before applying so a later discovery call reuses exactly
 	// the template that produced these watchers.
 	m.rememberRoot(rootCopy)
 
-	created, applyErr := m.applyMultiTenantRoot(ctx, &rootCopy)
+	created := 0
+	var applyErr error
+
+	if rootCopy.MultiTenantMode {
+		created, applyErr = m.applyMultiTenantRoot(ctx, &rootCopy)
+	} else {
+		created, applyErr = m.applySingleTenantRoot(ctx, &rootCopy)
+	}
 
 	m.emit(ctx, slog.LevelInfo, "root_configuration_applied", "Applied file watcher root configuration",
-		slog.String("root", rootBaseName(rootCopy.RootPath)),
+		slog.String("root", rootIDBaseName(rootCopy.RootPath)),
 		slog.Bool("multi_tenant_mode", rootCopy.MultiTenantMode),
 		slog.Int("watchers", created))
 
 	return created, applyErr
+}
+
+// applySingleTenantRoot creates or updates the single watcher for a root that is
+// itself the watched tenant directory. It returns 1 when the watcher was
+// applied, and the validation error when the root's base name cannot be a tenant
+// ID.
+func (m *fileWatcherAutoManager) applySingleTenantRoot(ctx context.Context, root *core.FileWatcherRootConfiguration) (int, error) {
+	tenantID := rootIDBaseName(root.RootPath)
+
+	if err := core.ValidateTenantID(tenantID); err != nil {
+		m.emit(ctx, slog.LevelWarn, "root_directory_skipped", "Skipped a single-tenant root whose base name is not a valid tenant ID",
+			slog.Int("name_length", len(tenantID)))
+
+		return 0, fmt.Errorf("skipping single-tenant root with invalid tenant name: %w", err)
+	}
+
+	config := m.generatedWatcherConfiguration(root, tenantID)
+	// The root itself is the watched tenant directory, not a subdirectory of it.
+	config.WatchPath = root.RootPath
+	config.MultiTenantMode = false
+
+	if err := m.applyGeneratedWatcher(ctx, config); err != nil {
+		return 0, err
+	}
+
+	return 1, nil
 }
 
 // applyMultiTenantRoot creates or updates one watcher per immediate
@@ -226,14 +256,21 @@ func (m *fileWatcherAutoManager) applyMultiTenantRoot(ctx context.Context, root 
 func (m *fileWatcherAutoManager) applyTenantDirectory(ctx context.Context, root *core.FileWatcherRootConfiguration, tenantID string) error {
 	if err := core.ValidateTenantID(tenantID); err != nil {
 		m.emit(ctx, slog.LevelWarn, "tenant_directory_skipped", "Skipped a tenant directory with an invalid name",
-			slog.String("root", rootBaseName(root.RootPath)),
+			slog.String("root", rootIDBaseName(root.RootPath)),
 			slog.Int("name_length", len(tenantID)))
 
 		return fmt.Errorf("skipping tenant directory with invalid name: %w", err)
 	}
 
-	config := m.generatedWatcherConfiguration(root, tenantID)
+	return m.applyGeneratedWatcher(ctx, m.generatedWatcherConfiguration(root, tenantID))
+}
 
+// applyGeneratedWatcher registers a generated watcher, or replaces the
+// configuration of an existing one in place.
+//
+// The persisted enable/disable decision is owned by the watcher ID, so an
+// operator's disable is never reset by re-applying a root.
+func (m *fileWatcherAutoManager) applyGeneratedWatcher(ctx context.Context, config *core.FileWatcherConfiguration) error {
 	if _, err := m.fileWatcher.GetWatcher(ctx, config.WatcherID); err != nil {
 		if !errors.Is(err, core.ErrWatcherNotFound) {
 			return fmt.Errorf("failed to inspect generated watcher: %w", err)
@@ -246,9 +283,6 @@ func (m *fileWatcherAutoManager) applyTenantDirectory(ctx context.Context, root 
 		return nil
 	}
 
-	// The watcher already exists: replace its configuration in place. The
-	// persisted enable/disable decision is owned by the watcher ID, so an
-	// operator's disable is never reset by re-applying a root.
 	if err := m.fileWatcher.UpdateWatcher(ctx, config); err != nil {
 		return fmt.Errorf("failed to update generated watcher: %w", err)
 	}
@@ -598,11 +632,14 @@ func rootPathHashSegment(rootPath string) string {
 	return fmt.Sprintf("%08x", hasher.Sum64())
 }
 
-// rootIDBaseName returns the root path segment used in a generated watcher ID.
+// rootIDBaseName returns the root path segment used in a generated watcher ID
+// and as the safe logging form of a root path.
 //
 // The directory name is used verbatim so the ID stays readable and stable across
 // restarts; a path without a usable base name falls back to a constant segment
-// rather than producing an empty or trailing-separator ID.
+// rather than producing an empty or trailing-separator ID. It is also the
+// tenant ID a single-tenant root derives, since the root path carries no tenant
+// of its own.
 func rootIDBaseName(rootPath string) string {
 	base := filepath.Base(filepath.Clean(rootPath))
 
@@ -612,12 +649,6 @@ func rootIDBaseName(rootPath string) string {
 	default:
 		return base
 	}
-}
-
-// rootBaseName is the safe logging form of a root path: the base name only,
-// never the full physical path.
-func rootBaseName(rootPath string) string {
-	return rootIDBaseName(rootPath)
 }
 
 // cloneRootConfigurations copies a root list, including each element's pattern

@@ -128,7 +128,7 @@ func (r *SQLiteMetadataRepository) GetByStatusPage(ctx context.Context, tenantID
 	if len(records) == limit {
 		last := records[len(records)-1]
 		page.NextCursor = encodeSQLiteStatusPageCursor(statusPageCursor{
-			available: availableNanos(last.AvailableForProcessingAt),
+			available: optionalTimeToNanos(last.AvailableForProcessingAt),
 			created:   last.CreatedAt.UTC().UnixNano(),
 			fileKey:   last.FileKey,
 		})
@@ -373,13 +373,4 @@ func decodeSQLiteStatusPageCursor(token string) (statusPageCursor, error) {
 		created:   int64(binary.BigEndian.Uint64(payload[9:17])),
 		fileKey:   string(payload[statusPageCursorHeaderSize:]),
 	}, nil
-}
-
-// availableNanos renders the availability sentinel for a cursor: a nil pointer
-// is the sentinel 0, which sorts before every real instant.
-func availableNanos(available *time.Time) int64 {
-	if available == nil {
-		return 0
-	}
-	return available.UTC().UnixNano()
 }

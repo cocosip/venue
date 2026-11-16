@@ -26,7 +26,10 @@ type FileSchedulerOptions struct {
 	RetryPolicy *core.FileRetryPolicy
 
 	// ProcessingTimeout is the duration after which a Processing file is considered timed out.
-	// Default: 30 minutes
+	// Default: 30 minutes. A negative value is rejected by NewFileScheduler with
+	// core.ErrInvalidArgument: it cannot express a cutoff, and every use of it
+	// (the empty-queue reclaim, the background pass, ResetTimedOutFiles) would
+	// either invert the cutoff or silently disable the pass.
 	ProcessingTimeout time.Duration
 
 	// RecoverTimedOutOnEmptyQueue reclaims timed-out Processing files when a claim
@@ -96,6 +99,11 @@ const batchCandidateLimit = 100
 // FileSchedulerOptions.TimedOutReclaimCooldown is left at its zero value, which
 // means "unset"; a negative value explicitly disables the cooldown.
 const defaultTimedOutReclaimCooldown = 30 * time.Second
+
+// resetTimedOutFilesPageSize bounds one page of the ResetTimedOutFiles drain.
+// The repository pages the timed-out set with LIMIT, so draining it in pages of
+// this size never materializes the whole set in memory at once.
+const resetTimedOutFilesPageSize = 256
 
 // claimRetryable reports whether err describes a lost claim rather than a real
 // infrastructure failure. Callers use it to decide between trying the next
@@ -236,6 +244,13 @@ func NewFileScheduler(
 
 	if effective.ProcessingTimeout == 0 {
 		effective.ProcessingTimeout = 30 * time.Minute
+	}
+	// A negative timeout passes every "not zero" check and then inverts the
+	// timed-out cutoff at the point of use (now-(-timeout) is in the future),
+	// where it either resets live claims or makes every empty-queue claim fail.
+	// Construction is the only place where the caller can still be told.
+	if effective.ProcessingTimeout < 0 {
+		return nil, fmt.Errorf("processing timeout cannot be negative: %w", core.ErrInvalidArgument)
 	}
 
 	// A zero cooldown means the option was left unset; only a negative value
@@ -851,6 +866,14 @@ func (s *fileScheduler) MarkAsCompleted(ctx context.Context, lease core.FileProc
 }
 
 // MarkAsFailed marks a file as failed and schedules retry or permanent failure.
+//
+// Like MarkAsCompleted, only a real failure transition is reported as success. A
+// repository that answers a released-lease no-op with the stored record and a nil
+// error — the lease was already reclaimed by the timeout path, for example — is
+// surfaced as core.ErrProcessingLeaseMismatch: the failure was not recorded,
+// RetryCount was not incremented, and the caller must not believe the retry
+// accounting moved. Without that check a file whose workers keep dying is
+// reclaimed forever instead of reaching PermanentlyFailed.
 func (s *fileScheduler) MarkAsFailed(ctx context.Context, lease core.FileProcessingLease, errorMessage string) error {
 	if lease.TenantID == "" {
 		return fmt.Errorf("tenant ID cannot be empty: %w", core.ErrInvalidArgument)
@@ -860,7 +883,13 @@ func (s *fileScheduler) MarkAsFailed(ctx context.Context, lease core.FileProcess
 	}
 
 	now := time.Now()
-	_, err := s.metadataRepo.CompareAndUpdateProcessing(ctx, lease, func(metadata *core.FileMetadata) error {
+	// applied records that the repository actually ran the update closure: the
+	// released-lease no-op returns the stored record with a nil error without
+	// calling it, and a record left Pending by the reclaim is indistinguishable
+	// from a retry by status alone.
+	applied := false
+	metadata, err := s.metadataRepo.CompareAndUpdateProcessing(ctx, lease, func(metadata *core.FileMetadata) error {
+		applied = true
 		metadata.RetryCount++
 		metadata.LastFailedAt = &now
 		metadata.LastError = errorMessage
@@ -886,6 +915,14 @@ func (s *fileScheduler) MarkAsFailed(ctx context.Context, lease core.FileProcess
 	})
 	if err != nil {
 		return fmt.Errorf("failed to fail processing lease: %w", err)
+	}
+
+	if !applied || metadata == nil ||
+		(metadata.Status != core.FileStatusPending && metadata.Status != core.FileStatusPermanentlyFailed) {
+		return fmt.Errorf(
+			"failure did not transition the file to Pending or PermanentlyFailed: %w",
+			core.ErrProcessingLeaseMismatch,
+		)
 	}
 
 	return nil
@@ -923,9 +960,11 @@ func (s *fileScheduler) GetFileStatus(ctx context.Context, tenant core.TenantCon
 // instant, which is already claimable: pkg/metadata compares inclusively
 // (available_for_processing_at <= now), so a stored availability that equals the
 // current instant is claimable and coarse platform clock granularity cannot leave
-// the recovered file invisible. Files whose processing lease was replaced
-// concurrently are skipped, and a request that is canceled mid-loop returns
-// ctx.Err() with the count reached so far.
+// the recovered file invisible. It drains the timed-out set in bounded pages of
+// resetTimedOutFilesPageSize candidates, so a large backlog is never materialized
+// in one query. Files whose processing lease was replaced concurrently are
+// skipped, and a request that is canceled mid-loop returns ctx.Err() with the
+// count reached so far.
 //
 // A zero timeout selects the scheduler's configured ProcessingTimeout. A negative
 // timeout is rejected with core.ErrInvalidArgument: it would invert the cutoff
@@ -946,18 +985,32 @@ func (s *fileScheduler) ResetTimedOutFiles(ctx context.Context, tenant core.Tena
 		return 0, fmt.Errorf("timeout cannot be negative: %w", core.ErrInvalidArgument)
 	}
 
-	// Unbounded scan: the cleanup cycle is expected to drain the whole set.
-	return s.resetTimedOutProcessingFiles(ctx, tenant.ID, timeout, 0)
+	// Drain the timed-out set in bounded pages instead of materializing it: each
+	// pass examines at most resetTimedOutFilesPageSize candidates, and a pass that
+	// resets a full page proves more rows may remain. Resetting removes the rows
+	// from the timed-out set, so the loop makes progress and terminates.
+	total := 0
+	for {
+		resetCount, err := s.resetTimedOutProcessingFiles(ctx, tenant.ID, timeout, resetTimedOutFilesPageSize)
+		total += resetCount
+		if err != nil {
+			return total, err
+		}
+		if resetCount < resetTimedOutFilesPageSize {
+			return total, nil
+		}
+	}
 }
 
 // resetTimedOutProcessingFiles resets timed-out Processing files to Pending
 // through the lease-checked CompareAndUpdateProcessing path.
 //
-// limit > 0 bounds how many timed-out candidates are examined, which the
-// empty-queue reclaim and the opportunistic background pass use to cap one
-// attempt; the bound is pushed into the repository query so a bounded pass
-// never materializes the whole timed-out set. limit <= 0 examines them all,
-// which is the drain-everything contract of ResetTimedOutFiles.
+// limit > 0 bounds how many timed-out candidates are examined, which every
+// production caller uses to cap one attempt (the empty-queue reclaim, the
+// opportunistic background pass, and one page of the ResetTimedOutFiles drain);
+// the bound is pushed into the repository query so a bounded pass never
+// materializes the whole timed-out set. limit <= 0 examines them all, which
+// ResetTimedOutFiles no longer requests: it drains the set in bounded pages.
 //
 // A negative timeout is rejected with core.ErrInvalidArgument for the reason
 // documented on ResetTimedOutFiles. A per-file lease mismatch is skipped, because

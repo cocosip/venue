@@ -21,6 +21,10 @@ const (
 	maxStatisticsMaxSeries     = 262144
 )
 
+// volumeTypeLocalFileSystem is the only volume type the runtime can construct.
+// It is named once so DefaultConfig, ApplyDefaults and Validate cannot drift.
+const volumeTypeLocalFileSystem = "LocalFileSystem"
+
 // Volume startup health-check defaults. The initial delay exists so a network
 // volume can finish mounting; a volume that answers the first probe is never
 // delayed.
@@ -171,12 +175,12 @@ type SqliteConfig struct {
 	// value disables periodic backups and automatic restore.
 	BackupDirectory string `json:"backupDirectory" yaml:"backupDirectory" mapstructure:"backupDirectory"`
 
-	// BackupInterval is the delay between two backup cycles. A non-positive
-	// value disables the periodic runner.
+	// BackupInterval is the delay between two backup cycles. Zero selects 1h; a
+	// negative value keeps the periodic runner from starting.
 	BackupInterval time.Duration `json:"backupInterval" yaml:"backupInterval" mapstructure:"backupInterval"`
 
 	// BackupRetention is how long a backup file is kept inside each tenant
-	// directory. A non-positive value disables pruning.
+	// directory. Zero selects 168h; a negative value disables pruning.
 	BackupRetention time.Duration `json:"backupRetention" yaml:"backupRetention" mapstructure:"backupRetention"`
 
 	// AutoRestoreFromBackup loads the newest readable backup of a tenant whose
@@ -411,8 +415,10 @@ type FileWatcherServiceConfig struct {
 	DisabledCheckInterval time.Duration `json:"disabledCheckInterval" yaml:"disabledCheckInterval" mapstructure:"disabledCheckInterval"`
 
 	// MaxParallelWatcherScans bounds how many watchers one cycle scans in
-	// parallel. Zero selects the runtime default; a negative value means
-	// sequential scanning.
+	// parallel. Zero selects the runtime default (4); a negative value is
+	// rejected by Validate. Sequential scanning is a runtime decision made
+	// through BackgroundFileWatcherService.UpdateOptions, not a configuration
+	// value, because construction treats a non-positive bound as "unset".
 	MaxParallelWatcherScans int `json:"maxParallelWatcherScans" yaml:"maxParallelWatcherScans" mapstructure:"maxParallelWatcherScans"`
 }
 
@@ -533,7 +539,8 @@ type CleanupConfig struct {
 	BackgroundTimedOutReclaimBatchSize int `json:"backgroundTimedOutReclaimBatchSize" yaml:"backgroundTimedOutReclaimBatchSize" mapstructure:"backgroundTimedOutReclaimBatchSize"`
 }
 
-// DeadLetterConfig configures where permanently failed payloads are moved when// PermanentlyFailedDisposition is "MoveToDeadLetter".
+// DeadLetterConfig configures where permanently failed payloads are moved when
+// PermanentlyFailedDisposition is "MoveToDeadLetter".
 //
 // Relative paths are resolved under the owning volume's mount path, so a
 // dead-letter area never leaves the volume that holds the payload.
@@ -654,8 +661,8 @@ func DefaultConfig() *Config {
 		},
 		Volumes: []VolumeConfig{{
 			VolumeID: "default-volume", MountPath: "./venue-storage/default",
-			VolumeType: "LocalFileSystem", ShardingDepth: 2, EnableFsync: true,
-			InitialDelay: 2 * time.Second, HealthCheckDelay: 500 * time.Millisecond,
+			VolumeType: volumeTypeLocalFileSystem, ShardingDepth: 2, EnableFsync: true,
+			InitialDelay: defaultVolumeInitialDelay, HealthCheckDelay: defaultVolumeHealthCheckDelay,
 		}},
 		Tenants:          []TenantConfig{},
 		FileWatchers:     []FileWatcherConfig{},
@@ -796,9 +803,10 @@ func (c *Config) ApplyDefaults() {
 	if c.Cleanup.DeadLetter.RootPath == "" {
 		c.Cleanup.DeadLetter.RootPath = d.Cleanup.DeadLetter.RootPath
 	}
-	if c.Cleanup.DeadLetter.ShardingDepth == 0 {
-		c.Cleanup.DeadLetter.ShardingDepth = d.Cleanup.DeadLetter.ShardingDepth
-	}
+	// ShardingDepth is deliberately not defaulted, matching VolumeConfig: zero is a
+	// meaningful value (a flat layout) that validateDeadLetter accepts, so
+	// rewriting it to 2 would make the flat layout unreachable. DefaultConfig
+	// supplies the documented depth of 2 explicitly.
 	if c.MetadataDirectory == "" {
 		c.MetadataDirectory = d.MetadataDirectory
 	}
@@ -948,21 +956,21 @@ func (c *Config) ApplyDefaults() {
 		if root.PostImportAction == "" {
 			root.PostImportAction = "Delete"
 		}
-		if root.SourceCleanupFailureDirectory == "" {
-			root.SourceCleanupFailureDirectory = defaultSourceCleanupFailureDirectory
-		}
+		// SourceCleanupFailureDirectory is deliberately not defaulted here: the
+		// field documents an empty value as "leave the source in place after the
+		// final failed attempt", which pkg/watcher honours, so filling it in would
+		// make that documented value unreachable. NewFileWatcherConfig supplies the
+		// quarantine default for callers that want it.
 		applyFileWatcherRootAdvancedDefaults(root)
 	}
 	for i := range c.Volumes {
 		if c.Volumes[i].VolumeType == "" {
-			c.Volumes[i].VolumeType = "LocalFileSystem"
+			c.Volumes[i].VolumeType = volumeTypeLocalFileSystem
 		}
-		if c.Volumes[i].InitialDelay == 0 {
-			c.Volumes[i].InitialDelay = defaultVolumeInitialDelay
-		}
-		if c.Volumes[i].HealthCheckDelay == 0 {
-			c.Volumes[i].HealthCheckDelay = defaultVolumeHealthCheckDelay
-		}
+		// InitialDelay and HealthCheckDelay are deliberately not defaulted: zero
+		// means "no wait" on both sides (see the field godoc and venue.waitForVolume),
+		// so defaulting them here would make the documented zero unreachable.
+		// DefaultConfig supplies the documented 2s/500ms explicitly.
 		if c.Volumes[i].SpaceCacheTTL == 0 {
 			c.Volumes[i].SpaceCacheTTL = defaultVolumeSpaceCacheTTL
 		}
@@ -986,9 +994,8 @@ func (c *Config) ApplyDefaults() {
 		if c.FileWatchers[i].PostImportAction == "" {
 			c.FileWatchers[i].PostImportAction = "Delete"
 		}
-		if c.FileWatchers[i].SourceCleanupFailureDirectory == "" {
-			c.FileWatchers[i].SourceCleanupFailureDirectory = defaultSourceCleanupFailureDirectory
-		}
+		// See the roots loop: an empty SourceCleanupFailureDirectory is the
+		// documented "leave the source in place" value, so it is not defaulted.
 		applyFileWatcherAdvancedDefaults(&c.FileWatchers[i])
 	}
 }
@@ -1111,6 +1118,15 @@ func (c *Config) Validate() error {
 		volumeIDs[volume.VolumeID] = true
 		if volume.MountPath == "" {
 			return fmt.Errorf("volume[%d]: MountPath is required", i)
+		}
+		// Validate the type here, not only inside NewVenue: an unsupported type
+		// used to pass Validate and fail after the tenant manager, the metadata
+		// repository and the quota repository were already opened. ApplyDefaults
+		// has already replaced an empty type with LocalFileSystem, so only the
+		// explicit values reach this check.
+		if volume.VolumeType != volumeTypeLocalFileSystem {
+			return fmt.Errorf("volume[%d]: VolumeType %q is not supported; the only supported type is %s",
+				i, volume.VolumeType, volumeTypeLocalFileSystem)
 		}
 		if volume.ShardingDepth < 0 || volume.ShardingDepth > 3 {
 			return fmt.Errorf("volume[%d]: ShardingDepth must be between 0 and 3", i)
@@ -1264,15 +1280,13 @@ func validateSqlite(sqlite *SqliteConfig) error {
 	if sqlite.OpenDatabaseIdleTimeout < 0 {
 		return fmt.Errorf("Sqlite.OpenDatabaseIdleTimeout cannot be negative")
 	}
-	if sqlite.CorruptedDatabaseRetention < 0 {
-		return fmt.Errorf("Sqlite.CorruptedDatabaseRetention cannot be negative")
-	}
-	if sqlite.BackupInterval < 0 {
-		return fmt.Errorf("Sqlite.BackupInterval cannot be negative")
-	}
-	if sqlite.BackupRetention < 0 {
-		return fmt.Errorf("Sqlite.BackupRetention cannot be negative")
-	}
+	// The three retention/interval knobs below follow the project's negative-form
+	// convention: zero selects the documented default, a negative value disables
+	// the behaviour it guards. They are deliberately accepted here because the
+	// components implement exactly that: a negative quarantine retention disables
+	// pruning in both the repositories and the cleanup sweep, a negative backup
+	// interval keeps the periodic runner from starting, and a negative backup
+	// retention disables pruning in the backup runner.
 	if sqlite.AutoRestoreFromBackup && sqlite.BackupDirectory == "" {
 		return fmt.Errorf("Sqlite.AutoRestoreFromBackup requires Sqlite.BackupDirectory")
 	}
@@ -1477,6 +1491,19 @@ func validateFileWatcherService(service *FileWatcherServiceConfig) error {
 		service.MinimumPollingInterval > service.MaximumPollingInterval {
 		return fmt.Errorf("FileWatcherService.MinimumPollingInterval must not exceed MaximumPollingInterval")
 	}
+	// The runtime rejects a default interval outside the clamp bounds and then
+	// discards the whole options block, silently replacing an operator's other
+	// settings with defaults. Validate the same bounds here so an invalid schedule
+	// fails at construction instead. Zero means "unset" on both sides and is
+	// therefore not compared.
+	if service.DefaultPollingInterval > 0 && service.MinimumPollingInterval > 0 &&
+		service.DefaultPollingInterval < service.MinimumPollingInterval {
+		return fmt.Errorf("FileWatcherService.DefaultPollingInterval must not be shorter than MinimumPollingInterval")
+	}
+	if service.DefaultPollingInterval > 0 && service.MaximumPollingInterval > 0 &&
+		service.DefaultPollingInterval > service.MaximumPollingInterval {
+		return fmt.Errorf("FileWatcherService.DefaultPollingInterval must not exceed MaximumPollingInterval")
+	}
 	if service.DisabledCheckInterval < 0 {
 		return fmt.Errorf("FileWatcherService.DisabledCheckInterval cannot be negative")
 	}
@@ -1544,9 +1571,18 @@ func validateFileWatcherRoots(roots []FileWatcherRootConfig) error {
 		}
 		seen[root.RootPath] = true
 		if !root.MultiTenantMode {
-			// A single-tenant root has no tenant directory to infer a tenant
-			// from, so the runtime cannot generate a usable watcher.
-			return fmt.Errorf("watcherRoots[%d]: MultiTenantMode must be true for a derived watcher", i)
+			// A single-tenant root has no tenant directory to infer a tenant from,
+			// so the runtime derives the tenant from the root's base name. Validate
+			// that derivation here rather than failing inside NewVenue after the
+			// tenant manager, the metadata repository and the quota repository are
+			// already open.
+			base := filepath.Base(filepath.Clean(root.RootPath))
+			if base == "" || base == "." || base == ".." || base == string(filepath.Separator) {
+				return fmt.Errorf("watcherRoots[%d]: a single-tenant RootPath must name a directory", i)
+			}
+			if err := core.ValidateTenantID(base); err != nil {
+				return fmt.Errorf("watcherRoots[%d]: MultiTenantMode is false, so the RootPath base name becomes the tenant ID: %w", i, err)
+			}
 		}
 		if root.PostImportAction != "Delete" && root.PostImportAction != "Move" && root.PostImportAction != "Keep" {
 			return fmt.Errorf("watcherRoots[%d]: PostImportAction must be 'Delete', 'Move', or 'Keep'", i)

@@ -9,17 +9,10 @@ import (
 	"github.com/cocosip/venue/pkg/core"
 )
 
-// VolumeSelector selects a storage volume for writing files.
-type VolumeSelector interface {
-	// SelectVolume selects a volume from the available volumes.
-	SelectVolume(ctx context.Context, volumes map[string]core.StorageVolume) (core.StorageVolume, error)
-}
-
-// VolumeCandidateSelector is an optional VolumeSelector extension that returns
-// every writable volume in preference order so the storage pool can retry a
-// failed write on the next candidate. requiredBytes <= 0 means "no size
-// constraint"; otherwise only volumes reporting at least that much free space
-// are returned.
+// VolumeCandidateSelector returns every writable volume in preference order so
+// the storage pool can retry a failed write on the next candidate.
+// requiredBytes <= 0 means "no size constraint"; otherwise only volumes
+// reporting at least that much free space are returned.
 type VolumeCandidateSelector interface {
 	// SelectVolumeCandidates returns writable volumes ordered by preference.
 	SelectVolumeCandidates(
@@ -36,15 +29,6 @@ type VolumeCandidateSelector interface {
 // The storage pool uses this selector exclusively. A different selection policy
 // would need a new option on StoragePool, so no other selector is shipped.
 type MostAvailableSpaceSelector struct{}
-
-// SelectVolume selects the volume with the most available space.
-func (s *MostAvailableSpaceSelector) SelectVolume(ctx context.Context, volumes map[string]core.StorageVolume) (core.StorageVolume, error) {
-	candidates, err := s.SelectVolumeCandidates(ctx, volumes, 0)
-	if err != nil {
-		return nil, err
-	}
-	return candidates[0], nil
-}
 
 // volumeCandidate is one writable volume and the free space that ranked it.
 type volumeCandidate struct {

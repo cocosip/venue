@@ -5,8 +5,25 @@ package volume
 import (
 	"context"
 	"fmt"
+	"os"
 	"syscall"
 )
+
+// syncDirectory flushes a directory's entries so a newly created file name is
+// durable, not just its contents.
+//
+// It is best-effort by contract: the caller treats a failure as a lost
+// optimization, because not every filesystem supports fsync on a directory, and
+// the file contents were already synced.
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = directory.Close() }()
+
+	return directory.Sync()
+}
 
 // probeDiskSpace reads total capacity and available space with one statfs call
 // (Unix implementation).

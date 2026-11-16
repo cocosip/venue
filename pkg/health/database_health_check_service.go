@@ -51,9 +51,13 @@ type DatabaseHealthCheckService struct {
 	checkOnStartupOnly    bool
 	periodicCheckInterval time.Duration
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// lifecycleMu guards ctx and cancel. They are republished on every Start, so
+	// an unguarded read from a concurrently stopping or finishing goroutine is a
+	// data race even though the values are only ever replaced, never mutated.
+	lifecycleMu sync.RWMutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 	// running is atomic because the run goroutine itself clears it when the
 	// startup-only loop finishes: the flag tracks the goroutine, not just the
 	// Stop call, and Stop must not hold a mutex across wg.Wait.
@@ -114,17 +118,28 @@ func NewDatabaseHealthCheckService(opts *DatabaseHealthCheckServiceOptions) (*Da
 }
 
 // Start starts the database health check service.
+//
+// The context is created before the running flag is claimed and published under
+// lifecycleMu together with the WaitGroup registration, so a concurrent Stop can
+// never observe running == true without a usable context, and can never return
+// from wg.Wait before the run goroutine has registered itself.
 func (s *DatabaseHealthCheckService) Start() error {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s.lifecycleMu.Lock()
 	if !s.running.CompareAndSwap(false, true) {
+		s.lifecycleMu.Unlock()
+		cancel()
 		return fmt.Errorf("database health check service is already running")
 	}
-
-	s.ctx, s.cancel = context.WithCancel(context.Background())
-
+	s.ctx = ctx
+	s.cancel = cancel
 	s.wg.Add(1)
+	s.lifecycleMu.Unlock()
+
 	go s.run()
 
-	s.emit(s.ctx, slog.LevelInfo, "started", "Database health check service started")
+	s.emit(ctx, slog.LevelInfo, "started", "Database health check service started")
 
 	return nil
 }
@@ -133,7 +148,8 @@ func (s *DatabaseHealthCheckService) Start() error {
 //
 // Stop does not hold a mutex while joining the run goroutine: in startup-only
 // mode that goroutine clears the running flag itself when its loop ends, so a
-// mutex across wg.Wait could interleave with it.
+// mutex across wg.Wait could interleave with it. lifecycleMu is therefore held
+// only long enough to claim the flag and read the context.
 //
 // A service whose run loop already ended by itself (CheckOnStartupOnly) stops
 // successfully: the caller performed the documented lifecycle and there is
@@ -141,22 +157,38 @@ func (s *DatabaseHealthCheckService) Start() error {
 // that Venue would otherwise log as a stop failure. Stopping a service that
 // was never started remains an error, because that is a caller mistake.
 func (s *DatabaseHealthCheckService) Stop() error {
+	s.lifecycleMu.Lock()
 	if !s.running.Swap(false) {
+		s.lifecycleMu.Unlock()
 		if s.completed.Load() {
 			return nil
 		}
 		return fmt.Errorf("database health check service is not running")
 	}
+	ctx, cancel := s.ctx, s.cancel
+	s.lifecycleMu.Unlock()
 
-	s.emit(s.ctx, slog.LevelInfo, "stopping", "Stopping database health check service")
-	if s.cancel != nil {
-		s.cancel()
+	s.emit(ctx, slog.LevelInfo, "stopping", "Stopping database health check service")
+	if cancel != nil {
+		cancel()
 	}
 	s.wg.Wait()
 
-	s.emit(s.ctx, slog.LevelInfo, "stopped", "Database health check service stopped")
+	s.emit(ctx, slog.LevelInfo, "stopped", "Database health check service stopped")
 
 	return nil
+}
+
+// context returns the context of the current run. It is read under lifecycleMu
+// because Start publishes a new one on every run while the previous run's
+// goroutine may still be logging through it.
+func (s *DatabaseHealthCheckService) context() context.Context {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
 }
 
 // IsRunning returns whether the service is currently running.
@@ -168,17 +200,21 @@ func (s *DatabaseHealthCheckService) IsRunning() bool {
 func (s *DatabaseHealthCheckService) run() {
 	defer s.wg.Done()
 
-	// Initial delay to allow other services to initialize
-	s.emit(s.ctx, slog.LevelInfo, "initial_delay", "Waiting for other services to initialize", slog.Duration("delay", s.initialDelay))
+	// Initial delay to allow other services to initialize. A stoppable timer is
+	// used instead of time.After so an early Stop does not leave a pending timer
+	// behind for the whole delay.
+	initialTimer := time.NewTimer(s.initialDelay)
+	s.emit(s.context(), slog.LevelInfo, "initial_delay", "Waiting for other services to initialize", slog.Duration("delay", s.initialDelay))
 	select {
-	case <-time.After(s.initialDelay):
+	case <-initialTimer.C:
 		// Continue
-	case <-s.ctx.Done():
+	case <-s.context().Done():
+		initialTimer.Stop()
 		return
 	}
 
 	// Perform health check with retry
-	s.emit(s.ctx, slog.LevelInfo, "check_started", "Starting database health check")
+	s.emit(s.context(), slog.LevelInfo, "check_started", "Starting database health check")
 	s.performHealthCheckWithRetry()
 
 	// If startup-only mode, stop here. The loop ends, so the running flag goes
@@ -189,7 +225,7 @@ func (s *DatabaseHealthCheckService) run() {
 	if s.checkOnStartupOnly {
 		s.completed.Store(true)
 		s.running.Store(false)
-		s.emit(s.ctx, slog.LevelInfo, "startup_check_completed", "Database health check completed")
+		s.emit(s.context(), slog.LevelInfo, "startup_check_completed", "Database health check completed")
 		return
 	}
 
@@ -200,10 +236,10 @@ func (s *DatabaseHealthCheckService) run() {
 	for {
 		select {
 		case <-ticker.C:
-			s.emit(s.ctx, slog.LevelInfo, "periodic_check_started", "Performing periodic database health check")
+			s.emit(s.context(), slog.LevelInfo, "periodic_check_started", "Performing periodic database health check")
 			s.performHealthCheckWithRetry()
-		case <-s.ctx.Done():
-			s.emit(s.ctx, slog.LevelInfo, "shutting_down", "Database health check service shutting down")
+		case <-s.context().Done():
+			s.emit(s.context(), slog.LevelInfo, "shutting_down", "Database health check service shutting down")
 			return
 		}
 	}
@@ -220,20 +256,22 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 	var lastErr error
 
 	for attempt := 1; attempt <= s.maxRetries; attempt++ {
-		report, err := s.healthChecker.CheckAllDatabases(s.ctx)
+		report, err := s.healthChecker.CheckAllDatabases(s.context())
 		if err != nil {
 			lastErr = err
 			lastReport = nil
-			s.emit(s.ctx, slog.LevelWarn, "check_failed", "Health check failed",
+			s.emit(s.context(), slog.LevelWarn, "check_failed", "Health check failed",
 				slog.Int("attempt", attempt),
 				slog.Int("max_retries", s.maxRetries),
 				errorTypeAttr(err))
 
 			if attempt < s.maxRetries {
+				retryTimer := time.NewTimer(s.retryDelay)
 				select {
-				case <-time.After(s.retryDelay):
+				case <-retryTimer.C:
 					continue
-				case <-s.ctx.Done():
+				case <-s.context().Done():
+					retryTimer.Stop()
 					return
 				}
 			}
@@ -244,7 +282,7 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 		lastErr = nil
 
 		if attempt > 1 {
-			s.emit(s.ctx, slog.LevelInfo, "check_recovered", "Database health check succeeded after retries",
+			s.emit(s.context(), slog.LevelInfo, "check_recovered", "Database health check succeeded after retries",
 				slog.Int("attempt", attempt),
 				slog.Int("max_retries", s.maxRetries))
 		}
@@ -253,12 +291,12 @@ func (s *DatabaseHealthCheckService) performHealthCheckWithRetry() {
 
 	// Report results
 	if lastErr != nil {
-		s.emit(s.ctx, slog.LevelError, "check_exhausted", "Database health check failed after all retries", errorTypeAttr(lastErr))
+		s.emit(s.context(), slog.LevelError, "check_exhausted", "Database health check failed after all retries", errorTypeAttr(lastErr))
 		return
 	}
 
 	if lastReport == nil {
-		s.emit(s.ctx, slog.LevelWarn, "report_missing", "Database health check completed with no report")
+		s.emit(s.context(), slog.LevelWarn, "report_missing", "Database health check completed with no report")
 		return
 	}
 
@@ -273,33 +311,33 @@ func (s *DatabaseHealthCheckService) reportHealthStatus(report *core.DatabaseHea
 	// Check for no databases
 	if report.HealthyDatabases == 0 && len(report.CorruptedDatabases) == 0 {
 		if len(report.OrphanedTenants) > 0 {
-			s.emit(s.ctx, slog.LevelWarn, "metadata_loss_detected", "Orphaned tenants have physical files but no metadata database",
+			s.emit(s.context(), slog.LevelWarn, "metadata_loss_detected", "Orphaned tenants have physical files but no metadata database",
 				slog.Int("orphaned_tenants", len(report.OrphanedTenants)))
 		} else {
-			s.emit(s.ctx, slog.LevelInfo, "no_databases", "No database files found")
+			s.emit(s.context(), slog.LevelInfo, "no_databases", "No database files found")
 		}
 		return
 	}
 
 	// All healthy
 	if report.AllHealthy {
-		s.emit(s.ctx, slog.LevelInfo, "check_healthy", "Database health check completed; all databases are healthy",
+		s.emit(s.context(), slog.LevelInfo, "check_healthy", "Database health check completed; all databases are healthy",
 			slog.Int("count", report.HealthyDatabases))
 		return
 	}
 
 	// Some corrupted databases
-	s.emit(s.ctx, slog.LevelWarn, "check_unhealthy", "Database health check completed with issues",
+	s.emit(s.context(), slog.LevelWarn, "check_unhealthy", "Database health check completed with issues",
 		slog.Int("healthy", report.HealthyDatabases),
 		slog.Int("corrupted", len(report.CorruptedDatabases)))
 
 	for _, corrupted := range report.CorruptedDatabases {
-		s.emit(s.ctx, slog.LevelError, "database_corrupted", "Corrupted database detected",
+		s.emit(s.context(), slog.LevelError, "database_corrupted", "Corrupted database detected",
 			slog.Any("database_type", corrupted.DatabaseType),
 			slog.String("tenant_id", corrupted.TenantID))
 	}
 
-	s.emit(s.ctx, slog.LevelError, "manual_intervention_required", "Manual intervention required to repair corrupted databases")
+	s.emit(s.context(), slog.LevelError, "manual_intervention_required", "Manual intervention required to repair corrupted databases")
 }
 
 func (s *DatabaseHealthCheckService) emit(ctx context.Context, level slog.Level, event, message string, attrs ...slog.Attr) {

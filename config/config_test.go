@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -122,7 +123,6 @@ func TestValidateRejectsDuplicateAndIncompleteEntries(t *testing.T) {
 		{"sqlite cache size zero", func(c *Config) { c.Sqlite.CacheSizeKb = 0 }},
 		{"negative cleanup interval", func(c *Config) { c.Cleanup.CleanupInterval = -time.Second }},
 		{"negative timed out reclaim cooldown", func(c *Config) { c.Cleanup.TimedOutReclaimCooldown = -time.Second }},
-		{"negative corrupted database retention", func(c *Config) { c.Sqlite.CorruptedDatabaseRetention = -time.Second }},
 		{"negative failed retention", func(c *Config) { c.Cleanup.FailedFileRetentionPeriod = -time.Second }},
 		{"negative retry count", func(c *Config) { c.RetryPolicy.MaxRetryCount = -1 }},
 		{"negative orphan recovery interval", func(c *Config) { c.OrphanRecovery.RecoveryInterval = -time.Second }},
@@ -432,9 +432,157 @@ func TestApplyDefaultsRestoresSourceCleanupAndDeadLetterDefaults(t *testing.T) {
 	if partial.Cleanup.DeadLetter.ExcludeTenantFromPath || partial.Cleanup.DeadLetter.ExcludeDatePartition {
 		t.Fatalf("a partial DeadLetter config dropped the default layout: %#v", partial.Cleanup.DeadLetter)
 	}
-	if partial.Cleanup.DeadLetter.ShardingDepth != defaults.Cleanup.DeadLetter.ShardingDepth {
-		t.Fatalf("DeadLetter.ShardingDepth = %d, want the default %d",
-			partial.Cleanup.DeadLetter.ShardingDepth, defaults.Cleanup.DeadLetter.ShardingDepth)
+	// ShardingDepth is a meaningful zero (a flat layout), so ApplyDefaults must
+	// leave it alone: rewriting it would make the documented flat layout
+	// unreachable. DefaultConfig still supplies the documented depth of 2.
+	if partial.Cleanup.DeadLetter.ShardingDepth != 0 {
+		t.Fatalf("DeadLetter.ShardingDepth = %d, want the configured flat layout 0", partial.Cleanup.DeadLetter.ShardingDepth)
+	}
+	if defaults.Cleanup.DeadLetter.ShardingDepth != 2 {
+		t.Fatalf("DefaultConfig DeadLetter.ShardingDepth = %d, want 2", defaults.Cleanup.DeadLetter.ShardingDepth)
+	}
+}
+
+// TestValidateAcceptsSingleTenantWatcherRoot pins the contract that a root with
+// MultiTenantMode false becomes a single watcher: the tenant is derived from the
+// root's base name, so Validate must accept an ordinary directory and reject a
+// base name that can never be a tenant ID.
+func TestValidateAcceptsSingleTenantWatcherRoot(t *testing.T) {
+	valid := DefaultConfig()
+	valid.FileWatcherRoots = []FileWatcherRootConfig{{
+		RootPath:         filepath.Join("incoming", "acme"),
+		MultiTenantMode:  false,
+		PostImportAction: "Delete",
+	}}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want a single-tenant root to be accepted", err)
+	}
+
+	tests := []struct {
+		name     string
+		rootPath string
+	}{
+		{"base name is a reserved device name", filepath.Join("incoming", "NUL")},
+		{"base name has a trailing dot", filepath.Join("incoming", "acme.")},
+		{"base name has interior reserved characters", filepath.Join("incoming", "ac:me")},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.FileWatcherRoots = []FileWatcherRootConfig{{
+				RootPath:         test.rootPath,
+				MultiTenantMode:  false,
+				PostImportAction: "Delete",
+			}}
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Validate() error = nil for RootPath %q, want an invalid tenant ID error", test.rootPath)
+			}
+		})
+	}
+}
+
+// TestApplyDefaultsKeepsDocumentedZeroValuesUnreachable otherwise would be:
+// every field below documents its zero value as meaningful, so defaulting it
+// would make that documented value impossible to express.
+func TestApplyDefaultsKeepsDocumentedZeroValues(t *testing.T) {
+	cfg := &Config{
+		Volumes: []VolumeConfig{{
+			VolumeID: "v1", MountPath: "./storage", VolumeType: volumeTypeLocalFileSystem,
+			InitialDelay: 0, HealthCheckDelay: 0,
+		}},
+		FileWatchers: []FileWatcherConfig{{
+			WatcherID: "w1", TenantID: "t1", WatchPath: "in", PostImportAction: "Delete",
+			SourceCleanupFailureDirectory: "",
+		}},
+		FileWatcherRoots: []FileWatcherRootConfig{{
+			RootPath: "roots", SourceCleanupFailureDirectory: "",
+		}},
+	}
+	cfg.ApplyDefaults()
+
+	if cfg.Volumes[0].InitialDelay != 0 {
+		t.Errorf("Volumes[0].InitialDelay = %v, want 0 so \"zero disables the delay\" holds", cfg.Volumes[0].InitialDelay)
+	}
+	if cfg.Volumes[0].HealthCheckDelay != 0 {
+		t.Errorf("Volumes[0].HealthCheckDelay = %v, want 0 so \"zero disables the inter-attempt delay\" holds", cfg.Volumes[0].HealthCheckDelay)
+	}
+	if cfg.FileWatchers[0].SourceCleanupFailureDirectory != "" {
+		t.Errorf("FileWatchers[0].SourceCleanupFailureDirectory = %q, want \"\" so \"leaves the source in place\" holds", cfg.FileWatchers[0].SourceCleanupFailureDirectory)
+	}
+	if cfg.FileWatcherRoots[0].SourceCleanupFailureDirectory != "" {
+		t.Errorf("FileWatcherRoots[0].SourceCleanupFailureDirectory = %q, want \"\" so \"leaves the source in place\" holds", cfg.FileWatcherRoots[0].SourceCleanupFailureDirectory)
+	}
+}
+
+// TestValidateRejectsUnsupportedVolumeType keeps the volume-type whitelist at the
+// configuration boundary: NewVenue used to fail only after the tenant manager,
+// metadata repository and quota repository were already open.
+func TestValidateRejectsUnsupportedVolumeType(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Volumes[0].VolumeType = "ObjectStore"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil for an unsupported VolumeType")
+	}
+}
+
+// TestValidateRejectsDefaultPollingIntervalOutsideClamp keeps the configuration
+// boundary in step with the runtime: the watcher service rejects a default
+// interval outside [minimum, maximum] and then discards the whole options block,
+// so an invalid schedule must fail here instead of silently resetting.
+func TestValidateRejectsDefaultPollingIntervalOutsideClamp(t *testing.T) {
+	tests := []struct {
+		name    string
+		service FileWatcherServiceConfig
+		wantErr bool
+	}{
+		{
+			name: "default below the minimum",
+			service: FileWatcherServiceConfig{
+				DefaultPollingInterval: 30 * time.Second,
+				MinimumPollingInterval: time.Hour,
+				MaximumPollingInterval: 2 * time.Hour,
+			},
+			wantErr: true,
+		},
+		{
+			name: "default above the maximum",
+			service: FileWatcherServiceConfig{
+				DefaultPollingInterval: time.Hour,
+				MinimumPollingInterval: 5 * time.Second,
+				MaximumPollingInterval: 10 * time.Second,
+			},
+			wantErr: true,
+		},
+		{
+			name: "default inside the clamp",
+			service: FileWatcherServiceConfig{
+				DefaultPollingInterval: 30 * time.Second,
+				MinimumPollingInterval: 5 * time.Second,
+				MaximumPollingInterval: time.Hour,
+			},
+		},
+		{
+			name: "unset default is not compared",
+			service: FileWatcherServiceConfig{
+				MinimumPollingInterval: 5 * time.Second,
+				MaximumPollingInterval: time.Hour,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.FileWatcherService = test.service
+			err := cfg.Validate()
+			if test.wantErr && err == nil {
+				t.Fatal("Validate() error = nil, want a bounds error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("Validate() error = %v, want nil", err)
+			}
+		})
 	}
 }
 

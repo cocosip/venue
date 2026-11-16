@@ -3,7 +3,6 @@ package metadata
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/cocosip/venue/pkg/core"
 )
@@ -33,8 +32,7 @@ func (r *SQLiteMetadataRepository) CountByStatuses(
 	}
 	defer r.end(handle)
 
-	query := `SELECT COUNT(*) FROM files WHERE tenant_id = ? AND status IN (` +
-		statusPlaceholders(len(statuses)) + `)`
+	query := sqliteCountByStatusesQuery(len(statuses))
 	args := make([]any, 0, len(statuses)+1)
 	args = append(args, tenantID)
 	for _, status := range statuses {
@@ -49,6 +47,14 @@ func (r *SQLiteMetadataRepository) CountByStatuses(
 		return 0, fmt.Errorf("failed to count files by status: %w: %w", err, core.ErrDatabaseError)
 	}
 	return count, nil
+}
+
+// sqliteCountByStatusesQuery is the per-tenant aggregate. Both count queries are
+// built by a function so the covering index their plan relies on is verified
+// against the exact statement the repository issues.
+func sqliteCountByStatusesQuery(statusCount int) string {
+	return `SELECT COUNT(*) FROM files WHERE tenant_id = ? AND status IN (` +
+		fileKeyPlaceholders(statusCount) + `)`
 }
 
 // CountByDirectory aggregates one tenant's per-directory record count for the
@@ -76,8 +82,7 @@ func (r *SQLiteMetadataRepository) CountByDirectory(
 	}
 	defer r.end(handle)
 
-	query := `SELECT directory_path, COUNT(*) FROM files WHERE tenant_id = ? AND status IN (` +
-		statusPlaceholders(len(statuses)) + `) GROUP BY directory_path`
+	query := sqliteCountByDirectoryQuery(len(statuses))
 	args := make([]any, 0, len(statuses)+1)
 	args = append(args, tenantID)
 	for _, status := range statuses {
@@ -110,9 +115,12 @@ func (r *SQLiteMetadataRepository) CountByDirectory(
 	return counts, nil
 }
 
-// statusPlaceholders returns "?, ?, ..." for an IN list.
-func statusPlaceholders(count int) string {
-	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
+// sqliteCountByDirectoryQuery is the per-directory aggregate of the same status
+// filter. directory_path is the third column of idx_files_quota_counts, which is
+// what lets the grouping read the index instead of building a temporary B-tree.
+func sqliteCountByDirectoryQuery(statusCount int) string {
+	return `SELECT directory_path, COUNT(*) FROM files WHERE tenant_id = ? AND status IN (` +
+		fileKeyPlaceholders(statusCount) + `) GROUP BY directory_path`
 }
 
 // uniqueStatuses removes duplicate statuses so an IN list never counts a record

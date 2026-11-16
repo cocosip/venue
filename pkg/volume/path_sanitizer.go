@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,6 +42,10 @@ func NewPathSanitizer(rootPath string) *PathSanitizer {
 // deliberate: resolving every path would put extra syscalls on the hot write
 // path for protection that a local attacker with volume write access does not
 // need to bypass.
+//
+// Every segment is also checked for the spellings Windows resolves differently
+// than it stores (a trailing dot or space, a reserved device name); see
+// validatePathSegments.
 func (s *PathSanitizer) SanitizeAndJoin(relativePath string) (string, error) {
 	if relativePath == "" {
 		return "", fmt.Errorf("relative path cannot be empty: %w", core.ErrInvalidArgument)
@@ -66,36 +71,75 @@ func (s *PathSanitizer) SanitizeAndJoin(relativePath string) (string, error) {
 		return "", fmt.Errorf("path must not escape parent directory: %s: %w", relativePath, core.ErrPathTraversalAttempt)
 	}
 
+	// Reject segments whose spelling Windows does not preserve, so a relative
+	// path always names the file it appears to name.
+	if err := validatePathSegments(cleanRelative); err != nil {
+		return "", err
+	}
+
 	// Join with root path. The checks above prove the result cannot leave the
 	// root, so no separate Rel-based containment check is needed.
 	return filepath.Join(s.rootPath, cleanRelative), nil
 }
 
-// ValidateRelativePath validates a relative path without joining it with root.
-func (s *PathSanitizer) ValidateRelativePath(relativePath string) error {
-	if relativePath == "" {
-		return fmt.Errorf("relative path cannot be empty: %w", core.ErrInvalidArgument)
-	}
+// reservedDeviceNames are the Windows device names that resolve in every
+// directory: "root\NUL" opens the null device, so a payload "written" to one
+// never reaches the volume (the write reports success and the bytes vanish,
+// while FileExists reports the file as present). pkg/core enforces the same
+// rule for tenant identifiers, but its table is unexported and scoped to
+// tenant governance, so this package keeps the path-level copy instead of
+// exporting a validation detail from core for one caller.
+var reservedDeviceNames = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM0": true, "COM1": true, "COM2": true, "COM3": true, "COM4": true,
+	"COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT0": true, "LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true,
+	"LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+}
 
-	// Check for suspicious patterns
-	if err := s.checkSuspiciousPatterns(relativePath); err != nil {
-		return err
-	}
-
-	// Clean path
-	cleanPath := filepath.Clean(relativePath)
-
-	// Must not be absolute
-	if filepath.IsAbs(cleanPath) {
-		return fmt.Errorf("path must be relative, not absolute: %s: %w", relativePath, core.ErrInvalidArgument)
-	}
-
-	// Must not start with a parent segment; see SanitizeAndJoin.
-	if isParentReference(cleanPath) {
-		return fmt.Errorf("path must not escape parent directory: %s: %w", relativePath, core.ErrPathTraversalAttempt)
+// validatePathSegments rejects the segment spellings Windows resolves to a
+// different name than the one written.
+//
+// A segment with a trailing dot or space is stripped by the filesystem, so
+// "a." and "a " both name "a": two distinct relative paths would collapse onto
+// one payload and a write could land on a file another path already owns. A
+// reserved device name (case-insensitively, and with any extension: "nul" and
+// "con.json" are devices) is resolved outside the volume entirely.
+//
+// The rule is unconditional rather than GOOS-gated, matching the reserved
+// filename characters above: Venue-managed paths are system-generated and never
+// carry these spellings, so one invariant is cheaper to reason about than
+// platform-dependent acceptance. Trailing dots and spaces are reported like the
+// path-identity hazard they are (both ErrInvalidArgument and
+// ErrPathTraversalAttempt, mirroring core.ValidateTenantID); a device name is
+// ErrInvalidArgument.
+func validatePathSegments(cleanPath string) error {
+	for _, segment := range strings.Split(cleanPath, string(os.PathSeparator)) {
+		if segment == "" {
+			continue
+		}
+		if trimmed := strings.TrimRight(segment, ". "); trimmed != segment {
+			return fmt.Errorf(
+				"path segment %q ends with a dot or space: %w",
+				segment,
+				errors.Join(core.ErrInvalidArgument, core.ErrPathTraversalAttempt),
+			)
+		}
+		if reservedDeviceNames[deviceNameKey(segment)] {
+			return fmt.Errorf("path segment %q is a reserved device name: %w", segment, core.ErrInvalidArgument)
+		}
 	}
 
 	return nil
+}
+
+// deviceNameKey returns the device-name key of a segment: the part before the
+// first dot, upper-cased, because Windows resolves "nul.txt" to the NUL device.
+func deviceNameKey(segment string) string {
+	if index := strings.IndexByte(segment, '.'); index >= 0 {
+		segment = segment[:index]
+	}
+	return strings.ToUpper(segment)
 }
 
 // checkSuspiciousPatterns checks for common path traversal patterns.
@@ -145,62 +189,6 @@ func isParentReference(cleanPath string) bool {
 		return len(cleanPath) > 2 && os.IsPathSeparator(cleanPath[2])
 	}
 	return false
-}
-
-// GetRootPath returns the root path.
-func (s *PathSanitizer) GetRootPath() string {
-	return s.rootPath
-}
-
-// IsAbsolute checks if a path is absolute.
-func IsAbsolute(path string) bool {
-	return filepath.IsAbs(path)
-}
-
-// SanitizeFilename sanitizes a filename (without path separators).
-// This is useful for sanitizing file keys or original file names.
-func SanitizeFilename(filename string) (string, error) {
-	if filename == "" {
-		return "", fmt.Errorf("filename cannot be empty: %w", core.ErrInvalidArgument)
-	}
-
-	// Check for path separators
-	if strings.ContainsAny(filename, "/\\") {
-		return "", fmt.Errorf("filename must not contain path separators: %s: %w", filename, core.ErrInvalidArgument)
-	}
-
-	// Check for null bytes
-	if strings.Contains(filename, "\x00") {
-		return "", fmt.Errorf("filename contains null byte: %w", core.ErrInvalidArgument)
-	}
-
-	// Check for control characters
-	for _, r := range filename {
-		if r < 32 && r != '\t' {
-			return "", fmt.Errorf("filename contains control character: %w", core.ErrInvalidArgument)
-		}
-	}
-
-	// Clean the filename
-	clean := filepath.Base(filename)
-
-	// Ensure it's not . or ..
-	if clean == "." || clean == ".." {
-		return "", fmt.Errorf("filename cannot be '.' or '..': %w", core.ErrInvalidArgument)
-	}
-
-	return clean, nil
-}
-
-// ExtractExtension extracts file extension from a filename.
-// Returns empty string if no extension.
-func ExtractExtension(filename string) string {
-	if filename == "" {
-		return ""
-	}
-
-	ext := filepath.Ext(filename)
-	return ext
 }
 
 // maxExtensionLength caps the length of an extension that may become part of a
@@ -290,10 +278,4 @@ func BuildShardedPath(fileKey string, shardDepth int) (string, error) {
 	parts = append(parts, fileKey)
 
 	return filepath.Join(parts...), nil
-}
-
-// ParseShardedPath parses a sharded path to extract the file key.
-func ParseShardedPath(shardedPath string) string {
-	// The file key is always the last component
-	return filepath.Base(shardedPath)
 }

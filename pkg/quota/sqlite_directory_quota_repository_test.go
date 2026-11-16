@@ -109,11 +109,6 @@ func TestNewSQLiteDirectoryQuotaRepositoryRejectsInvalidOptions(t *testing.T) {
 			wantErr: core.ErrInvalidArgument,
 		},
 		{
-			name:    "negative corrupted database retention",
-			mutate:  func(opts *SQLiteDirectoryQuotaRepositoryOptions) { opts.CorruptedDatabaseRetention = -time.Hour },
-			wantErr: core.ErrInvalidArgument,
-		},
-		{
 			name: "unknown journal mode",
 			mutate: func(opts *SQLiteDirectoryQuotaRepositoryOptions) {
 				opts.Sqlite = sqlite.DefaultOptions()
@@ -355,6 +350,52 @@ func TestSQLiteDirectoryQuotaRepositoryUpdateCreatesMissingRow(t *testing.T) {
 	}
 	if stored.CreatedAt.IsZero() || stored.UpdatedAt.IsZero() {
 		t.Fatalf("stored timestamps = %v / %v, want both set", stored.CreatedAt, stored.UpdatedAt)
+	}
+}
+
+// TestSQLiteDirectoryQuotaRepositoryUpdateIsOneTransaction proves the
+// update-create-update sequence of a missing row is one transaction: a failure
+// after the defaults insert must not leave the persisted defaults row behind.
+//
+// The failure is injected at the database, so it exercises the real sequence
+// instead of a Go-side short circuit.
+func TestSQLiteDirectoryQuotaRepositoryUpdateIsOneTransaction(t *testing.T) {
+	ctx := context.Background()
+	repository := newSQLiteQuotaRepository(t, &SQLiteDirectoryQuotaRepositoryOptions{DataPath: t.TempDir()})
+	const directoryPath = "/transactional"
+
+	handle, err := repository.acquire(ctx, sqliteQuotaTenant)
+	if err != nil {
+		t.Fatalf("acquire() error = %v", err)
+	}
+	// The first UPDATE of the sequence matches no row, so only the retry that
+	// follows the defaults insert reaches the trigger.
+	_, triggerErr := handle.db.ExecContext(ctx, `
+CREATE TRIGGER reject_quota_update BEFORE UPDATE ON quotas
+WHEN NEW.max_count = 42
+BEGIN
+    SELECT RAISE(ABORT, 'injected quota update failure');
+END`)
+	repository.release(handle)
+	if triggerErr != nil {
+		t.Fatalf("create the injection trigger error = %v", triggerErr)
+	}
+
+	quota := &core.DirectoryQuota{DirectoryPath: directoryPath, CurrentCount: 1, MaxCount: 42, Enabled: true}
+	err = repository.Update(ctx, sqliteQuotaTenant, quota)
+	if err == nil {
+		t.Fatal("Update() error = nil, want the injected failure")
+	}
+	if !errors.Is(err, core.ErrDatabaseError) {
+		t.Fatalf("Update() error = %v, want it to wrap core.ErrDatabaseError", err)
+	}
+
+	stored, err := repository.Get(ctx, sqliteQuotaTenant, directoryPath)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if stored != nil {
+		t.Fatalf("stored quota = %+v after a failed Update(), want no row: the defaults insert was not rolled back", stored)
 	}
 }
 

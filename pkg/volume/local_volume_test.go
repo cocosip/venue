@@ -543,67 +543,6 @@ func TestLocalFileSystemVolume_BuildFilePath(t *testing.T) {
 	}
 }
 
-// TestLocalFileSystemVolume_GetFileSize tests file size retrieval.
-func TestLocalFileSystemVolume_GetFileSize(t *testing.T) {
-	ctx := context.Background()
-	volume, _ := createTestVolume(t, 0)
-
-	testCases := []struct {
-		name     string
-		content  string
-		wantSize int64
-	}{
-		{
-			name:     "Empty file",
-			content:  "",
-			wantSize: 0,
-		},
-		{
-			name:     "Small file",
-			content:  "Hello",
-			wantSize: 5,
-		},
-		{
-			name:     "Large file",
-			content:  strings.Repeat("A", 10000),
-			wantSize: 10000,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			relativePath := "size-test.txt"
-			reader := bytes.NewReader([]byte(tc.content))
-			_, err := volume.WriteFile(ctx, relativePath, reader)
-			if err != nil {
-				t.Fatalf("Failed to write test file: %v", err)
-			}
-
-			size, err := volume.GetFileSize(ctx, relativePath)
-			if err != nil {
-				t.Fatalf("Expected no error, got %v", err)
-			}
-
-			if size != tc.wantSize {
-				t.Errorf("Expected size %d, got %d", tc.wantSize, size)
-			}
-
-			// Clean up
-			_ = volume.DeleteFile(ctx, relativePath)
-		})
-	}
-
-	t.Run("Non-existent file", func(t *testing.T) {
-		_, err := volume.GetFileSize(ctx, "non-existent.txt")
-		if err == nil {
-			t.Fatal("Expected error for non-existent file, got nil")
-		}
-		if err != core.ErrFileNotFound {
-			t.Errorf("Expected ErrFileNotFound, got %v", err)
-		}
-	})
-}
-
 // TestLocalFileSystemVolume_ShardedFileOperations tests file operations with sharding.
 func TestLocalFileSystemVolume_ShardedFileOperations(t *testing.T) {
 	ctx := context.Background()
@@ -664,16 +603,6 @@ func TestLocalFileSystemVolume_ShardedFileOperations(t *testing.T) {
 
 			if string(content) != testContent {
 				t.Errorf("Expected content %s, got %s", testContent, string(content))
-			}
-
-			// Get file size
-			size, err := volume.GetFileSize(ctx, relativePath)
-			if err != nil {
-				t.Fatalf("Failed to get file size: %v", err)
-			}
-
-			if size != int64(len(testContent)) {
-				t.Errorf("Expected size %d, got %d", len(testContent), size)
 			}
 
 			// Delete file

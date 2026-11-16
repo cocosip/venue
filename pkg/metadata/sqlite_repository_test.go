@@ -147,8 +147,6 @@ func TestNewSQLiteMetadataRepositoryRejectsInvalidOptions(t *testing.T) {
 		{name: "negative cache entries", mutate: func(o *SQLiteRepositoryOptions) { o.MaxCacheEntries = -1 }},
 		{name: "negative open databases", mutate: func(o *SQLiteRepositoryOptions) { o.MaxOpenDatabases = -1 }},
 		{name: "negative idle timeout", mutate: func(o *SQLiteRepositoryOptions) { o.OpenDatabaseIdleTimeout = -time.Second }},
-		{name: "negative corruption retention", mutate: func(o *SQLiteRepositoryOptions) { o.CorruptedDatabaseRetention = -1 }},
-		{name: "negative backup retention", mutate: func(o *SQLiteRepositoryOptions) { o.BackupRetention = -1 }},
 		{name: "auto restore without directory", mutate: func(o *SQLiteRepositoryOptions) { o.AutoRestoreFromBackup = true }},
 		{name: "invalid journal mode", mutate: func(o *SQLiteRepositoryOptions) { o.Sqlite.JournalMode = "SIDEWAYS" }},
 		{name: "invalid synchronous mode", mutate: func(o *SQLiteRepositoryOptions) { o.Sqlite.SynchronousMode = "SOMETIMES" }},
@@ -1100,7 +1098,7 @@ func TestSQLiteMetadataRepositoryPagingCursorResumesAfterTheLastRecord(t *testin
 		t.Fatalf("decodeSQLiteStatusPageCursor() error = %v", err)
 	}
 	want := statusPageCursor{
-		available: availableNanos(last.AvailableForProcessingAt),
+		available: optionalTimeToNanos(last.AvailableForProcessingAt),
 		created:   last.CreatedAt.UTC().UnixNano(),
 		fileKey:   last.FileKey,
 	}

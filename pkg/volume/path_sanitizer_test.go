@@ -127,8 +127,9 @@ func TestSanitizeAndJoin_RejectedEscapeClassesRemainRejected(t *testing.T) {
 // lexically below the volume root, and any path it rejects must fail with a
 // documented domain error.
 func TestSanitizeAndJoin_NoInputEscapesRoot(t *testing.T) {
-	sanitizer := NewPathSanitizer(filepath.Join(t.TempDir(), "volume-root"))
-	rootPath := sanitizer.GetRootPath()
+	rootPath := filepath.Join(t.TempDir(), "volume-root")
+	sanitizer := NewPathSanitizer(rootPath)
+	rootPath = filepath.Clean(rootPath)
 
 	inputs := []string{
 		"file.txt",
@@ -181,8 +182,14 @@ func TestNewPathSanitizer(t *testing.T) {
 		t.Fatal("Expected non-nil sanitizer")
 	}
 
-	if sanitizer.GetRootPath() != filepath.Clean(rootPath) {
-		t.Errorf("Expected root path %s, got %s", filepath.Clean(rootPath), sanitizer.GetRootPath())
+	// The root is cleaned once at construction; the join is the only public
+	// read of it, so it is what the test observes.
+	joined, err := sanitizer.SanitizeAndJoin("file.txt")
+	if err != nil {
+		t.Fatalf("SanitizeAndJoin() error = %v", err)
+	}
+	if want := filepath.Join(filepath.Clean(rootPath), "file.txt"); joined != want {
+		t.Errorf("SanitizeAndJoin() = %q, want the cleaned root join %q", joined, want)
 	}
 }
 
@@ -339,209 +346,92 @@ func TestSanitizeAndJoin_EmptyPath(t *testing.T) {
 	}
 }
 
-// TestValidateRelativePath tests relative path validation.
-func TestValidateRelativePath(t *testing.T) {
+// TestSanitizeAndJoin_RejectsUnaliasedSegments pins the segment spellings
+// Windows resolves to a different name than the one stored. "a." and "a " both
+// collapse onto "a", so two distinct relative paths would name one payload; a
+// reserved device name (case-insensitively, with or without an extension)
+// resolves outside the volume entirely, where a write "succeeds" and vanishes.
+func TestSanitizeAndJoin_RejectsUnaliasedSegments(t *testing.T) {
 	sanitizer := NewPathSanitizer(filepath.Join("tmp", "test"))
 
 	testCases := []struct {
-		name         string
-		relativePath string
-		wantError    bool
-		expectedErr  error
+		name           string
+		relativePath   string
+		acceptedErrors []error
 	}{
 		{
-			name:         "Valid relative path",
-			relativePath: "file.txt",
-			wantError:    false,
+			name:           "trailing dot",
+			relativePath:   "a.",
+			acceptedErrors: []error{core.ErrInvalidArgument, core.ErrPathTraversalAttempt},
 		},
 		{
-			name:         "Valid subdirectory",
-			relativePath: "subdir/file.txt",
-			wantError:    false,
+			name:           "trailing space",
+			relativePath:   "a ",
+			acceptedErrors: []error{core.ErrInvalidArgument, core.ErrPathTraversalAttempt},
 		},
 		{
-			name:         "Empty path",
-			relativePath: "",
-			wantError:    true,
-			expectedErr:  core.ErrInvalidArgument,
-		},
-		// Note: Windows absolute paths are rejected by the unconditional
-		// reserved-filename-character rule with ErrInvalidArgument on every
-		// platform; see TestSanitizeAndJoin_PathTraversal.
-		{
-			name:         "Parent directory",
-			relativePath: "../file.txt",
-			wantError:    true,
-			expectedErr:  core.ErrPathTraversalAttempt,
+			name:           "trailing dot in a directory segment",
+			relativePath:   "dir./file.txt",
+			acceptedErrors: []error{core.ErrInvalidArgument, core.ErrPathTraversalAttempt},
 		},
 		{
-			name:         "Null byte",
-			relativePath: "file\x00.txt",
-			wantError:    true,
-			expectedErr:  core.ErrPathTraversalAttempt,
+			name:           "trailing space in a directory segment",
+			relativePath:   "dir /file.txt",
+			acceptedErrors: []error{core.ErrInvalidArgument, core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "trailing dot and space",
+			relativePath:   "a. .txt ",
+			acceptedErrors: []error{core.ErrInvalidArgument, core.ErrPathTraversalAttempt},
+		},
+		{
+			name:           "reserved device name",
+			relativePath:   "NUL",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+		{
+			name:           "reserved device name in lower case",
+			relativePath:   "nul",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+		{
+			name:           "reserved device name with an extension",
+			relativePath:   "con.json",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+		{
+			name:           "reserved device name below a directory",
+			relativePath:   "tenant/COM1",
+			acceptedErrors: []error{core.ErrInvalidArgument},
+		},
+		{
+			name:           "reserved device name in a directory segment",
+			relativePath:   "lpt9/file.txt",
+			acceptedErrors: []error{core.ErrInvalidArgument},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := sanitizer.ValidateRelativePath(tc.relativePath)
-
-			if tc.wantError {
-				if err == nil {
-					t.Fatal("Expected error, got nil")
-				}
-				if tc.expectedErr != nil && !strings.Contains(err.Error(), tc.expectedErr.Error()) {
-					t.Errorf("Expected error containing %v, got %v", tc.expectedErr, err)
-				}
+			if _, err := sanitizer.SanitizeAndJoin(tc.relativePath); err == nil {
+				t.Fatalf("SanitizeAndJoin(%q) = nil error, want rejection", tc.relativePath)
 			} else {
-				if err != nil {
-					t.Errorf("Expected no error, got %v", err)
+				for _, expected := range tc.acceptedErrors {
+					if errors.Is(err, expected) {
+						return
+					}
 				}
+				t.Errorf("SanitizeAndJoin(%q) error = %v, want one of %v", tc.relativePath, err, tc.acceptedErrors)
 			}
 		})
 	}
-}
 
-// TestSanitizeFilename tests filename sanitization.
-func TestSanitizeFilename(t *testing.T) {
-	testCases := []struct {
-		name        string
-		filename    string
-		wantResult  string
-		wantError   bool
-		expectedErr error
-	}{
-		{
-			name:       "Valid filename",
-			filename:   "file.txt",
-			wantResult: "file.txt",
-			wantError:  false,
-		},
-		{
-			name:       "Filename with spaces",
-			filename:   "my file.txt",
-			wantResult: "my file.txt",
-			wantError:  false,
-		},
-		{
-			name:       "Filename with dots",
-			filename:   "file.with.dots.txt",
-			wantResult: "file.with.dots.txt",
-			wantError:  false,
-		},
-		{
-			name:        "Empty filename",
-			filename:    "",
-			wantError:   true,
-			expectedErr: core.ErrInvalidArgument,
-		},
-		{
-			name:        "Filename with forward slash",
-			filename:    "path/file.txt",
-			wantError:   true,
-			expectedErr: core.ErrInvalidArgument,
-		},
-		{
-			name:        "Filename with backslash",
-			filename:    "path\\file.txt",
-			wantError:   true,
-			expectedErr: core.ErrInvalidArgument,
-		},
-		{
-			name:        "Filename with null byte",
-			filename:    "file\x00.txt",
-			wantError:   true,
-			expectedErr: core.ErrInvalidArgument,
-		},
-		{
-			name:        "Filename is dot",
-			filename:    ".",
-			wantError:   true,
-			expectedErr: core.ErrInvalidArgument,
-		},
-		{
-			name:        "Filename is double dot",
-			filename:    "..",
-			wantError:   true,
-			expectedErr: core.ErrInvalidArgument,
-		},
-		{
-			name:        "Filename with control character",
-			filename:    "file\x01.txt",
-			wantError:   true,
-			expectedErr: core.ErrInvalidArgument,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result, err := SanitizeFilename(tc.filename)
-
-			if tc.wantError {
-				if err == nil {
-					t.Fatal("Expected error, got nil")
-				}
-				if tc.expectedErr != nil && !strings.Contains(err.Error(), tc.expectedErr.Error()) {
-					t.Errorf("Expected error containing %v, got %v", tc.expectedErr, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Expected no error, got %v", err)
-				}
-				if result != tc.wantResult {
-					t.Errorf("Expected %s, got %s", tc.wantResult, result)
-				}
-			}
-		})
-	}
-}
-
-// TestExtractExtension tests extension extraction.
-func TestExtractExtension(t *testing.T) {
-	testCases := []struct {
-		name       string
-		filename   string
-		wantResult string
-	}{
-		{
-			name:       "File with extension",
-			filename:   "file.txt",
-			wantResult: ".txt",
-		},
-		{
-			name:       "File with multiple dots",
-			filename:   "file.tar.gz",
-			wantResult: ".gz",
-		},
-		{
-			name:       "File without extension",
-			filename:   "README",
-			wantResult: "",
-		},
-		{
-			name:       "Hidden file",
-			filename:   ".gitignore",
-			wantResult: ".gitignore", // On Windows, this is treated as extension
-		},
-		{
-			name:       "Empty filename",
-			filename:   "",
-			wantResult: "",
-		},
-		{
-			name:       "Path with extension",
-			filename:   "path/to/file.txt",
-			wantResult: ".txt",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := ExtractExtension(tc.filename)
-			if result != tc.wantResult {
-				t.Errorf("Expected %s, got %s", tc.wantResult, result)
-			}
-		})
+	// The rule must not over-reach: names that merely resemble a device, and
+	// dots inside a name, stay usable.
+	for _, relativePath := range []string{"console", "concept/file.txt", "a.b/c.d", ".venue-write-warmup-123"} {
+		if _, err := sanitizer.SanitizeAndJoin(relativePath); err != nil {
+			t.Errorf("SanitizeAndJoin(%q) error = %v, want acceptance", relativePath, err)
+		}
 	}
 }
 
@@ -630,91 +520,6 @@ func TestBuildShardedPath(t *testing.T) {
 				if result != tc.wantResult {
 					t.Errorf("Expected %s, got %s", tc.wantResult, result)
 				}
-			}
-		})
-	}
-}
-
-// TestParseShardedPath tests extracting file key from sharded path.
-func TestParseShardedPath(t *testing.T) {
-	testCases := []struct {
-		name        string
-		shardedPath string
-		wantResult  string
-	}{
-		{
-			name:        "No sharding",
-			shardedPath: "a1b2c3d4e5f6",
-			wantResult:  "a1b2c3d4e5f6",
-		},
-		{
-			name:        "One level sharding",
-			shardedPath: filepath.Join("a1", "a1b2c3d4e5f6"),
-			wantResult:  "a1b2c3d4e5f6",
-		},
-		{
-			name:        "Two level sharding",
-			shardedPath: filepath.Join("a1", "b2", "a1b2c3d4e5f6"),
-			wantResult:  "a1b2c3d4e5f6",
-		},
-		{
-			name:        "Three level sharding",
-			shardedPath: filepath.Join("a1", "b2", "c3", "a1b2c3d4e5f6"),
-			wantResult:  "a1b2c3d4e5f6",
-		},
-		{
-			name:        "Path with extension",
-			shardedPath: filepath.Join("a1", "b2", "a1b2c3d4e5f6.pdf"),
-			wantResult:  "a1b2c3d4e5f6.pdf",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := ParseShardedPath(tc.shardedPath)
-			if result != tc.wantResult {
-				t.Errorf("Expected %s, got %s", tc.wantResult, result)
-			}
-		})
-	}
-}
-
-// TestIsAbsolute tests absolute path detection.
-func TestIsAbsolute(t *testing.T) {
-	testCases := []struct {
-		name       string
-		path       string
-		wantResult bool
-	}{
-		{
-			name:       "Relative path",
-			path:       "file.txt",
-			wantResult: false,
-		},
-		{
-			name:       "Relative subdirectory",
-			path:       "subdir/file.txt",
-			wantResult: false,
-		},
-		// Note: Windows absolute path test removed - platform-specific behavior
-		// filepath.IsAbs() returns different results on Windows vs Unix
-		{
-			name:       "Current directory",
-			path:       ".",
-			wantResult: false,
-		},
-		{
-			name:       "Parent directory",
-			path:       "..",
-			wantResult: false,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := IsAbsolute(tc.path)
-			if result != tc.wantResult {
-				t.Errorf("Expected %v, got %v", tc.wantResult, result)
 			}
 		})
 	}
@@ -854,21 +659,6 @@ func TestSanitizeAndJoin_ParentSegmentPrecision(t *testing.T) {
 	for _, relativePath := range rejected {
 		if _, err := sanitizer.SanitizeAndJoin(relativePath); err == nil {
 			t.Errorf("SanitizeAndJoin(%q) = nil error, want rejection", relativePath)
-		}
-	}
-}
-
-// TestValidateRelativePath_ParentSegmentPrecision applies the same precision to
-// the validation-only entry point, which runs the checks without a root join.
-func TestValidateRelativePath_ParentSegmentPrecision(t *testing.T) {
-	sanitizer := NewPathSanitizer(filepath.Join("tmp", "test"))
-
-	if err := sanitizer.ValidateRelativePath("..data"); err != nil {
-		t.Errorf("ValidateRelativePath(..data) error = %v, want acceptance", err)
-	}
-	for _, relativePath := range []string{"../evil", `..\evil`, "a/../../b"} {
-		if err := sanitizer.ValidateRelativePath(relativePath); err == nil {
-			t.Errorf("ValidateRelativePath(%q) = nil error, want rejection", relativePath)
 		}
 	}
 }

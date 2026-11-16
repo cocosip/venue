@@ -244,8 +244,11 @@ func (s *BackgroundCleanupService) Stop() error {
 	s.mu.Lock()
 
 	if !s.running {
+		// Stop is idempotent across every background service: a deferred shutdown
+		// path calls it unconditionally, so "already stopped" is not an error. The
+		// alternative logged a spurious stop failure at LevelError.
 		s.mu.Unlock()
-		return fmt.Errorf("background cleanup service is not running")
+		return nil
 	}
 
 	ctx := s.ctx

@@ -82,7 +82,6 @@ func newLeaseMismatchError(lease core.FileProcessingLease, current *core.FileMet
 // backupFile is one entry of a backup directory.
 type backupFile struct {
 	path    string
-	size    int64
 	modTime time.Time
 }
 
@@ -156,7 +155,6 @@ func listBackupsNewestFirst(directory string) ([]backupFile, error) {
 		}
 		backups = append(backups, backupFile{
 			path:    filepath.Join(directory, entry.Name()),
-			size:    info.Size(),
 			modTime: info.ModTime(),
 		})
 	}

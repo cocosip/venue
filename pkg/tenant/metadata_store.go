@@ -44,14 +44,15 @@ func NewMetadataStore(rootPath string) (*MetadataStore, error) {
 // Save saves tenant metadata to disk.
 //
 // The write is atomic: the payload is written to a unique temporary file in the
-// same directory, flushed to disk, and then renamed over the target.
+// same directory, flushed to disk, and then renamed over the target. The store
+// lock covers only the directory-entry swap, not the payload write and its
+// fsync: each tenant owns its own file, and the unique temporary name already
+// prevents two saves from interleaving. Holding the lock across the fsync
+// serialized every tenant's Save behind one disk flush.
 func (s *MetadataStore) Save(metadata *core.TenantMetadata) error {
 	if metadata == nil {
 		return fmt.Errorf("tenant metadata cannot be nil: %w", core.ErrInvalidArgument)
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	filePath, err := s.getFilePath(metadata.TenantID)
 	if err != nil {
@@ -89,8 +90,12 @@ func (s *MetadataStore) Save(metadata *core.TenantMetadata) error {
 		return fmt.Errorf("failed to close tenant metadata temp file: %w", err)
 	}
 
-	// Atomic rename
+	// Atomic rename. The lock covers only this swap and the directory sync that
+	// follows, so a concurrent Load never observes a half-written record while
+	// the expensive payload write above stays outside the critical section.
+	s.mu.Lock()
 	if err := os.Rename(tmpPath, filePath); err != nil {
+		s.mu.Unlock()
 		_ = os.Remove(tmpPath) // Cleanup
 		return fmt.Errorf("failed to rename tenant metadata: %w", err)
 	}
@@ -101,6 +106,7 @@ func (s *MetadataStore) Save(metadata *core.TenantMetadata) error {
 	// way, and opening a directory for fsync is not portable (Windows rejects
 	// the fsync) — so a failure is deliberately not surfaced.
 	_ = s.syncDirectory(dir)
+	s.mu.Unlock()
 
 	return nil
 }

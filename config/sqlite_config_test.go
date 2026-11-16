@@ -96,9 +96,6 @@ func TestValidateSqliteNumericBounds(t *testing.T) {
 		{name: "negative busy timeout", mutate: func(s *config.SqliteConfig) { s.BusyTimeoutMs = -1 }, wantError: true},
 		{name: "negative max open databases", mutate: func(s *config.SqliteConfig) { s.MaxOpenDatabases = -1 }, wantError: true},
 		{name: "negative idle timeout", mutate: func(s *config.SqliteConfig) { s.OpenDatabaseIdleTimeout = -time.Second }, wantError: true},
-		{name: "negative corrupted retention", mutate: func(s *config.SqliteConfig) { s.CorruptedDatabaseRetention = -time.Second }, wantError: true},
-		{name: "negative backup interval", mutate: func(s *config.SqliteConfig) { s.BackupInterval = -time.Second }, wantError: true},
-		{name: "negative backup retention", mutate: func(s *config.SqliteConfig) { s.BackupRetention = -time.Second }, wantError: true},
 		{
 			name:      "auto restore requires a backup directory",
 			mutate:    func(s *config.SqliteConfig) { s.AutoRestoreFromBackup = true; s.BackupDirectory = "" },
@@ -117,6 +114,18 @@ func TestValidateSqliteNumericBounds(t *testing.T) {
 			// An empty directory disables periodic backups; the default interval
 			// must therefore not make DefaultConfig invalid.
 			mutate: func(s *config.SqliteConfig) {},
+		},
+		{
+			// The negative form is the documented "disable" marker for these three
+			// knobs: a negative quarantine retention disables pruning, a negative
+			// backup interval keeps the runner from starting, and a negative backup
+			// retention disables backup pruning. Validate must let those through.
+			name: "negative retention and interval select the documented disable",
+			mutate: func(s *config.SqliteConfig) {
+				s.CorruptedDatabaseRetention = -time.Second
+				s.BackupInterval = -time.Second
+				s.BackupRetention = -time.Second
+			},
 		},
 	}
 

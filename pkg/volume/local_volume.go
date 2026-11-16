@@ -113,7 +113,9 @@ type LocalFileSystemVolume struct {
 
 	// syncFile, syncDirectory, openFileForRead and mkdirAll are seams for
 	// deterministic tests: they default to (*os.File).Sync, syncing a directory
-	// handle, os.Open, and os.MkdirAll. Production never replaces them.
+	// handle, os.Open, and os.MkdirAll. syncDirectory is a no-op on Windows,
+	// where a directory handle cannot be flushed. Production never replaces
+	// these seams.
 	syncFile        func(*os.File) error
 	syncDirectory   func(string) error
 	openFileForRead func(string) (*os.File, error)
@@ -132,6 +134,11 @@ type LocalFileSystemVolume struct {
 	healthValue      bool
 	healthExpiresAt  time.Time
 	healthRefreshing bool
+	// healthProbing is non-nil while the first, synchronous health probe is in
+	// flight. It is closed when that probe publishes its verdict, so concurrent
+	// first callers wait on the probe itself instead of serializing on healthMu
+	// behind one filesystem syscall.
+	healthProbing chan struct{}
 	// healthForce increments on every forced probe. A background refresh that
 	// started before the forced probe must not overwrite its verdict, so the
 	// refresh publishes only when the counter still matches.
@@ -150,6 +157,17 @@ type LocalFileSystemVolume struct {
 	spaceAvailable  int64
 	spaceExpiresAt  time.Time
 	spaceRefreshing bool
+	// spaceProbing is non-nil while the first, synchronous capacity probe is in
+	// flight. It is closed when that probe publishes its outcome, so concurrent
+	// first callers wait on the probe instead of serializing on spaceMu.
+	spaceProbing chan struct{}
+	// spaceProbeErr is the outcome of the first probe a concurrent caller just
+	// waited for; nil after a successful reading.
+	spaceProbeErr error
+	// spaceForce is the mirror image of healthForce: it increments on every
+	// InvalidateSpaceCache, and a background refresh that started before the
+	// invalidation must not publish the reading the caller asked to drop.
+	spaceForce uint64
 
 	// copyBuffers reuses the payload staging buffer across writes so a large
 	// file does not allocate one per write.
@@ -269,6 +287,10 @@ func (v *LocalFileSystemVolume) AvailableSpace(ctx context.Context) (int64, erro
 
 // spaceSnapshot returns the cached capacity pair, probing on the first call and
 // refreshing an expired pair in the background.
+//
+// The first probe runs outside spaceMu: a hung or networked mount delays the
+// callers that have no reading yet, but never the callers that already have one.
+// Concurrent first callers share that probe through spaceProbing.
 func (v *LocalFileSystemVolume) spaceSnapshot(ctx context.Context) (total int64, available int64, err error) {
 	if v.spaceCacheTTL < 0 {
 		return v.probeSpace(ctx)
@@ -287,32 +309,68 @@ func (v *LocalFileSystemVolume) spaceSnapshot(ctx context.Context) (total int64,
 		total, available = v.spaceTotal, v.spaceAvailable
 		if !v.spaceRefreshing {
 			v.spaceRefreshing = true
+			force := v.spaceForce
 			refreshCtx := context.WithoutCancel(ctx)
-			go v.refreshSpace(refreshCtx)
+			go v.refreshSpace(refreshCtx, force)
 		}
 		v.spaceMu.Unlock()
 		return total, available, nil
 	}
 
-	// First reading: there is nothing cached to return, so probe synchronously.
+	// First reading: there is nothing cached to return, so the probe must run
+	// before the caller returns. It runs outside spaceMu — a hung or networked
+	// mount must not hold the lock every other caller needs — and a caller that
+	// arrives while it is in flight waits for that probe instead of starting a
+	// second one.
+	if probeDone := v.spaceProbing; probeDone != nil {
+		v.spaceMu.Unlock()
+		select {
+		case <-probeDone:
+		case <-ctx.Done():
+			// Report the cancellation instead of blocking on a probe that
+			// belongs to another caller.
+			return 0, 0, ctx.Err()
+		}
+		v.spaceMu.Lock()
+		total, available, err = v.spaceTotal, v.spaceAvailable, v.spaceProbeErr
+		v.spaceMu.Unlock()
+		return total, available, err
+	}
+
+	probeDone := make(chan struct{})
+	v.spaceProbing = probeDone
+	v.spaceMu.Unlock()
+
 	total, available, err = v.probeSpace(ctx)
+
+	v.spaceMu.Lock()
+	v.spaceProbing = nil
+	v.spaceProbeErr = err
 	if err == nil {
 		v.spaceKnown = true
 		v.spaceTotal = total
 		v.spaceAvailable = available
-		v.spaceExpiresAt = now.Add(v.spaceCacheTTL)
+		v.spaceExpiresAt = v.now().Add(v.spaceCacheTTL)
 	}
 	v.spaceMu.Unlock()
+	close(probeDone)
+
 	return total, available, err
 }
 
 // refreshSpace refreshes an expired capacity reading and publishes it.
-func (v *LocalFileSystemVolume) refreshSpace(ctx context.Context) {
+//
+// force is the invalidation counter observed when the refresh started: if
+// InvalidateSpaceCache ran meanwhile, the caller explicitly asked for a fresh
+// filesystem reading and this one — taken from the state that was already
+// invalidated — must not be published, or it would restore exactly the stale
+// value that was dropped.
+func (v *LocalFileSystemVolume) refreshSpace(ctx context.Context, force uint64) {
 	total, available, err := v.probeSpace(ctx)
 
 	v.spaceMu.Lock()
 	v.spaceRefreshing = false
-	if err == nil {
+	if v.spaceForce == force && err == nil {
 		v.spaceKnown = true
 		v.spaceTotal = total
 		v.spaceAvailable = available
@@ -328,9 +386,14 @@ func (v *LocalFileSystemVolume) refreshSpace(ctx context.Context) {
 // reading is what made the volume look writable, and the next selection must
 // observe the real free space instead of reusing the stale one. It is a no-op
 // when capacity caching is disabled.
+//
+// An in-flight background refresh is invalidated with the cache: it started
+// before this call, so its reading describes the state the caller no longer
+// trusts.
 func (v *LocalFileSystemVolume) InvalidateSpaceCache() {
 	v.spaceMu.Lock()
 	v.spaceKnown = false
+	v.spaceForce++
 	v.spaceMu.Unlock()
 }
 
@@ -342,8 +405,9 @@ func (v *LocalFileSystemVolume) InvalidateSpaceCache() {
 //
 // On a warm cache an expired verdict is refreshed in the background: the caller
 // gets the previous answer immediately and never waits for a slow or hung probe.
-// The first call has no answer to return, so it probes synchronously; a forced
-// probe should use ProbeHealth.
+// The first call has no answer to return, so it probes synchronously, outside
+// healthMu; concurrent first callers wait for that one probe rather than
+// serializing on the lock. A forced probe should use ProbeHealth.
 //
 // A cancelled or expired context never poisons the cache: a context failure
 // says nothing about the volume, and caching it would make one cancelled
@@ -380,14 +444,38 @@ func (v *LocalFileSystemVolume) IsHealthy(ctx context.Context) bool {
 		return healthy
 	}
 
-	// No known verdict yet: probe synchronously so startup and the first write
-	// observe the real state. The lock serializes concurrent first callers onto
-	// this one probe, and each of them reuses the published result.
+	// No known verdict yet: the probe must run before the caller returns, but it
+	// runs outside healthMu so a hung mount cannot hold the lock every other
+	// caller needs. A concurrent first caller waits on healthProbing — the probe
+	// itself — and reuses its verdict.
+	if probeDone := v.healthProbing; probeDone != nil {
+		v.healthMu.Unlock()
+		select {
+		case <-probeDone:
+		case <-ctx.Done():
+			// A dead context says nothing about the volume, so report the
+			// failed probe instead of waiting on another caller's probe.
+			return v.probeHealth(ctx)
+		}
+		v.healthMu.Lock()
+		healthy := v.healthValue
+		v.healthMu.Unlock()
+		return healthy
+	}
+
+	probeDone := make(chan struct{})
+	v.healthProbing = probeDone
+	v.healthMu.Unlock()
+
 	healthy := v.probeHealth(ctx)
+
+	v.healthMu.Lock()
+	v.healthProbing = nil
 	v.healthKnown = true
 	v.healthValue = healthy
-	v.healthExpiresAt = now.Add(v.healthCacheTTL)
+	v.healthExpiresAt = v.now().Add(v.healthCacheTTL)
 	v.healthMu.Unlock()
+	close(probeDone)
 
 	return healthy
 }
@@ -613,9 +701,9 @@ func (v *LocalFileSystemVolume) WriteFile(ctx context.Context, relativePath stri
 		// Syncing the file makes its contents durable, but the directory entry
 		// that names it is separate. Without this the file can be missing after
 		// a crash while its SQLite metadata row is already durable. A failure is
-		// best-effort: the directory cannot be opened for fsync on every
-		// platform (Windows rejects it), and the payload itself is already
-		// synced.
+		// best-effort: not every platform or filesystem can sync a directory
+		// (syncDirectory is a no-op on Windows), and the payload itself is
+		// already synced.
 		_ = v.syncDirectory(dir)
 	}
 
@@ -699,6 +787,12 @@ func (v *LocalFileSystemVolume) DeleteFile(ctx context.Context, relativePath str
 // os.Rename replaces unconditionally and Windows exposes no
 // MoveFileEx-without-replace through the standard library — so an atomic
 // no-replace commit is not implemented.
+//
+// The cross-filesystem fallback removes the source only after the destination is
+// committed, and treats that removal as best-effort: a committed move is a
+// success even when the duplicate source cannot be deleted. The source may
+// therefore still exist after a successful move (for example while another
+// handle keeps it open); callers that care can verify it with FileExists.
 func (v *LocalFileSystemVolume) MoveFile(ctx context.Context, fromRelativePath string, toRelativePath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -757,7 +851,9 @@ func (v *LocalFileSystemVolume) MoveFile(ctx context.Context, fromRelativePath s
 // copyFileAndRemoveSource is the cross-device fallback for MoveFile: the bytes
 // are written to a temporary file in the destination directory so the final
 // rename stays inside one filesystem and therefore publishes the destination
-// atomically. The source is only removed after that rename succeeded.
+// atomically. The source is only removed after that rename succeeded, and that
+// removal is best-effort: the commit is the point of no return, so a delete that
+// fails afterwards leaves a duplicate rather than an error.
 //
 // The caller owns the temporary file; every failure path removes it best-effort,
 // because a partially written staging file must never be mistaken for a payload.
@@ -790,17 +886,10 @@ func (v *LocalFileSystemVolume) copyFileAndRemoveSource(ctx context.Context, sou
 	}
 	stagedPath := staged.Name()
 
-	// A same-filesystem rename preserves the source's mode, so the fallback
-	// copy must too: os.CreateTemp hands back a private 0600 file, and renaming
-	// it unmodified would publish the payload with permissions the payload
-	// never had.
-	if err := staged.Chmod(sourceInfo.Mode().Perm()); err != nil {
-		return fmt.Errorf("failed to preserve the source mode on the move destination: %w", err)
-	}
-
-	// Best-effort release of the staging file: it only exists to be renamed onto
-	// the destination, so it must not outlive a failed move. Closing twice is
-	// harmless and intentionally ignored for the same reason.
+	// The staging file only exists to be renamed onto the destination, so it must
+	// not outlive a failed move. The release is registered before the first
+	// fallible call: a failure in Chmod below would otherwise leak both the open
+	// handle and a .venue-move-* file inside the volume.
 	committed := false
 	defer func() {
 		_ = staged.Close()
@@ -808,6 +897,14 @@ func (v *LocalFileSystemVolume) copyFileAndRemoveSource(ctx context.Context, sou
 			_ = os.Remove(stagedPath)
 		}
 	}()
+
+	// A same-filesystem rename preserves the source's mode, so the fallback
+	// copy must too: os.CreateTemp hands back a private 0600 file, and renaming
+	// it unmodified would publish the payload with permissions the payload
+	// never had.
+	if err := staged.Chmod(sourceInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("failed to preserve the source mode on the move destination: %w", err)
+	}
 
 	copied, err := io.Copy(staged, source)
 	if err != nil {
@@ -842,12 +939,16 @@ func (v *LocalFileSystemVolume) copyFileAndRemoveSource(ctx context.Context, sou
 	}
 	committed = true
 
-	if err := os.Remove(sourceFullPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to remove move source: %w", err)
-	}
+	// The move succeeded: the payload is durable at the destination under its
+	// final name. Deleting the source is cleanup of the duplicate, so a failure
+	// here is not a failed move and must not be reported as one — the caller
+	// would retry a move that already happened, and the retry fails at
+	// "destination already exists", leaving the payload unmovable forever.
+	//
+	// The volume keeps no logging or statistics hook, so the only way a caller
+	// can learn the source survived is to observe it (FileExists on the old
+	// path); cleanup and orphan recovery are what eventually reclaim it.
+	_ = os.Remove(sourceFullPath)
 
 	return nil
 }
@@ -930,24 +1031,4 @@ func (v *LocalFileSystemVolume) BuildPhysicalPath(tenantID string, fileKey strin
 		return "", err
 	}
 	return filepath.Join(tenantID, shardedPath), nil
-}
-
-// GetFileSize returns the size of a file in bytes.
-func (v *LocalFileSystemVolume) GetFileSize(ctx context.Context, relativePath string) (int64, error) {
-	// Sanitize and get full path
-	fullPath, err := v.sanitizer.SanitizeAndJoin(relativePath)
-	if err != nil {
-		return 0, err
-	}
-
-	// Get file info
-	info, err := os.Stat(fullPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, core.ErrFileNotFound
-		}
-		return 0, fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	return info.Size(), nil
 }

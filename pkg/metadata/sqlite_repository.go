@@ -71,8 +71,13 @@ const (
 // which no query shape reads: every status listing orders by availability first,
 // so the index only added a B-tree write to every transition. The windowed
 // maintenance queries do use idx_files_status_completed_at and
-// idx_files_status_last_failed_at, and the claim uses
-// idx_files_status_available.
+// idx_files_status_last_failed_at, the claim uses idx_files_status_available,
+// the idempotent write uses the partial idx_files_import_operation, and the
+// reconciliation aggregates use the covering idx_files_quota_counts.
+//
+// Every statement is idempotent, so a database created by an earlier revision
+// gains a new index or column simply by being opened: there is no separate
+// migration step and no data is rewritten.
 const (
 	sqliteFilesTableDDL = `
 CREATE TABLE IF NOT EXISTS files (
@@ -117,6 +122,17 @@ CREATE INDEX IF NOT EXISTS idx_files_status_completed_at
 	sqliteFilesStatusLastFailedAtIndexDDL = `
 CREATE INDEX IF NOT EXISTS idx_files_status_last_failed_at
     ON files(status, last_failed_at, file_key)`
+
+	// sqliteFilesQuotaCountIndexDDL is the covering index of the reconciliation
+	// aggregates. CountByStatuses and CountByDirectory both filter on tenant_id
+	// and status and read directory_path, and no other index starts with
+	// tenant_id: without this index SQLite can only pick a status-only index and
+	// then re-read the table for the tenant predicate, and the per-directory
+	// grouping needs a temporary B-tree because no index carries
+	// directory_path.
+	sqliteFilesQuotaCountIndexDDL = `
+CREATE INDEX IF NOT EXISTS idx_files_quota_counts
+    ON files(tenant_id, status, directory_path)`
 
 	sqliteFilesProcessingStartIndexDDL = `
 CREATE INDEX IF NOT EXISTS idx_files_processing_start
@@ -220,13 +236,11 @@ type SQLiteRepositoryOptions struct {
 	// BackupDirectory is the root of the per-tenant backup tree, which expands
 	// one level per tenant: {BackupDirectory}/{tenantId}. An empty value
 	// disables automatic restore.
+	//
+	// The repository never prunes backups: it only reads them when automatic
+	// recovery needs one. Pruning belongs to the backup runner that owns the
+	// directory, so two writers can never race over the same backup file.
 	BackupDirectory string
-
-	// BackupRetention is retained for symmetry with the backup runner's policy.
-	// The repository itself does not prune backups: it only reads them when
-	// automatic recovery needs one, and pruning there would race the runner that
-	// owns the directory.
-	BackupRetention time.Duration
 
 	// AutoRestoreFromBackup loads the newest readable backup of a tenant whose
 	// database had to be quarantined. It requires RecoverCorruptedDatabase and a
@@ -445,12 +459,9 @@ func NewSQLiteMetadataRepository(opts *SQLiteRepositoryOptions) (core.MetadataRe
 	if opts.OpenDatabaseIdleTimeout < 0 {
 		return nil, fmt.Errorf("metadata open database idle timeout cannot be negative: %w", core.ErrInvalidArgument)
 	}
-	if opts.CorruptedDatabaseRetention < 0 {
-		return nil, fmt.Errorf("metadata corrupted database retention cannot be negative: %w", core.ErrInvalidArgument)
-	}
-	if opts.BackupRetention < 0 {
-		return nil, fmt.Errorf("metadata backup retention cannot be negative: %w", core.ErrInvalidArgument)
-	}
+	// CorruptedDatabaseRetention follows the project's negative-form convention:
+	// zero selects the documented default, a negative value disables pruning, so
+	// it is deliberately not rejected here.
 	if opts.AutoRestoreFromBackup && opts.BackupDirectory == "" {
 		return nil, fmt.Errorf("metadata auto restore from backup requires a backup directory: %w", core.ErrInvalidArgument)
 	}
@@ -647,6 +658,12 @@ func (r *SQLiteMetadataRepository) Get(ctx context.Context, tenantID string, fil
 // GetByImportOperationID returns the metadata record that owns operationID for
 // one tenant. The lookup is served directly by SQLite's unique partial index;
 // no operation-ID map is retained in process memory.
+//
+// The non-empty import_operation_id predicate repeats the partial index's own
+// WHERE clause on purpose: SQLite can only use a partial index when the statement
+// proves that predicate, so leaving it out turns this hot-path lookup into a full
+// table scan. It is also the column's semantics, because an empty value means
+// "no operation id".
 func (r *SQLiteMetadataRepository) GetByImportOperationID(
 	ctx context.Context,
 	tenantID string,
@@ -665,11 +682,7 @@ func (r *SQLiteMetadataRepository) GetByImportOperationID(
 	}
 	defer r.end(handle)
 
-	row := handle.db.QueryRowContext(ctx,
-		`SELECT `+sqliteFileMetadataColumns+`
-		 FROM files
-		 WHERE tenant_id = @tenant AND import_operation_id = @operation_id
-		 LIMIT 1`,
+	row := handle.db.QueryRowContext(ctx, sqliteSelectImportOperationSQL,
 		sql.Named("tenant", tenantID),
 		sql.Named("operation_id", operationID))
 	metadata, err := sqliteScanMetadata(row)
@@ -681,6 +694,17 @@ func (r *SQLiteMetadataRepository) GetByImportOperationID(
 	}
 	return metadata, nil
 }
+
+// sqliteSelectImportOperationSQL is the idempotent-write lookup. Its predicate
+// list must stay a superset of idx_files_import_operation's WHERE clause, or the
+// planner falls back to scanning the files table.
+const sqliteSelectImportOperationSQL = `
+SELECT ` + sqliteFileMetadataColumns + `
+FROM files
+WHERE tenant_id = @tenant
+  AND import_operation_id = @operation_id
+  AND import_operation_id <> ''
+LIMIT 1`
 
 // Delete removes file metadata. Deleting a record that does not exist is not an
 // error, matching the Badger implementation's engine delete.
@@ -1381,8 +1405,30 @@ func (r *SQLiteMetadataRepository) Optimize(ctx context.Context) error {
 		}
 		r.optimizeHandle(ctx, handle)
 		r.end(handle)
+		r.closeOptimizedTenantHandle(tenantID, handle)
 	}
 	return nil
+}
+
+// closeOptimizedTenantHandle detaches and closes the handle Optimize opened for an
+// idle tenant, so the pass really opens, compacts and closes it instead of pinning
+// one file handle per tenant until shutdown.
+//
+// The handle is removed only when it is still the one this pass opened and no
+// operation acquired it in the meantime: a caller that already holds a reference
+// keeps its handle and its own lifecycle.
+func (r *SQLiteMetadataRepository) closeOptimizedTenantHandle(tenantID string, handle *sqliteTenantDatabase) {
+	r.mu.Lock()
+	if r.databases[tenantID] != handle || handle.refs.Load() > 0 {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.databases, tenantID)
+	r.mu.Unlock()
+
+	if err := r.closeHandle(handle); err != nil {
+		warnRepositoryEvent(r.logging, "metadata_optimize_close_failed", "close_failed")
+	}
 }
 
 // optimizeHandle compacts one tenant database and records the size delta.
@@ -1568,6 +1614,7 @@ func (r *SQLiteMetadataRepository) begin(ctx context.Context, tenantID string) (
 
 		db, path, err := r.openTenantDatabase(ctx, tenantID)
 
+		var evicted []*sqliteTenantDatabase
 		r.mu.Lock()
 		delete(r.openings, tenantID)
 		handle := &sqliteTenantDatabase{tenantID: tenantID, path: path, db: db, checkpointAfterBatch: r.sqlite.CheckpointAfterBatch, logging: r.logging}
@@ -1581,9 +1628,10 @@ func (r *SQLiteMetadataRepository) begin(ctx context.Context, tenantID string) (
 		default:
 			r.databases[tenantID] = handle
 			handle.acquire(r.now())
-			r.evictLocked(tenantID)
+			evicted = r.evictLocked(tenantID)
 		}
 		r.mu.Unlock()
+		r.closeEvicted(evicted)
 
 		// Every waiter is released before this function returns, on every path:
 		// a waiter that never sees pending.done would block until its own
@@ -1615,8 +1663,9 @@ func (r *SQLiteMetadataRepository) end(handle *sqliteTenantDatabase) {
 	// the only other eviction point is a cold open that never happens.
 	if r.idleTimeout > 0 && r.releaseOps.Add(1)%metadataIdleSweepInterval == 0 {
 		r.mu.Lock()
-		r.evictLocked("")
+		evicted := r.evictLocked("")
 		r.mu.Unlock()
+		r.closeEvicted(evicted)
 	}
 }
 
@@ -1636,9 +1685,10 @@ func (h *sqliteTenantDatabase) release(now time.Time) {
 	h.lastUsedNanos.Store(now.UnixNano())
 }
 
-// evictLocked closes handles that exceed the bound or sat idle for too long.
+// evictLocked removes the handles that exceed the bound or sat idle for too long
+// from the handle table and returns them for the caller to close.
 //
-// exclude names the handle the caller is about to use, which is never closed. A
+// exclude names the handle the caller is about to use, which is never removed. A
 // handle with an active reference is skipped rather than waited for: the caller
 // that holds it is already inside its own operation, and blocking the repository
 // lock on it would serialize unrelated tenants.
@@ -1647,9 +1697,11 @@ func (h *sqliteTenantDatabase) release(now time.Time) {
 // must be met the oldest idle handles are closed first. The handle leaves the
 // table before it is closed, so a concurrent acquisition either sees it and uses
 // it or does not see it and reopens the tenant.
-func (r *SQLiteMetadataRepository) evictLocked(exclude string) {
+//
+// The caller must hold mu and must close the returned handles after releasing it.
+func (r *SQLiteMetadataRepository) evictLocked(exclude string) []*sqliteTenantDatabase {
 	if r.maxOpenDatabases <= 0 && r.idleTimeout <= 0 {
-		return
+		return nil
 	}
 
 	candidates := make([]*sqliteTenantDatabase, 0, len(r.databases))
@@ -1663,6 +1715,8 @@ func (r *SQLiteMetadataRepository) evictLocked(exclude string) {
 		return candidates[i].lastUsedNanos.Load() < candidates[j].lastUsedNanos.Load()
 	})
 
+	var evicted []*sqliteTenantDatabase
+
 	// Idle eviction can close every candidate.
 	if r.idleTimeout > 0 {
 		cutoff := r.now().Add(-r.idleTimeout).UnixNano()
@@ -1670,7 +1724,8 @@ func (r *SQLiteMetadataRepository) evictLocked(exclude string) {
 			if handle.lastUsedNanos.Load() > cutoff {
 				break
 			}
-			r.closeEvictedLocked(handle)
+			delete(r.databases, handle.tenantID)
+			evicted = append(evicted, handle)
 		}
 	}
 
@@ -1683,22 +1738,30 @@ func (r *SQLiteMetadataRepository) evictLocked(exclude string) {
 			if _, ok := r.databases[handle.tenantID]; !ok {
 				continue
 			}
-			r.closeEvictedLocked(handle)
+			delete(r.databases, handle.tenantID)
+			evicted = append(evicted, handle)
 		}
 	}
+	return evicted
 }
 
-// closeEvictedLocked removes one handle from the table and closes it. The caller
-// must hold mu.
+// closeEvicted closes the handles an eviction removed from the table.
 //
-// The close runs on a separate goroutine so releasing a file handle cannot stall
-// another tenant's acquisition; the handle is already unreachable by tenant ID,
-// so nothing can observe it half closed.
-func (r *SQLiteMetadataRepository) closeEvictedLocked(handle *sqliteTenantDatabase) {
-	delete(r.databases, handle.tenantID)
-	go func() {
-		_ = r.closeHandle(handle)
-	}()
+// The caller must have released mu: a close checkpoints the write-ahead log and
+// releases the file handle, and holding the repository lock across that I/O would
+// serialize every other tenant behind one slow disk.
+//
+// The close is synchronous rather than handed to a goroutine, so the operation
+// that triggered the eviction owns the close and Close can never report
+// completion while an evicted handle is still open. A failed close is logged
+// instead of dropped: the handle is already unreachable, so the only trace left
+// is the diagnostic.
+func (r *SQLiteMetadataRepository) closeEvicted(handles []*sqliteTenantDatabase) {
+	for _, handle := range handles {
+		if err := r.closeHandle(handle); err != nil {
+			warnRepositoryEvent(r.logging, "metadata_handle_eviction_failed", "close_failed")
+		}
+	}
 }
 
 // snapshotHandlesLocked returns a stable, deterministically ordered copy of the
@@ -1898,6 +1961,7 @@ func (r *SQLiteMetadataRepository) applySchema(ctx context.Context, db *sql.DB) 
 		sqliteFilesStatusCompletedAtIndexDDL,
 		sqliteFilesStatusLastFailedAtIndexDDL,
 		sqliteFilesProcessingStartIndexDDL,
+		sqliteFilesQuotaCountIndexDDL,
 		sqliteFilesImportOperationIndexDDL,
 		sqliteFilesStatusCreatedAtIndexDropDDL,
 		sqliteSchemaVersionDDL,
@@ -1947,8 +2011,9 @@ type sqliteAdditiveColumn struct {
 }
 
 // sqliteFilesAdditiveColumns is the ordered inventory of columns added to the
-// files table after its first revision. It is empty today and exists so a future
-// revision appends an entry instead of inventing a second migration path.
+// files table after its first revision. A future revision appends an entry
+// instead of inventing a second migration path; migrateAdditiveColumns adds only
+// the columns an existing database is missing, so the list is safe to replay.
 var sqliteFilesAdditiveColumns = []sqliteAdditiveColumn{
 	{name: "import_operation_id", definition: "TEXT"},
 }

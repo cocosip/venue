@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cocosip/venue/pkg/core"
+	"github.com/cocosip/venue/pkg/scheduler"
 	"github.com/cocosip/venue/pkg/volume"
 )
 
@@ -336,6 +337,68 @@ func (r *fakeMetadataRepo) fileCount() int {
 	return len(r.files)
 }
 
+// GetByImportOperationID is the core.ImportOperationRepository capability, so
+// the idempotent write path can be exercised without a real database.
+func (r *fakeMetadataRepo) GetByImportOperationID(_ context.Context, tenantID string, operationID string) (*core.FileMetadata, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, metadata := range r.files {
+		if metadata.TenantID == tenantID && metadata.ImportOperationID == operationID {
+			copied := *metadata
+			return &copied, nil
+		}
+	}
+	return nil, core.ErrFileNotFound
+}
+
+// recordingTenantManager reports one fixed tenant state and counts lookups, so
+// the write path's tenant resolution is observable without tenant storage.
+type recordingTenantManager struct {
+	mu     sync.Mutex
+	status core.TenantStatus
+	err    error
+	gets   int
+}
+
+func (m *recordingTenantManager) GetTenant(_ context.Context, tenantID string) (core.TenantContext, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gets++
+	if m.err != nil {
+		return core.TenantContext{}, m.err
+	}
+	return core.TenantContext{ID: tenantID, Status: m.status}, nil
+}
+
+func (m *recordingTenantManager) TryGetTenant(ctx context.Context, tenantID string) (core.TenantContext, bool, error) {
+	tenant, err := m.GetTenant(ctx, tenantID)
+	return tenant, err == nil, err
+}
+
+func (m *recordingTenantManager) IsTenantEnabled(ctx context.Context, tenantID string) (bool, error) {
+	tenant, err := m.GetTenant(ctx, tenantID)
+	if err != nil {
+		return false, err
+	}
+	return tenant.IsEnabled(), nil
+}
+
+func (m *recordingTenantManager) CreateTenant(context.Context, string) error { return nil }
+
+func (m *recordingTenantManager) EnableTenant(context.Context, string) error { return nil }
+
+func (m *recordingTenantManager) DisableTenant(context.Context, string) error { return nil }
+
+func (m *recordingTenantManager) GetAllTenants(context.Context) ([]core.TenantContext, error) {
+	return nil, nil
+}
+
+func (m *recordingTenantManager) lookups() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gets
+}
+
 // newRegressionPool builds a storage pool directly so tests can inject fake
 // collaborators without opening a real metadata database.
 func newRegressionPool(
@@ -350,7 +413,6 @@ func newRegressionPool(
 		volumes:        volumes,
 		tenantQuotaMgr: tenantQuota,
 		dirQuotaMgr:    dirQuota,
-		volumeSelector: &MostAvailableSpaceSelector{},
 	}
 }
 
@@ -1121,5 +1183,410 @@ func TestIdempotentWriteGuard_HashMatchesConcatenatedPair(t *testing.T) {
 		if got := pool.idempotentWriteGuard(pair[0], pair[1]); got != wantGuard {
 			t.Errorf("idempotentWriteGuard(%q, %q) = %p, want %p", pair[0], pair[1], got, wantGuard)
 		}
+	}
+}
+
+// TestWriteFile_ResolvesTenantThroughManager is the regression test for the write
+// path trusting the caller's TenantContext.Status: core.TenantStatusEnabled is the
+// Go zero value, so a disabled or never-created tenant that was never resolved
+// still looked enabled and the write proceeded. The manager is now the authority
+// for both outcomes, and it is consulted before any write resource is taken.
+func TestWriteFile_ResolvesTenantThroughManager(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name       string
+		manager    *recordingTenantManager
+		wantErr    error
+		wantWrites int64
+	}{
+		{
+			name:       "enabled tenant",
+			manager:    &recordingTenantManager{status: core.TenantStatusEnabled},
+			wantWrites: 1,
+		},
+		{
+			name:    "disabled tenant",
+			manager: &recordingTenantManager{status: core.TenantStatusDisabled},
+			wantErr: core.ErrTenantDisabled,
+		},
+		{
+			name:    "missing tenant with auto-create disabled",
+			manager: &recordingTenantManager{err: fmt.Errorf("tenant %q: %w", "test-tenant", core.ErrTenantNotFound)},
+			wantErr: core.ErrTenantNotFound,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			vol := newFakeVolume("v1", true, 4096)
+			repo := newFakeMetadataRepo()
+			tenantQuota := &fakeTenantQuotaManager{}
+			dirQuota := &fakeDirectoryQuotaManager{}
+			pool := newRegressionPool(
+				map[string]core.StorageVolume{"v1": vol},
+				repo,
+				tenantQuota,
+				dirQuota,
+			)
+			pool.tenantManager = tc.manager
+
+			// The caller's snapshot claims Enabled, which is the zero value the
+			// bug relied on.
+			_, err := pool.WriteFile(ctx, createTestTenant(), bytes.NewReader([]byte("payload")), nil)
+
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("WriteFile() error = %v, want %v", err, tc.wantErr)
+				}
+				if got := vol.writeCalls.Load(); got != 0 {
+					t.Errorf("physical writes = %d, want 0 for a rejected tenant", got)
+				}
+				if got := repo.addCount(); got != 0 {
+					t.Errorf("metadata writes = %d, want 0 for a rejected tenant", got)
+				}
+				increments, decrements := tenantQuota.counts()
+				if increments != 0 || decrements != 0 {
+					t.Errorf("tenant quota mutations = (%d, %d), want (0, 0)", increments, decrements)
+				}
+				if len(dirQuota.increments) != 0 || len(dirQuota.decrements) != 0 {
+					t.Errorf("directory quota mutations = (%v, %v), want none", dirQuota.increments, dirQuota.decrements)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("WriteFile() error = %v, want success", err)
+				}
+				if got := vol.writeCalls.Load(); got != tc.wantWrites {
+					t.Errorf("physical writes = %d, want %d", got, tc.wantWrites)
+				}
+				if got := repo.fileCount(); got != 1 {
+					t.Errorf("metadata records = %d, want 1", got)
+				}
+			}
+
+			if got := tc.manager.lookups(); got != 1 {
+				t.Errorf("tenant manager lookups = %d, want exactly 1 resolution per write", got)
+			}
+		})
+	}
+}
+
+// TestWriteFile_EnabledSnapshotCannotBypassDisabledTenant pins the same defect
+// from the caller's side: an explicitly enabled snapshot of a tenant the manager
+// has disabled must not write either.
+func TestWriteFile_EnabledSnapshotCannotBypassDisabledTenant(t *testing.T) {
+	vol := newFakeVolume("v1", true, 4096)
+	repo := newFakeMetadataRepo()
+	pool := newRegressionPool(map[string]core.StorageVolume{"v1": vol}, repo, nil, nil)
+	pool.tenantManager = &recordingTenantManager{status: core.TenantStatusDisabled}
+
+	tenant := createTestTenant()
+	if !tenant.IsEnabled() {
+		t.Fatal("precondition: the test tenant snapshot must look enabled")
+	}
+
+	if _, err := pool.WriteFile(context.Background(), tenant, bytes.NewReader([]byte("payload")), nil); !errors.Is(err, core.ErrTenantDisabled) {
+		t.Fatalf("WriteFile() error = %v, want ErrTenantDisabled", err)
+	}
+	if got := repo.fileCount(); got != 0 {
+		t.Errorf("metadata records = %d, want 0 for a disabled tenant", got)
+	}
+}
+
+// gatedReader blocks on its first Read until the test releases it, so a
+// concurrent operation can be started against a write that is mid-copy.
+type gatedReader struct {
+	data    []byte
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	r.once.Do(func() {
+		close(r.started)
+		<-r.release
+	})
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestWriteFileIdempotently_ConcurrentDuplicatesShareOneFile proves the
+// exactly-once guarantee survives the narrowed critical section: a duplicate of
+// the same operation waits for the in-flight write and receives its file key, so
+// one payload copy and one metadata record are produced.
+func TestWriteFileIdempotently_ConcurrentDuplicatesShareOneFile(t *testing.T) {
+	ctx := context.Background()
+	vol := newFakeVolume("v1", true, 4096)
+	repo := newFakeMetadataRepo()
+	pool := newRegressionPool(map[string]core.StorageVolume{"v1": vol}, repo, nil, nil)
+	tenant := createTestTenant()
+
+	type writeResult struct {
+		fileKey string
+		err     error
+	}
+
+	const operationID = "watcher-operation-duplicate"
+	content := &gatedReader{
+		data:    []byte("first payload"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+
+	first := make(chan writeResult, 1)
+	go func() {
+		fileKey, err := pool.WriteFileIdempotently(ctx, tenant, content, nil, operationID)
+		first <- writeResult{fileKey: fileKey, err: err}
+	}()
+	<-content.started
+
+	second := make(chan writeResult, 1)
+	go func() {
+		fileKey, err := pool.WriteFileIdempotently(ctx, tenant, bytes.NewReader([]byte("second payload")), nil, operationID)
+		second <- writeResult{fileKey: fileKey, err: err}
+	}()
+
+	// The duplicate must wait for the operation already in flight.
+	select {
+	case result := <-second:
+		t.Fatalf("duplicate returned (%q, %v) while the first write was still copying", result.fileKey, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(content.release)
+
+	firstResult := <-first
+	if firstResult.err != nil {
+		t.Fatalf("first WriteFileIdempotently() error = %v", firstResult.err)
+	}
+	secondResult := <-second
+	if secondResult.err != nil {
+		t.Fatalf("second WriteFileIdempotently() error = %v", secondResult.err)
+	}
+	if secondResult.fileKey != firstResult.fileKey {
+		t.Errorf("duplicate file key = %q, want the in-flight %q", secondResult.fileKey, firstResult.fileKey)
+	}
+
+	if got := vol.writeCalls.Load(); got != 1 {
+		t.Errorf("payload copies = %d, want 1 for one logical write", got)
+	}
+	if got := vol.writtenCount(); got != 1 {
+		t.Errorf("physical files = %d, want 1", got)
+	}
+	if got := repo.fileCount(); got != 1 {
+		t.Errorf("metadata records = %d, want 1", got)
+	}
+	metadata, err := repo.Get(ctx, tenant.ID, firstResult.fileKey)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if metadata.FileSize != int64(len("first payload")) {
+		t.Errorf("stored size = %d, want the first payload's %d bytes", metadata.FileSize, len("first payload"))
+	}
+}
+
+// TestWriteFileIdempotently_UnrelatedWritesDoNotSerialize is the regression test
+// for the striped guard being held across the whole physical write: two different
+// operations that hash to the same stripe serialized whole payload copies.
+func TestWriteFileIdempotently_UnrelatedWritesDoNotSerialize(t *testing.T) {
+	ctx := context.Background()
+	vol := newFakeVolume("v1", true, 4096)
+	repo := newFakeMetadataRepo()
+	pool := newRegressionPool(map[string]core.StorageVolume{"v1": vol}, repo, nil, nil)
+	tenant := createTestTenant()
+
+	// Find a second operation ID that lands on the same stripe as the first.
+	const firstOperationID = "operation-a"
+	secondOperationID := ""
+	for index := 0; secondOperationID == "" && index < 100_000; index++ {
+		candidate := fmt.Sprintf("operation-b-%d", index)
+		if pool.idempotentWriteGuard(tenant.ID, candidate) == pool.idempotentWriteGuard(tenant.ID, firstOperationID) {
+			secondOperationID = candidate
+		}
+	}
+	if secondOperationID == "" {
+		t.Fatal("no second operation ID shares the first one's stripe")
+	}
+
+	type writeResult struct {
+		fileKey string
+		err     error
+	}
+
+	content := &gatedReader{
+		data:    []byte("first payload"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	first := make(chan writeResult, 1)
+	go func() {
+		fileKey, err := pool.WriteFileIdempotently(ctx, tenant, content, nil, firstOperationID)
+		first <- writeResult{fileKey: fileKey, err: err}
+	}()
+	<-content.started
+
+	second := make(chan writeResult, 1)
+	go func() {
+		fileKey, err := pool.WriteFileIdempotently(ctx, tenant, bytes.NewReader([]byte("second payload")), nil, secondOperationID)
+		second <- writeResult{fileKey: fileKey, err: err}
+	}()
+
+	select {
+	case result := <-second:
+		if result.err != nil {
+			close(content.release)
+			<-first
+			t.Fatalf("unrelated operation error = %v", result.err)
+		}
+	case <-time.After(5 * time.Second):
+		close(content.release)
+		<-first
+		t.Fatal("an unrelated operation on the same stripe waited for the in-flight payload copy")
+	}
+
+	close(content.release)
+	if result := <-first; result.err != nil {
+		t.Fatalf("first WriteFileIdempotently() error = %v", result.err)
+	}
+
+	if got := repo.fileCount(); got != 2 {
+		t.Errorf("metadata records = %d, want 2 independent operations", got)
+	}
+}
+
+// TestReadFile_MissingVolumeWrapsUnavailable is the regression test for a volume
+// that metadata still references but the pool no longer has: the error must keep
+// the domain sentinel so callers can handle a missing volume like any other
+// unavailable one.
+func TestReadFile_MissingVolumeWrapsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeMetadataRepo()
+	record := &core.FileMetadata{
+		FileKey:      "key-1",
+		TenantID:     "test-tenant",
+		VolumeID:     "retired-volume",
+		PhysicalPath: filepath.Join("test-tenant", "key-1"),
+		Status:       core.FileStatusPending,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	if err := repo.AddOrUpdate(ctx, record); err != nil {
+		t.Fatalf("AddOrUpdate() error = %v", err)
+	}
+
+	pool := newRegressionPool(
+		map[string]core.StorageVolume{"v1": newFakeVolume("v1", true, 4096)},
+		repo,
+		nil,
+		nil,
+	)
+
+	_, err := pool.ReadFile(ctx, createTestTenant(), record.FileKey)
+	if !errors.Is(err, core.ErrStorageVolumeUnavailable) {
+		t.Fatalf("ReadFile() error = %v, want ErrStorageVolumeUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), record.VolumeID) {
+		t.Errorf("ReadFile() error = %v, want the volume ID kept as context", err)
+	}
+}
+
+// TestGetFileStatusRejectsDisabledTenant is the regression test for the one
+// caller-visible method that skipped the disabled-tenant guard, so DisableTenant's
+// documented promise did not hold for it.
+func TestGetFileStatusRejectsDisabledTenant(t *testing.T) {
+	repo := newFakeMetadataRepo()
+	volumes := map[string]core.StorageVolume{"v1": newFakeVolume("v1", true, 4096)}
+	fileScheduler, err := scheduler.NewFileScheduler(repo, volumes, nil)
+	if err != nil {
+		t.Fatalf("NewFileScheduler() error = %v", err)
+	}
+
+	pool := newRegressionPool(volumes, repo, nil, nil)
+	pool.scheduler = fileScheduler
+
+	disabled := core.TenantContext{ID: "test-tenant", Status: core.TenantStatusDisabled}
+	if _, err := pool.GetFileStatus(context.Background(), disabled, "key-1"); !errors.Is(err, core.ErrTenantDisabled) {
+		t.Fatalf("GetFileStatus() error = %v, want ErrTenantDisabled", err)
+	}
+}
+
+// TestCapacity_ReturnsContextError is the regression test for a capacity query
+// that reported a cancelled, partial aggregate with a nil error.
+func TestCapacity_ReturnsContextError(t *testing.T) {
+	vol := newFakeVolume("v1", true, 4096)
+	pool := newRegressionPool(map[string]core.StorageVolume{"v1": vol}, newFakeMetadataRepo(), nil, nil)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	total, err := pool.GetTotalCapacity(cancelled)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetTotalCapacity() error = %v, want context.Canceled", err)
+	}
+	if total != 0 {
+		t.Errorf("GetTotalCapacity() = %d, want the partial sum 0", total)
+	}
+	space, err := pool.GetAvailableSpace(cancelled)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetAvailableSpace() error = %v, want context.Canceled", err)
+	}
+	if space != 0 {
+		t.Errorf("GetAvailableSpace() = %d, want the partial sum 0", space)
+	}
+
+	// The aborted computation must not be cached as a complete aggregate.
+	total, err = pool.GetTotalCapacity(context.Background())
+	if err != nil {
+		t.Fatalf("GetTotalCapacity() after the cancellation error = %v", err)
+	}
+	if total != vol.total {
+		t.Errorf("GetTotalCapacity() = %d, want the live aggregate %d", total, vol.total)
+	}
+}
+
+// TestWriteFileIdempotently_ReleasesClaimAfterPanic pins the claim lifecycle: a
+// panic raised by the caller's reader unwinds through the write path, and the
+// in-flight claim for that operation must still be released or every later retry
+// of the same operation would wait on it forever.
+func TestWriteFileIdempotently_ReleasesClaimAfterPanic(t *testing.T) {
+	ctx := context.Background()
+	vol := newFakeVolume("v1", true, 4096)
+	repo := newFakeMetadataRepo()
+	pool := newRegressionPool(map[string]core.StorageVolume{"v1": vol}, repo, nil, nil)
+	tenant := createTestTenant()
+
+	const operationID = "watcher-operation-panic"
+
+	recovered := func() (value any) {
+		defer func() { value = recover() }()
+		_, _ = pool.WriteFileIdempotently(ctx, tenant, &panickingReader{remaining: 8}, nil, operationID)
+		return nil
+	}()
+	if recovered == nil {
+		t.Fatal("expected the reader panic to propagate out of WriteFileIdempotently")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := pool.WriteFileIdempotently(ctx, tenant, bytes.NewReader([]byte("retry")), nil, operationID)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("retry after the panicking write error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the operation ID stayed claimed after a panicking write")
+	}
+
+	if got := repo.fileCount(); got != 1 {
+		t.Errorf("metadata records = %d, want the retry's single record", got)
 	}
 }

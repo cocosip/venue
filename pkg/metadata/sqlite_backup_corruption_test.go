@@ -242,21 +242,36 @@ func TestSQLiteMetadataRepositoryPrunesQuarantinedFilesByRetention(t *testing.T)
 	dataPath := t.TempDir()
 	const tenantID = "tenant-retention"
 
-	// Two quarantine siblings: one beyond the retention, one inside it.
 	directory := filepath.Join(dataPath, tenantID)
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
-	oldFile := filepath.Join(directory, metadataDatabaseFileName+corruptedDatabaseSuffix+"20200101T000000Z")
-	freshFile := filepath.Join(directory, metadataDatabaseFileName+corruptedDatabaseSuffix+"20250101T000000Z")
-	for _, path := range []string{oldFile, freshFile} {
+
+	// Every artifact a quarantine produces: the database file and each of its
+	// WAL/SHM sidecars. A sidecar is renamed to <db>-wal.corrupted.<stamp>, so it
+	// does not share the database file's own "<db>.corrupted." prefix.
+	quarantined := []struct {
+		name string
+		old  bool
+	}{
+		{name: metadataDatabaseFileName + corruptedDatabaseSuffix + "20200101T000000Z", old: true},
+		{name: metadataDatabaseFileName + corruptedDatabaseSuffix + "20250101T000000Z"},
+		{name: metadataDatabaseFileName + walSuffix + corruptedDatabaseSuffix + "20200101T000000Z", old: true},
+		{name: metadataDatabaseFileName + walSuffix + corruptedDatabaseSuffix + "20250101T000000Z"},
+		{name: metadataDatabaseFileName + shmSuffix + corruptedDatabaseSuffix + "20200101T000000Z", old: true},
+		{name: metadataDatabaseFileName + shmSuffix + corruptedDatabaseSuffix + "20250101T000000Z"},
+	}
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	for _, artifact := range quarantined {
+		path := filepath.Join(directory, artifact.name)
 		if err := os.WriteFile(path, []byte("rescue copy"), 0o644); err != nil {
 			t.Fatalf("WriteFile(%s) error = %v", path, err)
 		}
-	}
-	old := time.Now().Add(-30 * 24 * time.Hour)
-	if err := os.Chtimes(oldFile, old, old); err != nil {
-		t.Fatalf("Chtimes() error = %v", err)
+		if artifact.old {
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatalf("Chtimes() error = %v", err)
+			}
+		}
 	}
 
 	repo := newSQLiteFixtureRepository(t, func(options *SQLiteRepositoryOptions) {
@@ -267,14 +282,20 @@ func TestSQLiteMetadataRepositoryPrunesQuarantinedFilesByRetention(t *testing.T)
 		t.Fatalf("AddOrUpdate() error = %v", err)
 	}
 
-	if _, err := os.Stat(oldFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expired quarantine file still exists: %v", err)
-	}
-	if _, err := os.Stat(freshFile); err != nil {
-		t.Fatalf("unexpired quarantine file was removed: %v", err)
+	for _, artifact := range quarantined {
+		_, err := os.Stat(filepath.Join(directory, artifact.name))
+		switch {
+		case artifact.old && !errors.Is(err, os.ErrNotExist):
+			t.Errorf("expired quarantine file %s still exists: %v", artifact.name, err)
+		case !artifact.old && err != nil:
+			t.Errorf("unexpired quarantine file %s was removed: %v", artifact.name, err)
+		}
 	}
 }
 
+// TestSQLiteMetadataRepositoryNegativeRetentionKeepsQuarantineFiles pins the
+// negative-form retention convention: zero selects the 72h default, and a
+// negative value disables pruning, so an operator can keep every rescue copy.
 func TestSQLiteMetadataRepositoryNegativeRetentionKeepsQuarantineFiles(t *testing.T) {
 	ctx := context.Background()
 	dataPath := t.TempDir()
@@ -295,10 +316,11 @@ func TestSQLiteMetadataRepositoryNegativeRetentionKeepsQuarantineFiles(t *testin
 
 	repo := newSQLiteFixtureRepository(t, func(options *SQLiteRepositoryOptions) {
 		options.DataPath = dataPath
-		// A negative retention has to survive constructor validation, so it is
-		// applied to the opened repository directly.
+		options.CorruptedDatabaseRetention = -time.Hour
 	})
-	repo.corruptRetention = -1
+	if repo.corruptRetention != -time.Hour {
+		t.Fatalf("corruptRetention = %v, want the configured -1h", repo.corruptRetention)
+	}
 
 	if err := repo.AddOrUpdate(ctx, sqliteRecord(tenantID, "file-negative", time.Now().UTC())); err != nil {
 		t.Fatalf("AddOrUpdate() error = %v", err)
@@ -635,18 +657,7 @@ func TestSQLiteMetadataRepositoryBackupCoversTenantDirectoriesWithoutHandles(t *
 	}
 	// Close the handles so the enumeration must read the directory: on Windows an
 	// open database holds a file lock that would also break t.TempDir cleanup.
-	repo.mu.Lock()
-	handles := make([]*sqliteTenantDatabase, 0, len(repo.databases))
-	for _, handle := range repo.databases {
-		handles = append(handles, handle)
-	}
-	repo.databases = map[string]*sqliteTenantDatabase{}
-	repo.mu.Unlock()
-	for _, handle := range handles {
-		if err := repo.closeHandle(handle); err != nil {
-			t.Fatalf("closeHandle() error = %v", err)
-		}
-	}
+	detachSQLiteHandles(t, repo)
 
 	known, err := repo.KnownTenantIDs(ctx)
 	if err != nil {
@@ -725,6 +736,126 @@ func TestSQLiteMetadataRepositoryBackupSkipsVerificationWhenConfigured(t *testin
 // ---------------------------------------------------------------------------
 // Maintenance
 // ---------------------------------------------------------------------------
+
+// detachSQLiteHandles closes and forgets every open handle, leaving the tenant
+// databases on disk exactly as a process restart would.
+func detachSQLiteHandles(t *testing.T, repo *SQLiteMetadataRepository) {
+	t.Helper()
+
+	repo.mu.Lock()
+	handles := make([]*sqliteTenantDatabase, 0, len(repo.databases))
+	for _, handle := range repo.databases {
+		handles = append(handles, handle)
+	}
+	repo.databases = make(map[string]*sqliteTenantDatabase)
+	repo.mu.Unlock()
+
+	for _, handle := range handles {
+		if err := repo.closeHandle(handle); err != nil {
+			t.Fatalf("closeHandle() error = %v", err)
+		}
+	}
+}
+
+// TestSQLiteMetadataRepositoryEvictionClosesHandleBeforeReturning proves an
+// eviction is accounted for by the operation that triggered it: an evicted handle
+// is closed before that operation returns, so Close can never report completion
+// while a handle it gave up on is still open.
+//
+// The evicted handle's own mutex is held to make the close unable to finish, which
+// turns "handed to an untracked goroutine" into an observable difference instead
+// of a timing race.
+func TestSQLiteMetadataRepositoryEvictionClosesHandleBeforeReturning(t *testing.T) {
+	ctx := context.Background()
+	repo := newSQLiteFixtureRepository(t, func(options *SQLiteRepositoryOptions) {
+		options.MaxOpenDatabases = 1
+	})
+
+	if err := repo.AddOrUpdate(ctx, sqliteRecord("tenant-evict-a", "file-a", time.Now().UTC())); err != nil {
+		t.Fatalf("AddOrUpdate(tenant-a) error = %v", err)
+	}
+	repo.mu.RLock()
+	evicted := repo.databases["tenant-evict-a"]
+	repo.mu.RUnlock()
+	if evicted == nil {
+		t.Fatal("tenant-evict-a has no open handle, want one to evict")
+	}
+
+	// closeHandle needs this mutex, so the close cannot complete while it is held.
+	evicted.mu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- repo.AddOrUpdate(ctx, sqliteRecord("tenant-evict-b", "file-b", time.Now().UTC()))
+	}()
+
+	select {
+	case err := <-done:
+		evicted.mu.Unlock()
+		if err != nil {
+			t.Fatalf("AddOrUpdate(tenant-b) error = %v", err)
+		}
+		t.Fatal("the eviction returned while the evicted handle was still being closed: the close is not awaited")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	evicted.mu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AddOrUpdate(tenant-b) error = %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the eviction did not complete after the handle was released")
+	}
+
+	// database/sql reports a closed pool with its own sentinel ("sql: database is
+	// closed"), which is not one of the exported errors, so the message is the
+	// observable proof that the handle really released its pool.
+	if err := evicted.db.Ping(); err == nil || !strings.Contains(err.Error(), "database is closed") {
+		t.Fatalf("evicted handle Ping() error = %v, want the closed-pool error", err)
+	}
+}
+
+// TestSQLiteMetadataRepositoryOptimizeClosesIdleTenantHandle proves
+// OptimizeIdleTenantDatabases really opens, compacts and closes an idle tenant:
+// the handle it opened must not stay in the table until shutdown.
+func TestSQLiteMetadataRepositoryOptimizeClosesIdleTenantHandle(t *testing.T) {
+	ctx := context.Background()
+	dataPath := t.TempDir()
+	const tenantID = "tenant-optimize-idle"
+
+	repo := newSQLiteFixtureRepository(t, func(options *SQLiteRepositoryOptions) {
+		options.DataPath = dataPath
+		options.OptimizeIdleTenantDatabases = true
+	})
+	if err := repo.AddOrUpdate(ctx, sqliteRecord(tenantID, "file-idle", time.Now().UTC())); err != nil {
+		t.Fatalf("AddOrUpdate() error = %v", err)
+	}
+
+	// A restart leaves the database on disk and no handle in the table, which is
+	// exactly the state an idle tenant is in.
+	detachSQLiteHandles(t, repo)
+	if got := repo.openHandleCount(); got != 0 {
+		t.Fatalf("open handles = %d before Optimize, want 0", got)
+	}
+
+	if err := repo.Optimize(ctx); err != nil {
+		t.Fatalf("Optimize() error = %v", err)
+	}
+	if got := repo.openHandleCount(); got != 0 {
+		t.Fatalf("open handles = %d after Optimize, want 0: an idle tenant is opened, compacted and closed", got)
+	}
+	// A clean close removes the write-ahead log sidecar; its absence is the
+	// observable proof that the handle released the file.
+	if _, err := os.Lstat(sqliteTenantDatabasePath(dataPath, tenantID) + walSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("write-ahead log still present after Optimize closed the idle tenant: %v", err)
+	}
+
+	// Compaction keeps the data, and the next access simply reopens the tenant.
+	if _, err := repo.Get(ctx, tenantID, "file-idle"); err != nil {
+		t.Fatalf("Get(file-idle) after Optimize error = %v", err)
+	}
+}
 
 func TestSQLiteMetadataRepositoryOptimizeCompactsOpenTenants(t *testing.T) {
 	ctx := context.Background()

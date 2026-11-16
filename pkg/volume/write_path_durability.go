@@ -3,12 +3,13 @@ package volume
 import (
 	"context"
 	"io"
-	"os"
 )
 
 // This file holds the write path's cancellation and durability plumbing: the
-// context-aware payload copy and the directory fsync that makes a new file name
-// durable. Both are shared by WriteFile and the cross-device move fallback.
+// context-aware payload copy. It is shared by WriteFile and the cross-device
+// move fallback. The directory fsync that makes a new file name durable lives in
+// the platform-specific files (local_volume_windows.go / local_volume_unix.go),
+// because syncing a directory is not portable: see syncDirectory.
 //
 // The volume deliberately keeps no write-path statistics: the counters had no
 // production reader, so the write fast path no longer pays for them.
@@ -38,20 +39,4 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	}
 
 	return n, err
-}
-
-// syncDirectory flushes a directory's entries so a newly created file name is
-// durable, not just its contents.
-//
-// It is best-effort by contract: the caller treats a failure as a lost
-// optimization, because opening a directory for fsync is not portable (Windows
-// rejects os.Open on a directory), and the file contents were already synced.
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = directory.Close() }()
-
-	return directory.Sync()
 }

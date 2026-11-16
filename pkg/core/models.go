@@ -845,17 +845,3 @@ type DatabaseOptimizationResult struct {
 	// SizeAfter is the combined on-disk size after optimization, in bytes.
 	SizeAfter int64
 }
-
-// SpaceReclaimedMegabytes returns SpaceReclaimed in MiB.
-func (r DatabaseOptimizationResult) SpaceReclaimedMegabytes() float64 {
-	return float64(r.SpaceReclaimed) / 1024 / 1024
-}
-
-// PercentageReclaimed returns the share of the pre-optimization size that was
-// reclaimed, in percent. It is zero when SizeBefore is not positive.
-func (r DatabaseOptimizationResult) PercentageReclaimed() float64 {
-	if r.SizeBefore <= 0 {
-		return 0
-	}
-	return float64(r.SpaceReclaimed) * 100 / float64(r.SizeBefore)
-}

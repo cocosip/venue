@@ -436,34 +436,6 @@ func TestIntegration_PathGeneration(t *testing.T) {
 			t.Errorf("Expected path to contain day %s, got %s", day, location.PhysicalPath)
 		}
 	})
-
-	t.Run("Flat path generator", func(t *testing.T) {
-		opts := &StoragePoolOptions{
-			TenantManager:      tenantMgr,
-			MetadataRepository: repo,
-			FileScheduler:      sched,
-			Volumes:            volumes,
-			PathGenerator:      &FlatPathGenerator{},
-		}
-
-		pool, _ := NewStoragePool(opts)
-		tenant := createTestTenant()
-
-		content := bytes.NewReader([]byte("test"))
-		fileName := "test.txt"
-		fileKey, _ := pool.WriteFile(ctx, tenant, content, &fileName)
-
-		location, _ := pool.GetFileLocation(ctx, tenant, fileKey)
-
-		// Path should be flat: tenantID/fileKey.ext
-		// Should NOT contain year/month/day
-		now := time.Now()
-		year := now.Format("2006")
-
-		if contains(location.PhysicalPath, year) {
-			t.Errorf("Flat path should not contain year, got %s", location.PhysicalPath)
-		}
-	})
 }
 
 // Helper function

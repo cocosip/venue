@@ -98,11 +98,11 @@ func TestMostAvailableSpaceSelector_SelectsExpectedVolume(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			selected, err := (&MostAvailableSpaceSelector{}).SelectVolume(context.Background(), tc.volumes)
+			candidates, err := (&MostAvailableSpaceSelector{}).SelectVolumeCandidates(context.Background(), tc.volumes, 0)
 
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("expected an error, got volume %v", selected)
+					t.Fatalf("expected an error, got candidates %v", candidates)
 				}
 				if !errors.Is(err, core.ErrInsufficientStorage) {
 					t.Fatalf("expected ErrInsufficientStorage, got %v", err)
@@ -113,11 +113,11 @@ func TestMostAvailableSpaceSelector_SelectsExpectedVolume(t *testing.T) {
 			if err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
-			if selected == nil {
-				t.Fatal("expected a volume, got nil")
+			if len(candidates) == 0 || candidates[0] == nil {
+				t.Fatal("expected a preferred volume, got none")
 			}
-			if selected.VolumeID() != tc.wantVolume {
-				t.Errorf("selected volume = %q, want %q", selected.VolumeID(), tc.wantVolume)
+			if candidates[0].VolumeID() != tc.wantVolume {
+				t.Errorf("selected volume = %q, want %q", candidates[0].VolumeID(), tc.wantVolume)
 			}
 		})
 	}
@@ -129,7 +129,8 @@ func TestMostAvailableSpaceSelector_RespectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := (&MostAvailableSpaceSelector{}).SelectVolume(ctx, selectorVolumes(newFakeVolume("v1", true, 100)))
+	_, err := (&MostAvailableSpaceSelector{}).SelectVolumeCandidates(
+		ctx, selectorVolumes(newFakeVolume("v1", true, 100)), 0)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
@@ -203,8 +204,9 @@ func TestMostAvailableSpaceSelector_SizeConstraint(t *testing.T) {
 	}
 }
 
-// TestPathGenerators_GenerateExpectedLayouts covers the three shipped path
-// generators, which previously had no tests.
+// TestPathGenerators_GenerateExpectedLayouts covers the one shipped path
+// generator, which is only the fallback for a volume that cannot build its own
+// path.
 func TestPathGenerators_GenerateExpectedLayouts(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -212,19 +214,9 @@ func TestPathGenerators_GenerateExpectedLayouts(t *testing.T) {
 		pattern *regexp.Regexp
 	}{
 		{
-			name:    "flat",
-			gen:     &FlatPathGenerator{},
-			pattern: regexp.MustCompile(`^tenant-1/abc123\.pdf$`),
-		},
-		{
 			name:    "date based",
 			gen:     &DateBasedPathGenerator{},
 			pattern: regexp.MustCompile(`^tenant-1/\d{4}/\d{2}/\d{2}/abc123\.pdf$`),
-		},
-		{
-			name:    "hour based",
-			gen:     &HourBasedPathGenerator{},
-			pattern: regexp.MustCompile(`^tenant-1/\d{4}/\d{2}/\d{2}/\d{2}/abc123\.pdf$`),
 		},
 	}
 
@@ -241,9 +233,7 @@ func TestPathGenerators_GenerateExpectedLayouts(t *testing.T) {
 // TestPathGenerators_EmptyExtension verifies extension-less file keys.
 func TestPathGenerators_EmptyExtension(t *testing.T) {
 	generators := map[string]PathGenerator{
-		"flat":       &FlatPathGenerator{},
 		"date based": &DateBasedPathGenerator{},
-		"hour based": &HourBasedPathGenerator{},
 	}
 
 	for name, generator := range generators {

@@ -294,7 +294,9 @@ func TestSQLiteDirectoryQuotaRepositoryLoggingOmitsPathsAndTenants(t *testing.T)
 }
 
 // TestSQLiteDirectoryQuotaRepositoryPrunesExpiredQuarantineFiles covers the
-// bounded retention of quarantined quota data.
+// bounded retention of quarantined quota data. It covers every artifact a
+// quarantine produces: the database file itself and each WAL/SHM sidecar, which
+// is renamed to <db>-wal.corrupted.<stamp> and therefore has a different prefix.
 func TestSQLiteDirectoryQuotaRepositoryPrunesExpiredQuarantineFiles(t *testing.T) {
 	ctx := context.Background()
 	dataPath := t.TempDir()
@@ -303,16 +305,27 @@ func TestSQLiteDirectoryQuotaRepositoryPrunesExpiredQuarantineFiles(t *testing.T
 		t.Fatalf("Remove(%s) error = %v", path, err)
 	}
 
-	stale := path + quotaCorruptedDatabaseSuffix + "20200101T000000Z"
-	fresh := path + quotaCorruptedDatabaseSuffix + "29990101T000000Z"
-	for _, quarantinedPath := range []string{stale, fresh} {
-		if err := os.WriteFile(quarantinedPath, []byte("rescue copy\n"), 0o644); err != nil {
-			t.Fatalf("WriteFile(%s) error = %v", quarantinedPath, err)
-		}
+	quarantined := []struct {
+		path string
+		old  bool
+	}{
+		{path: path + quotaCorruptedDatabaseSuffix + "20200101T000000Z", old: true},
+		{path: path + quotaCorruptedDatabaseSuffix + "29990101T000000Z"},
+		{path: path + quotaWalSuffix + quotaCorruptedDatabaseSuffix + "20200101T000000Z", old: true},
+		{path: path + quotaWalSuffix + quotaCorruptedDatabaseSuffix + "29990101T000000Z"},
+		{path: path + quotaShmSuffix + quotaCorruptedDatabaseSuffix + "20200101T000000Z", old: true},
+		{path: path + quotaShmSuffix + quotaCorruptedDatabaseSuffix + "29990101T000000Z"},
 	}
 	old := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatalf("Chtimes(%s) error = %v", stale, err)
+	for _, artifact := range quarantined {
+		if err := os.WriteFile(artifact.path, []byte("rescue copy\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", artifact.path, err)
+		}
+		if artifact.old {
+			if err := os.Chtimes(artifact.path, old, old); err != nil {
+				t.Fatalf("Chtimes(%s) error = %v", artifact.path, err)
+			}
+		}
 	}
 
 	repository := newSQLiteQuotaRepository(t, &SQLiteDirectoryQuotaRepositoryOptions{
@@ -323,11 +336,55 @@ func TestSQLiteDirectoryQuotaRepositoryPrunesExpiredQuarantineFiles(t *testing.T
 		t.Fatalf("GetOrCreate() error = %v", err)
 	}
 
-	if _, err := os.Lstat(stale); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stale quarantine file still present: %v", err)
+	for _, artifact := range quarantined {
+		_, err := os.Lstat(artifact.path)
+		switch {
+		case artifact.old && !errors.Is(err, os.ErrNotExist):
+			t.Errorf("expired quarantine file %s still present: %v", quarantineArtifactName(path, artifact.path), err)
+		case !artifact.old && err != nil:
+			t.Errorf("fresh quarantine file %s was pruned: %v", quarantineArtifactName(path, artifact.path), err)
+		}
 	}
-	if _, err := os.Lstat(fresh); err != nil {
-		t.Fatalf("fresh quarantine file was pruned: %v", err)
+}
+
+// quarantineArtifactName renders a quarantine path relative to the database path,
+// so a failure names the artifact shape instead of a temporary directory.
+func quarantineArtifactName(databasePath string, quarantinedPath string) string {
+	return strings.TrimPrefix(quarantinedPath, databasePath)
+}
+
+// TestSQLiteDirectoryQuotaRepositoryNegativeRetentionDisablesPruning pins the
+// negative-form retention convention of the quota store: zero selects the 72h
+// default, and a negative value is accepted and disables pruning.
+func TestSQLiteDirectoryQuotaRepositoryNegativeRetentionDisablesPruning(t *testing.T) {
+	ctx := context.Background()
+	dataPath := t.TempDir()
+	path := plantCorruptSQLiteQuotaDatabase(t, dataPath, sqliteQuotaTenant)
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove(%s) error = %v", path, err)
+	}
+
+	stale := path + quotaCorruptedDatabaseSuffix + "20200101T000000Z"
+	if err := os.WriteFile(stale, []byte("rescue copy\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", stale, err)
+	}
+	old := time.Now().Add(-365 * 24 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatalf("Chtimes(%s) error = %v", stale, err)
+	}
+
+	repository := newSQLiteQuotaRepository(t, &SQLiteDirectoryQuotaRepositoryOptions{
+		DataPath:                   dataPath,
+		CorruptedDatabaseRetention: -time.Hour,
+	})
+	if repository.corruptRetention != -time.Hour {
+		t.Fatalf("corruptRetention = %v, want the configured -1h", repository.corruptRetention)
+	}
+	if _, err := repository.GetOrCreate(ctx, sqliteQuotaTenant, "/kept"); err != nil {
+		t.Fatalf("GetOrCreate() error = %v", err)
+	}
+	if _, err := os.Lstat(stale); err != nil {
+		t.Fatalf("a negative retention pruned a quarantine file: %v", err)
 	}
 }
 

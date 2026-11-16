@@ -342,8 +342,11 @@ func TestOrphanRecoveryServiceLifecycle(t *testing.T) {
 	if service.IsRunning() {
 		t.Fatal("IsRunning() = true after Stop")
 	}
-	if err := service.Stop(); err == nil {
-		t.Fatal("second Stop() error = nil, want error")
+	// Stop is idempotent: every background service in Venue returns nil when it
+	// was already stopped, so a deferred shutdown path can call it unconditionally
+	// without producing a spurious "stop failed" log.
+	if err := service.Stop(); err != nil {
+		t.Fatalf("second Stop() error = %v, want nil for an idempotent Stop", err)
 	}
 }
 

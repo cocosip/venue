@@ -191,7 +191,8 @@ func TestCleanupInvalidDatabaseBackups_MissingRootIsBestEffort(t *testing.T) {
 // database file of the managed layout plus a parseable quarantine stamp is a
 // quarantine, so a legal tenant directory name that merely contains the marker
 // is never mistaken for one.
-func TestIsQuarantinedDatabaseName(t *testing.T) {
+// TestQuarantineStamp pins the quarantine-name recogniser that the sweep relies on: a match is deleted, so a live tenant directory named like a quarantine must not match, while every real quarantine name must.
+func TestQuarantineStamp(t *testing.T) {
 	tests := []struct {
 		name string
 		want bool
@@ -235,8 +236,8 @@ func TestIsQuarantinedDatabaseName(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := isQuarantinedDatabaseName(test.name); got != test.want {
-				t.Fatalf("isQuarantinedDatabaseName(%q) = %v, want %v", test.name, got, test.want)
+			if _, got := quarantineStamp(test.name); got != test.want {
+				t.Fatalf("quarantineStamp(%q) ok = %v, want %v", test.name, got, test.want)
 			}
 		})
 	}

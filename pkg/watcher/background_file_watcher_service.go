@@ -62,7 +62,13 @@ type BackgroundFileWatcherServiceOptions struct {
 	// replaces them. The direct *PollingInterval and DisabledCheckInterval
 	// fields below are legacy conveniences kept for callers that only need the
 	// non-persisted schedule knobs; they are folded into the effective options
-	// and ServiceOptions wins whenever it sets the same value.
+	// and ServiceOptions wins whenever it sets the same interval.
+	//
+	// ServiceOptions.Enabled is not consulted at construction: a bool cannot
+	// distinguish "unset" from an explicit false, and construction must never
+	// silently disable scanning. Construction-time enablement is InitialEnabled
+	// (nil keeps scanning); the values set here are reported back by Options()
+	// and controlled at runtime through UpdateOptions/SetEnabled.
 	ServiceOptions core.FileWatcherServiceOptions
 
 	// MinimumPollingInterval is the minimum allowed polling interval.
@@ -89,27 +95,6 @@ type BackgroundFileWatcherServiceOptions struct {
 	//
 	// Deprecated: set ServiceOptions.DisabledCheckInterval instead.
 	DisabledCheckInterval time.Duration
-
-	// ServiceEnabled controls whether the service is globally enabled.
-	//
-	// Default: enabled. A zero value leaves the service ENABLED so that simply
-	// constructing the service cannot silently disable directory imports; use
-	// SetEnabled(false) to disable it at runtime. Callers that want to start the
-	// service disabled must call SetEnabled(false) explicitly or persist a
-	// disabled state through UpdateOptions.
-	//
-	// Deprecated: the effective enabled state is exposed by ServiceOptions.
-	ServiceEnabled bool
-
-	// Enabled is the global enabled flag at construction time.
-	//
-	// Like ServiceEnabled, a zero value is default-safe: it never disables the
-	// service on its own. An explicitly persisted disabled state (written by
-	// SetEnabled(false) or UpdateOptions) always wins, so a restart keeps an
-	// operator's decision. A construction-time disable must go through
-	// InitialEnabled, because a bool cannot distinguish "unset" from an explicit
-	// false.
-	Enabled bool
 
 	// InitialEnabled overrides the construction-time enabled state when non-nil:
 	// the service starts disabled when it points at false and enabled when it
@@ -196,7 +181,7 @@ type BackgroundFileWatcherService struct {
 
 	scheduleMu   sync.Mutex
 	nextScanDue  map[string]time.Time
-	warnedClamps map[string]bool
+	warnedClamps map[clampWarning]bool
 
 	// scanStateMu guards the process-wide concurrency bound and the one-scan-per-
 	// watcher invariant. The map contains only currently running watchers, so it
@@ -227,14 +212,15 @@ type BackgroundFileWatcherService struct {
 // Construction is default-safe: a zero or negative MaxParallelWatcherScans is an
 // "unset" marker here, so the documented parallel bound applies. The enabled
 // state is resolved separately: it starts enabled and only InitialEnabled can
-// override that at construction — ServiceEnabled, Enabled, and
-// ServiceOptions.Enabled can confirm but never disable it — and a persisted
-// document still outranks both. Construction-time input is never persisted: only
-// SetEnabled and UpdateOptions write the document, so an InitialEnabled=false
-// start keeps the service disabled for this process lifetime without becoming an
-// operator decision of record. A persisted document is validated; one that cannot
-// describe a runnable schedule is ignored with a safe warning and the defaults
-// apply.
+// override that at construction, while ServiceOptions.Enabled can confirm but
+// never disable it (its zero value is indistinguishable from "unset"), and a
+// persisted document still outranks both. Construction-time input is never
+// persisted: only SetEnabled and UpdateOptions write the document, so an
+// InitialEnabled=false start keeps the service disabled for this process
+// lifetime without becoming an operator decision of record. A persisted document
+// is validated; one that cannot describe a runnable schedule is ignored with a
+// safe warning and the defaults apply, with the resolved construction-time
+// enabled state preserved.
 func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) (*BackgroundFileWatcherService, error) {
 	if opts == nil {
 		return nil, fmt.Errorf("options cannot be nil: %w", core.ErrInvalidArgument)
@@ -278,16 +264,16 @@ func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) 
 	}
 
 	// Default-safe: a caller that leaves every enabled flag at its zero value
-	// still gets scanning, and only an explicitly persisted disable turns the
-	// service off. The legacy ServiceEnabled and Enabled flags can only confirm
-	// the enabled state, never disable it silently. InitialEnabled is the
-	// explicit construction-time override; SetEnabled(false) and UpdateOptions
-	// remain the way to disable the service at runtime, and their persisted
-	// document still outranks this input.
-	options.Enabled = true
+	// still gets scanning. ServiceOptions.Enabled is copied above but cannot
+	// express "explicit false", so the enabled state is decided by
+	// InitialEnabled alone; only an explicitly persisted document (SetEnabled or
+	// UpdateOptions) outranks it. The resolved value is kept so the invalid
+	// persisted-document fallback below cannot resurrect a disabled start.
+	constructionEnabled := true
 	if opts.InitialEnabled != nil {
-		options.Enabled = *opts.InitialEnabled
+		constructionEnabled = *opts.InitialEnabled
 	}
+	options.Enabled = constructionEnabled
 
 	// A non-positive parallel-scan bound is not usable as a concurrency limit, so
 	// a construction-time value that is zero or negative (Go's "unset" marker)
@@ -329,7 +315,7 @@ func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) 
 		})
 
 		normalized, err = applyServiceOptionsDefaults(core.FileWatcherServiceOptions{
-			Enabled:                 true,
+			Enabled:                 constructionEnabled,
 			MaxParallelWatcherScans: defaultMaxParallelScans,
 		})
 		if err != nil {
@@ -347,7 +333,7 @@ func NewBackgroundFileWatcherService(opts *BackgroundFileWatcherServiceOptions) 
 		initialDelay:  initialDelay,
 		configRootDir: configRootDir,
 		nextScanDue:   make(map[string]time.Time),
-		warnedClamps:  make(map[string]bool),
+		warnedClamps:  make(map[clampWarning]bool),
 		inFlightScans: make(map[string]bool),
 		scanWake:      make(chan struct{}, 1),
 	}
@@ -519,7 +505,7 @@ func (s *BackgroundFileWatcherService) Start() error {
 	s.wg.Add(1)
 	go s.run(ctx)
 
-	s.emit(ctx, slog.LevelInfo, "started", "Background file watcher service started")
+	s.emit(ctx, slog.LevelInfo, "watcher_service_started", "Background file watcher service started")
 
 	return nil
 }
@@ -544,13 +530,13 @@ func (s *BackgroundFileWatcherService) Stop() error {
 	cancel := s.cancel
 	s.stateMu.Unlock()
 
-	s.emit(ctx, slog.LevelInfo, "stopping", "Stopping background file watcher service")
+	s.emit(ctx, slog.LevelInfo, "watcher_service_stopping", "Stopping background file watcher service")
 
 	cancel()
 	s.wg.Wait()
 
 	if ctx != nil {
-		s.emit(ctx, slog.LevelInfo, "stopped", "Background file watcher service stopped")
+		s.emit(ctx, slog.LevelInfo, "watcher_service_stopped", "Background file watcher service stopped")
 	}
 
 	return nil
@@ -592,13 +578,21 @@ func (s *BackgroundFileWatcherService) IsEnabled() bool {
 }
 
 // run is the main loop that executes file watcher scans on a schedule.
+//
+// One timer is reused for every wait: the interval can be an hour long and every
+// scan release wakes the loop, so allocating a fresh time.After timer per
+// iteration would leave one unreachable timer per wake-up for the garbage
+// collector to reclaim.
 func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 	defer s.wg.Done()
 
-	s.emit(ctx, slog.LevelInfo, "initial_delay", "Background file watcher service waiting for initial delay", slog.Duration("delay", s.initialDelay))
+	s.emit(ctx, slog.LevelInfo, "watcher_service_initial_delay", "Background file watcher service waiting for initial delay", slog.Duration("delay", s.initialDelay))
+
+	timer := time.NewTimer(s.initialDelay)
+	defer timer.Stop()
 
 	select {
-	case <-time.After(s.initialDelay):
+	case <-timer.C:
 		// Continue
 	case <-ctx.Done():
 		return
@@ -607,7 +601,7 @@ func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			s.emit(ctx, slog.LevelInfo, "shutting_down", "File watcher service shutting down")
+			s.emit(ctx, slog.LevelInfo, "watcher_service_shutting_down", "File watcher service shutting down")
 
 			return
 		default:
@@ -616,10 +610,12 @@ func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 		options := s.Options()
 
 		if !options.Enabled {
-			s.emit(ctx, slog.LevelDebug, "disabled", "File watcher service is globally disabled", slog.Duration("check_interval", options.DisabledCheckInterval))
+			s.emit(ctx, slog.LevelDebug, "watcher_service_disabled", "File watcher service is globally disabled", slog.Duration("check_interval", options.DisabledCheckInterval))
+
+			resetTimer(timer, options.DisabledCheckInterval)
 
 			select {
-			case <-time.After(options.DisabledCheckInterval):
+			case <-timer.C:
 				continue
 			case <-ctx.Done():
 				return
@@ -627,10 +623,12 @@ func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 		}
 
 		interval := s.dispatchScanCycle(ctx)
-		s.emit(ctx, slog.LevelDebug, "next_scan", "Next scan cycle", slog.Duration("interval", interval))
+		s.emit(ctx, slog.LevelDebug, "watcher_service_next_scan", "Next scan cycle", slog.Duration("interval", interval))
+
+		resetTimer(timer, interval)
 
 		select {
-		case <-time.After(interval):
+		case <-timer.C:
 			// Continue to next cycle
 		case <-s.scanWake:
 			// A scan slot was released; re-evaluate the deferred watchers now
@@ -639,6 +637,39 @@ func (s *BackgroundFileWatcherService) run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// resetTimer re-arms a reusable timer for the next wait. The non-blocking drain
+// handles the case where the previous wait was abandoned through another select
+// case: the timer may have fired concurrently, and Reset on a timer with a
+// pending notification would otherwise deliver it to the next wait.
+func resetTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+
+	timer.Reset(delay)
+}
+
+// watcherScheduleEntry is the dispatch-time view of one watcher: the identity
+// and schedule fields the service actually reads. It deliberately carries no
+// patterns or other configuration, so the dispatch path never deep-copies a
+// configuration and never sorts.
+type watcherScheduleEntry struct {
+	WatcherID       string
+	Enabled         bool
+	PollingInterval time.Duration
+}
+
+// watcherScheduleSnapshotter is the optional FileWatcher capability the
+// dispatch path prefers over GetAllWatchers. Implementations outside this
+// package cannot satisfy it, so the dispatch path keeps a GetAllWatchers
+// fallback.
+type watcherScheduleSnapshotter interface {
+	scheduleSnapshot() []watcherScheduleEntry
 }
 
 // dispatchScanCycle starts due watcher scans without waiting for them. Each
@@ -650,13 +681,13 @@ func (s *BackgroundFileWatcherService) dispatchScanCycle(ctx context.Context) ti
 
 func (s *BackgroundFileWatcherService) dispatchScanCycleAt(ctx context.Context, now time.Time) time.Duration {
 	options := s.Options()
-	watchers, err := s.fileWatcher.GetAllWatchers(ctx)
+	watchers, err := s.scheduleEntries(ctx)
 	if err != nil {
 		s.emit(ctx, slog.LevelError, "watchers_get_failed", "Failed to get watchers", errorTypeAttr(err))
 		return options.DefaultPollingInterval
 	}
 
-	enabled := make([]*core.FileWatcherConfiguration, 0, len(watchers))
+	enabled := make([]watcherScheduleEntry, 0, len(watchers))
 	enabledIDs := make(map[string]bool, len(watchers))
 	for _, watcher := range watchers {
 		if watcher.Enabled {
@@ -682,7 +713,7 @@ func (s *BackgroundFileWatcherService) dispatchScanCycleAt(ctx context.Context, 
 		s.scheduleNext(watcher, now)
 		dispatched++
 		s.wg.Add(1)
-		go func(target *core.FileWatcherConfiguration) {
+		go func(target watcherScheduleEntry) {
 			defer s.wg.Done()
 			defer s.releaseWatcherScan(target.WatcherID)
 			s.scanWatcherOnce(ctx, target)
@@ -694,6 +725,34 @@ func (s *BackgroundFileWatcherService) dispatchScanCycleAt(ctx context.Context, 
 			slog.Int("count", dispatched), slog.Int("max_parallel", s.parallelScanLimit()))
 	}
 	return s.delayUntilNextDue(enabled, now)
+}
+
+// scheduleEntries returns the cheap schedule snapshot when the FileWatcher
+// provides one, and falls back to GetAllWatchers for an implementation that
+// cannot.
+func (s *BackgroundFileWatcherService) scheduleEntries(ctx context.Context) ([]watcherScheduleEntry, error) {
+	if snapshotter, ok := s.fileWatcher.(watcherScheduleSnapshotter); ok {
+		return snapshotter.scheduleSnapshot(), nil
+	}
+
+	wave, err := s.fileWatcher.GetAllWatchers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]watcherScheduleEntry, 0, len(wave))
+	for _, config := range wave {
+		if config == nil {
+			continue
+		}
+		entries = append(entries, watcherScheduleEntry{
+			WatcherID:       config.WatcherID,
+			Enabled:         config.Enabled,
+			PollingInterval: config.PollingInterval,
+		})
+	}
+
+	return entries, nil
 }
 
 func (s *BackgroundFileWatcherService) reserveWatcherScan(watcherID string, limit int) bool {
@@ -723,23 +782,17 @@ func (s *BackgroundFileWatcherService) releaseWatcherScan(watcherID string) {
 	}
 }
 
-// scanTotals accumulates the per-watcher scan results of one cycle.
-type scanTotals struct {
-	imported int
-	failed   int
-	skipped  int
-	bytes    int64
-}
-
+// scanWatcherOnce scans one watcher and reports its outcome. The caller only
+// needs the side effects: the aggregate counters were never consumed.
 func (s *BackgroundFileWatcherService) scanWatcherOnce(
 	ctx context.Context,
-	watcher *core.FileWatcherConfiguration,
-) scanTotals {
+	watcher watcherScheduleEntry,
+) {
 	result, err := s.fileWatcher.ScanNow(ctx, watcher.WatcherID)
 	if err != nil {
 		s.emit(ctx, slog.LevelError, "watcher_scan_failed", "Failed to scan watcher", slog.String("watcher_id", watcher.WatcherID), errorTypeAttr(err))
 
-		return scanTotals{}
+		return
 	}
 
 	if result.FilesImported > 0 || result.FilesFailed > 0 ||
@@ -764,13 +817,6 @@ func (s *BackgroundFileWatcherService) scanWatcherOnce(
 			slog.String("watcher_id", watcher.WatcherID),
 			slog.Int("count", result.FilesDiscovered))
 	}
-
-	return scanTotals{
-		imported: result.FilesImported,
-		failed:   result.FilesFailed,
-		skipped:  result.FilesSkipped,
-		bytes:    result.BytesImported,
-	}
 }
 
 // nextDue returns the time a watcher is next due, creating the schedule entry on
@@ -781,8 +827,8 @@ func (s *BackgroundFileWatcherService) scanWatcherOnce(
 // sleeping until its previous, longer due time, so an UpdateWatcher that shortens
 // a schedule or moves a watch path would not take effect until that stale
 // deadline passed.
-func (s *BackgroundFileWatcherService) nextDue(watcher *core.FileWatcherConfiguration, now time.Time) time.Time {
-	maxDue := now.Add(s.pollingIntervalFor(watcher))
+func (s *BackgroundFileWatcherService) nextDue(watcher watcherScheduleEntry, now time.Time) time.Time {
+	maxDue := now.Add(s.pollingIntervalForSchedule(watcher))
 
 	s.scheduleMu.Lock()
 	defer s.scheduleMu.Unlock()
@@ -803,8 +849,8 @@ func (s *BackgroundFileWatcherService) nextDue(watcher *core.FileWatcherConfigur
 }
 
 // scheduleNext records when a watcher should be scanned next.
-func (s *BackgroundFileWatcherService) scheduleNext(watcher *core.FileWatcherConfiguration, now time.Time) {
-	interval := s.pollingIntervalFor(watcher)
+func (s *BackgroundFileWatcherService) scheduleNext(watcher watcherScheduleEntry, now time.Time) {
+	interval := s.pollingIntervalForSchedule(watcher)
 
 	s.scheduleMu.Lock()
 	defer s.scheduleMu.Unlock()
@@ -818,7 +864,7 @@ func (s *BackgroundFileWatcherService) scheduleNext(watcher *core.FileWatcherCon
 // re-dispatched when a scan slot is released (see releaseWatcherScan), so the
 // loop is not polled at a fixed short interval while slots stay busy. The
 // default polling interval is the safety net when every watcher is due.
-func (s *BackgroundFileWatcherService) delayUntilNextDue(watchers []*core.FileWatcherConfiguration, now time.Time) time.Duration {
+func (s *BackgroundFileWatcherService) delayUntilNextDue(watchers []watcherScheduleEntry, now time.Time) time.Duration {
 	if len(watchers) == 0 {
 		return s.Options().DefaultPollingInterval
 	}
@@ -852,9 +898,9 @@ func (s *BackgroundFileWatcherService) pruneSchedule(enabledIDs map[string]bool)
 		}
 	}
 
-	for watcherID := range s.warnedClamps {
-		if enabledIDs == nil || !enabledIDs[watcherID] {
-			delete(s.warnedClamps, watcherID)
+	for key := range s.warnedClamps {
+		if enabledIDs == nil || !enabledIDs[key.watcherID] {
+			delete(s.warnedClamps, key)
 		}
 	}
 }
@@ -862,31 +908,53 @@ func (s *BackgroundFileWatcherService) pruneSchedule(enabledIDs map[string]bool)
 // pollingIntervalFor returns a watcher's effective polling interval, clamped to
 // [MinimumPollingInterval, MaximumPollingInterval].
 func (s *BackgroundFileWatcherService) pollingIntervalFor(watcher *core.FileWatcherConfiguration) time.Duration {
+	return s.effectivePollingInterval(watcher.WatcherID, watcher.PollingInterval)
+}
+
+// pollingIntervalForSchedule is the dispatch-path form of pollingIntervalFor: it
+// never needs the watcher's configuration.
+func (s *BackgroundFileWatcherService) pollingIntervalForSchedule(watcher watcherScheduleEntry) time.Duration {
+	return s.effectivePollingInterval(watcher.WatcherID, watcher.PollingInterval)
+}
+
+func (s *BackgroundFileWatcherService) effectivePollingInterval(watcherID string, requested time.Duration) time.Duration {
 	options := s.Options()
 
-	interval := watcher.PollingInterval
+	interval := requested
 	if interval <= 0 {
 		interval = options.DefaultPollingInterval
 	}
 
 	switch {
 	case interval < options.MinimumPollingInterval:
-		s.warnClamp(watcher.WatcherID, interval, options.MinimumPollingInterval, true)
+		s.warnClamp(watcherID, interval, options.MinimumPollingInterval, true)
 		interval = options.MinimumPollingInterval
 	case interval > options.MaximumPollingInterval:
-		s.warnClamp(watcher.WatcherID, interval, options.MaximumPollingInterval, false)
+		s.warnClamp(watcherID, interval, options.MaximumPollingInterval, false)
 		interval = options.MaximumPollingInterval
 	}
 
 	return interval
 }
 
-// warnClamp emits the interval clamp notice once per watcher and direction.
+// clampWarning identifies one variation of the one-time interval clamp notice.
+type clampWarning struct {
+	watcherID string
+	// belowMinimum distinguishes the "too short" notice from the "too long"
+	// one, so a watcher clamped in both directions reports both.
+	belowMinimum bool
+}
+
+// warnClamp emits the interval clamp notice once per watcher and direction, so a
+// watcher that is clamped low and later clamped high reports both conditions
+// instead of only the first one it hit.
 func (s *BackgroundFileWatcherService) warnClamp(watcherID string, requested, applied time.Duration, belowMinimum bool) {
+	key := clampWarning{watcherID: watcherID, belowMinimum: belowMinimum}
+
 	s.scheduleMu.Lock()
-	alreadyWarned := s.warnedClamps[watcherID]
+	alreadyWarned := s.warnedClamps[key]
 	if !alreadyWarned {
-		s.warnedClamps[watcherID] = true
+		s.warnedClamps[key] = true
 	}
 	s.scheduleMu.Unlock()
 

@@ -100,10 +100,15 @@ type StoragePool interface {
 	// GetFileStatus returns the current processing status of a file.
 	GetFileStatus(ctx context.Context, tenant TenantContext, fileKey string) (FileProcessingStatus, error)
 
-	// GetTotalCapacity returns the total capacity across all mounted volumes.
+	// GetTotalCapacity returns the summed capacity of the volumes that are
+	// currently healthy. A volume that is unhealthy or unmounted is excluded, so
+	// the result reflects usable capacity rather than installed capacity, and it
+	// returns ctx.Err() when the snapshot is cancelled.
 	GetTotalCapacity(ctx context.Context) (int64, error)
 
-	// GetAvailableSpace returns the available space across all mounted volumes.
+	// GetAvailableSpace returns the summed available space of the volumes that
+	// are currently healthy, with the same exclusions and cancellation contract
+	// as GetTotalCapacity.
 	GetAvailableSpace(ctx context.Context) (int64, error)
 }
 

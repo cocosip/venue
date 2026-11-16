@@ -33,26 +33,6 @@ const minimumSQLiteFileSize = 100
 
 // DatabaseHealthCheckerOptions configures the database health checker.
 type DatabaseHealthCheckerOptions struct {
-	// MetadataDatabasePath is accepted for backward compatibility and ignored.
-	//
-	// It used to name the single shared BadgerDB metadata directory
-	// ("<MetadataDirectory>/shared/metadata"). The SQLite layout has no shared
-	// metadata database: every tenant owns
-	// "{MetadataDataPath}/{tenantId}/metadata.db", and the caller has no way to
-	// know the tenant set up front, so a single database path cannot describe
-	// the layout. Setting the field is not an error; it has no effect.
-	MetadataDatabasePath string
-
-	// DirectoryQuotaDatabasePath is accepted for backward compatibility and
-	// ignored.
-	//
-	// It used to name the directory quota BadgerDB directory
-	// ("<QuotaDirectory>/quota"). The SQLite layout stores one
-	// "{DirectoryQuotaDataPath}/{tenantId}/quotas.db" per tenant, so a single
-	// database path cannot describe the layout. Setting the field is not an
-	// error; it has no effect.
-	DirectoryQuotaDatabasePath string
-
 	// MetadataDataPath is the metadata root that holds the per-tenant metadata
 	// databases, conventionally config.Config.MetadataDirectory. The checker
 	// derives "{MetadataDataPath}/{tenantId}/metadata.db" from it for every
@@ -91,19 +71,15 @@ type databaseHealthChecker struct {
 
 // NewDatabaseHealthChecker creates a new database health checker.
 //
-// MetadataDataPath must name the metadata root (or, for compatibility, the
-// ignored MetadataDatabasePath must be non-empty); otherwise
+// MetadataDataPath must name the metadata root, otherwise
 // core.ErrInvalidArgument is returned. DirectoryQuotaDataPath is optional and
 // disables directory quota checks when empty.
-//
-// MetadataDatabasePath and DirectoryQuotaDatabasePath are accepted and ignored;
-// see DatabaseHealthCheckerOptions.
 func NewDatabaseHealthChecker(opts *DatabaseHealthCheckerOptions) (core.DatabaseHealthChecker, error) {
 	if opts == nil {
 		return nil, fmt.Errorf("options cannot be nil: %w", core.ErrInvalidArgument)
 	}
 
-	if opts.MetadataDataPath == "" && opts.MetadataDatabasePath == "" {
+	if opts.MetadataDataPath == "" {
 		return nil, fmt.Errorf("metadata data path cannot be empty: %w", core.ErrInvalidArgument)
 	}
 

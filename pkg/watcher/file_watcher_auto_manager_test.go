@@ -341,21 +341,74 @@ func TestFileWatcherAutoManager_ApplyPicksUpNewTenantDirectory(t *testing.T) {
 	}
 }
 
-func TestFileWatcherAutoManager_NonMultiTenantRootWithoutTenantIsRejected(t *testing.T) {
-	rootPath := t.TempDir()
-
-	manager, _ := newTestAutoManager(t, filepath.Join(t.TempDir(), "state"), nil)
-
-	_, err := manager.ApplyRootConfiguration(context.Background(), &core.FileWatcherRootConfiguration{
-		RootPath:        rootPath,
-		MultiTenantMode: false,
-		Enabled:         true,
-	})
-	if err == nil {
-		t.Fatalf("ApplyRootConfiguration() error = nil, want core.ErrInvalidArgument for a root without a derivable tenant")
+// TestFileWatcherAutoManager_SingleTenantRootBecomesOneWatcher pins the public
+// contract: "When root.MultiTenantMode is false, the root itself becomes a
+// single watcher." The root template carries no tenant ID, so the root's base
+// name is the derived tenant ID and the tenant segment of the watcher ID.
+func TestFileWatcherAutoManager_SingleTenantRootBecomesOneWatcher(t *testing.T) {
+	rootPath := filepath.Join(t.TempDir(), "incoming")
+	if err := os.Mkdir(rootPath, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
 	}
-	if !errors.Is(err, core.ErrInvalidArgument) {
-		t.Fatalf("ApplyRootConfiguration() error = %v, want core.ErrInvalidArgument", err)
+
+	manager, watcher := newTestAutoManager(t, filepath.Join(t.TempDir(), "state"), nil)
+
+	root := multiTenantRootTemplate(rootPath)
+	root.MultiTenantMode = false
+
+	created, err := manager.ApplyRootConfiguration(context.Background(), &root)
+	if err != nil {
+		t.Fatalf("ApplyRootConfiguration() error = %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("ApplyRootConfiguration() = %d, want one watcher for the root itself", created)
+	}
+
+	tenantID := rootIDBaseName(rootPath)
+	watcherID := generatedWatcherID(rootPath, tenantID)
+
+	config, err := watcher.GetWatcher(context.Background(), watcherID)
+	if err != nil {
+		t.Fatalf("GetWatcher(%q) error = %v", watcherID, err)
+	}
+	if config.WatchPath != rootPath {
+		t.Fatalf("WatchPath = %q, want the root itself %q", config.WatchPath, rootPath)
+	}
+	if config.MultiTenantMode {
+		t.Fatalf("MultiTenantMode = true, want a single-tenant watcher")
+	}
+	if config.TenantID != tenantID {
+		t.Fatalf("TenantID = %q, want the root base name %q", config.TenantID, tenantID)
+	}
+	if !config.Enabled || config.PollingInterval != root.PollingInterval {
+		t.Fatalf("generated watcher = %+v, want the root template's settings", config)
+	}
+	if !strings.HasPrefix(watcherID, generatedWatcherIDPrefix) {
+		t.Fatalf("watcher ID %q is not marked as derived", watcherID)
+	}
+
+	all, err := watcher.GetAllWatchers(context.Background())
+	if err != nil {
+		t.Fatalf("GetAllWatchers() error = %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("GetAllWatchers() = %d watchers, want exactly one for a single-tenant root", len(all))
+	}
+
+	// Applying again updates instead of duplicating.
+	if created, err := manager.ApplyRootConfiguration(context.Background(), &root); err != nil || created != 1 {
+		t.Fatalf("ApplyRootConfiguration() #2 = %d, %v; want 1, nil", created, err)
+	}
+	if all, err := watcher.GetAllWatchers(context.Background()); err != nil || len(all) != 1 {
+		t.Fatalf("GetAllWatchers() after re-apply = %d, %v; want one watcher", len(all), err)
+	}
+
+	// RemoveAllWatchers keeps its "derived watchers only" semantics.
+	if err := manager.RemoveAllWatchers(context.Background()); err != nil {
+		t.Fatalf("RemoveAllWatchers() error = %v", err)
+	}
+	if _, err := watcher.GetWatcher(context.Background(), watcherID); err == nil {
+		t.Fatalf("the derived single-tenant watcher survived RemoveAllWatchers()")
 	}
 }
 
@@ -371,6 +424,33 @@ func TestFileWatcherAutoManager_InvalidRootPathIsRejected(t *testing.T) {
 
 	if _, err := manager.ApplyRootConfiguration(context.Background(), &core.FileWatcherRootConfiguration{MultiTenantMode: true}); err == nil {
 		t.Fatalf("ApplyRootConfiguration() error = nil, want an error for an empty root path")
+	}
+}
+
+// TestFileWatcherAutoManager_SingleTenantRootRejectsInvalidTenantName proves a
+// root whose base name cannot be a tenant ID is reported instead of silently
+// registering a watcher that could never import.
+func TestFileWatcherAutoManager_SingleTenantRootRejectsInvalidTenantName(t *testing.T) {
+	rootPath := filepath.Join(t.TempDir(), ".hidden")
+	if err := os.Mkdir(rootPath, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+
+	manager, watcher := newTestAutoManager(t, filepath.Join(t.TempDir(), "state"), nil)
+
+	root := multiTenantRootTemplate(rootPath)
+	root.MultiTenantMode = false
+
+	if _, err := manager.ApplyRootConfiguration(context.Background(), &root); !errors.Is(err, core.ErrInvalidArgument) {
+		t.Fatalf("ApplyRootConfiguration() error = %v, want core.ErrInvalidArgument for an invalid derived tenant name", err)
+	}
+
+	all, err := watcher.GetAllWatchers(context.Background())
+	if err != nil {
+		t.Fatalf("GetAllWatchers() error = %v", err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("GetAllWatchers() = %d watchers, want none for an invalid derived tenant name", len(all))
 	}
 }
 

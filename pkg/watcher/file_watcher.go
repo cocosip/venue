@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -177,12 +178,13 @@ type fileWatcher struct {
 	// so a steady-state scan does not stat each of them again.
 	tenantDirCache map[string]cachedTenantDirectories
 
-	// pruneMu guards prunedOnce and lastPrunedAt.
+	// pruneMu guards pruneRuns.
 	pruneMu sync.Mutex
-	// prunedOnce reports whether the throttled history prune ran at least once.
-	prunedOnce bool
-	// lastPrunedAt is when the throttled history prune last ran.
-	lastPrunedAt time.Time
+	// pruneRuns records, per watcher ID, when the throttled history prune last
+	// ran. The throttle knob and the prune scope are per watcher, so the state
+	// that bounds them must be keyed the same way: one watcher's scan must not
+	// consume another watcher's window.
+	pruneRuns map[string]time.Time
 
 	// importedFilesMu guards importedCount and the flush bookkeeping. It is
 	// never held across history serialization or file I/O.
@@ -297,6 +299,7 @@ func NewFileWatcher(opts *FileWatcherOptions) (core.FileWatcher, error) {
 		scheduleHistoryFlush: time.AfterFunc,
 		tenantCache:          make(map[string]cachedTenantList),
 		tenantDirCache:       make(map[string]cachedTenantDirectories),
+		pruneRuns:            make(map[string]time.Time),
 	}
 
 	// Load imported files history
@@ -569,12 +572,12 @@ func (w *fileWatcher) UpdateWatcher(ctx context.Context, config *core.FileWatche
 // prepareConfiguration validates a caller-supplied configuration with
 // RegisterWatcher's rules and returns the immutable snapshot to store.
 //
-// The snapshot is normalized: blank file patterns are dropped (falling back to
-// "*"), invalid globs are rejected, negative concurrency is rejected, zero
-// polling interval and minimum file age fall back to the runtime defaults, and
-// the watch directory is created when missing. A persisted runtime
-// enable/disable decision for the watcher ID outranks the configured Enabled
-// flag.
+// The snapshot is normalized: blank file patterns are dropped, invalid globs are
+// rejected, surviving patterns are lower-cased (matching is case-insensitive),
+// negative concurrency is rejected, zero polling interval and minimum file age
+// fall back to the runtime defaults, and the watch directory is created when
+// missing. A persisted runtime enable/disable decision for the watcher ID
+// outranks the configured Enabled flag.
 //
 // The returned pointer is owned by the caller and must not alias caller state.
 func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration) (*core.FileWatcherConfiguration, error) {
@@ -584,9 +587,10 @@ func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration
 
 	// The watcher ID becomes a directory segment below the failure directory
 	// and the key of persisted state files, so it must never carry path
-	// separators, traversal segments, or control characters.
-	if err := validateWatcherID(config.WatcherID); err != nil {
-		return nil, err
+	// separators, traversal segments, reserved filename characters, device
+	// names, or control characters, and must fit the length cap.
+	if err := core.ValidateWatcherID(config.WatcherID); err != nil {
+		return nil, fmt.Errorf("invalid watcher ID: %w", err)
 	}
 
 	// Validate tenant in single-tenant mode
@@ -657,9 +661,15 @@ func (w *fileWatcher) prepareConfiguration(config *core.FileWatcherConfiguration
 	return &stored, nil
 }
 
-// UnregisterWatcher removes a file watcher and drops its persisted runtime
-// enable/disable decision, so a later registration of the same watcher ID
-// starts from configuration again.
+// UnregisterWatcher removes a file watcher and drops every per-watcher entry it
+// left behind: the persisted runtime enable/disable decision and the in-memory
+// tenant, tenant-directory, prune-throttle and idempotence-warning caches.
+//
+// A later registration of the same watcher ID therefore starts from
+// configuration and a clean cache again. The auto manager registers and
+// unregisters one watcher per tenant directory every cycle, so keeping this
+// state keyed by a watcher that no longer exists would grow the maps without
+// bound.
 //
 // Dropping the persisted entry is best-effort: if the state file cannot be
 // written the watcher is still removed in memory and nil is returned, because
@@ -670,6 +680,18 @@ func (w *fileWatcher) UnregisterWatcher(ctx context.Context, watcherID string) e
 	}
 
 	w.watchers.Delete(watcherID)
+
+	w.tenantCacheMu.Lock()
+	delete(w.tenantCache, watcherID)
+	delete(w.tenantDirCache, watcherID)
+	w.tenantCacheMu.Unlock()
+
+	w.pruneMu.Lock()
+	delete(w.pruneRuns, watcherID)
+	w.pruneMu.Unlock()
+
+	w.warnedIdempotentFallback.Delete(watcherID)
+
 	w.removeWatcherState(ctx, watcherID)
 
 	return nil
@@ -735,6 +757,44 @@ func (w *fileWatcher) HasEnabledWatcher() bool {
 	})
 
 	return enabled
+}
+
+// scheduleSnapshot implements watcherScheduleSnapshotter: it returns the
+// schedule fields of every watcher without copying configurations, and without
+// sorting, because the background service schedules each watcher independently
+// and never needs an order.
+func (w *fileWatcher) scheduleSnapshot() []watcherScheduleEntry {
+	entries := make([]watcherScheduleEntry, 0)
+
+	w.watchers.Range(func(key, value interface{}) bool {
+		watcherID, ok := key.(string)
+		if !ok {
+			return true
+		}
+
+		entry, ok := value.(*watcherEntry)
+		if !ok {
+			return true
+		}
+
+		entry.mu.Lock()
+		enabled := entry.config != nil && entry.config.Enabled
+		interval := time.Duration(0)
+		if entry.config != nil {
+			interval = entry.config.PollingInterval
+		}
+		entry.mu.Unlock()
+
+		entries = append(entries, watcherScheduleEntry{
+			WatcherID:       watcherID,
+			Enabled:         enabled,
+			PollingInterval: interval,
+		})
+
+		return true
+	})
+
+	return entries
 }
 
 // GetWatchersForTenant returns the watchers that import for one tenant, sorted
@@ -826,9 +886,13 @@ func (w *fileWatcher) ScanAllWatchers(ctx context.Context) (map[string]*core.Fil
 
 		result, err := w.scanWatcher(ctx, config)
 		if err != nil {
-			w.emit(ctx, slog.LevelError, "scan_failed", "Failed to scan watcher", slog.String("watcher_id", watcherID), errorTypeAttr(err))
+			// The same scan failure the background service reports uses the same
+			// stable event name, and the caller-visible error is reduced to its
+			// type: *fs.PathError embeds the full physical path and the original
+			// file name.
+			w.emit(ctx, slog.LevelError, "watcher_scan_failed", "Failed to scan watcher", slog.String("watcher_id", watcherID), errorTypeAttr(err))
 			result = &core.FileWatcherScanResult{
-				Errors: []string{err.Error()},
+				Errors: []string{fmt.Sprintf("watcher %s scan failed: %s", watcherID, errorTypeText(err))},
 			}
 		}
 
@@ -898,20 +962,18 @@ func (w *fileWatcher) recordScanStatistics(config *core.FileWatcherConfiguration
 
 	timestamp := time.Now().UTC()
 
-	dimensions := func() map[string]string {
-		return map[string]string{
-			core.StatisticsDimensionTenantID:  config.TenantID,
-			core.StatisticsDimensionWatcherID: config.WatcherID,
-			core.StatisticsDimensionOperation: "scan",
-		}
+	dimensions := map[string]string{
+		core.StatisticsDimensionTenantID:  config.TenantID,
+		core.StatisticsDimensionWatcherID: config.WatcherID,
+		core.StatisticsDimensionOperation: "scan",
 	}
 
-	w.statistics.Record(core.StatisticWatcherScanCount, 1, timestamp, dimensions())
-	w.statistics.Record(core.StatisticWatcherFilesDiscovered, int64(result.FilesDiscovered), timestamp, dimensions())
-	w.statistics.Record(core.StatisticWatcherFilesImported, int64(result.FilesImported), timestamp, dimensions())
-	w.statistics.Record(core.StatisticWatcherFilesSkipped, int64(result.FilesSkipped), timestamp, dimensions())
-	w.statistics.Record(core.StatisticWatcherFilesFailed, int64(result.FilesFailed), timestamp, dimensions())
-	w.statistics.Record(core.StatisticWatcherBytesImported, result.BytesImported, timestamp, dimensions())
+	w.statistics.Record(core.StatisticWatcherScanCount, 1, timestamp, dimensions)
+	w.statistics.Record(core.StatisticWatcherFilesDiscovered, int64(result.FilesDiscovered), timestamp, dimensions)
+	w.statistics.Record(core.StatisticWatcherFilesImported, int64(result.FilesImported), timestamp, dimensions)
+	w.statistics.Record(core.StatisticWatcherFilesSkipped, int64(result.FilesSkipped), timestamp, dimensions)
+	w.statistics.Record(core.StatisticWatcherFilesFailed, int64(result.FilesFailed), timestamp, dimensions)
+	w.statistics.Record(core.StatisticWatcherBytesImported, result.BytesImported, timestamp, dimensions)
 }
 
 // scanSingleTenant scans files in single-tenant mode.
@@ -924,7 +986,7 @@ func (w *fileWatcher) recordScanStatistics(config *core.FileWatcherConfiguration
 // about to be imported.
 func (w *fileWatcher) scanSingleTenant(ctx context.Context, config *core.FileWatcherConfiguration, result *core.FileWatcherScanResult, startTime time.Time) (*core.FileWatcherScanResult, error) {
 	// Discover files
-	files, err := w.discoverFiles(ctx, config.WatchPath, config)
+	files, err := w.discoverFiles(ctx, config.WatchPath, config, result)
 	if err != nil {
 		return result, fmt.Errorf("failed to discover files: %w", err)
 	}
@@ -979,7 +1041,7 @@ func (w *fileWatcher) scanMultiTenant(ctx context.Context, config *core.FileWatc
 		tenantID := entry.Name()
 		tenantPath := filepath.Join(config.WatchPath, tenantID)
 
-		files, err := w.discoverFiles(ctx, tenantPath, config)
+		files, err := w.discoverFiles(ctx, tenantPath, config, result)
 		if err != nil {
 			w.addResultError(result, fmt.Sprintf("watcher %s discovery failed: %s", config.WatcherID, errorTypeText(err)))
 			continue
@@ -1107,12 +1169,36 @@ func (w *fileWatcher) addResultError(result *core.FileWatcherScanResult, message
 // discoverFiles discovers files in a directory based on configuration.
 //
 // IncludeSubdirectories selects recursive discovery; otherwise only the top
-// directory is scanned. Errors are reported to the caller instead of being
-// silently swallowed so an unreadable directory is visible in the scan result.
-func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config *core.FileWatcherConfiguration) ([]string, error) {
+// directory is scanned. An unreadable entry or directory is recorded on the scan
+// result through errorTypeText instead of being silently swallowed, so the
+// caller sees that discovery was incomplete without leaking a physical path or
+// an original file name.
+//
+// Each entry's name is matched against the patterns exactly once, before the
+// age and size gates, so the match is never repeated for the same file. The
+// patterns are lower-cased once per call, because pattern matching is
+// case-insensitive.
+func (w *fileWatcher) discoverFiles(
+	ctx context.Context,
+	dirPath string,
+	config *core.FileWatcherConfiguration,
+	result *core.FileWatcherScanResult,
+) ([]string, error) {
 	var files []string
 
-	appendFile := func(path string, info os.FileInfo) {
+	patterns := lowerFilePatterns(config.FilePatterns)
+
+	report := func(err error) {
+		if result == nil {
+			return
+		}
+
+		w.addResultError(result, fmt.Sprintf("watcher %s discovery failed: %s", config.WatcherID, errorTypeText(err)))
+	}
+
+	// addCandidate applies the age and size gates to an entry whose pattern was
+	// already matched by the caller.
+	addCandidate := func(path string, info os.FileInfo) {
 		if info.IsDir() {
 			return
 		}
@@ -1124,11 +1210,6 @@ func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config 
 
 		// Check file size
 		if config.MaxFileSizeBytes > 0 && info.Size() > config.MaxFileSizeBytes {
-			return
-		}
-
-		// Check file patterns
-		if !matchesAnyPattern(info.Name(), config.FilePatterns) {
 			return
 		}
 
@@ -1152,16 +1233,18 @@ func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config 
 
 			// Match the name before the stat: a candidate that cannot match is
 			// never touched.
-			if !matchesAnyPattern(entry.Name(), config.FilePatterns) {
+			if !matchesAnyPattern(entry.Name(), patterns) {
 				continue
 			}
 
 			info, err := entry.Info()
 			if err != nil {
+				report(err)
+
 				continue
 			}
 
-			appendFile(filepath.Join(dirPath, entry.Name()), info)
+			addCandidate(filepath.Join(dirPath, entry.Name()), info)
 		}
 
 		return files, nil
@@ -1169,14 +1252,21 @@ func (w *fileWatcher) discoverFiles(ctx context.Context, dirPath string, config 
 
 	walkErr := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // Skip unreadable entries; the parent walk continues.
+			// Report the unreadable entry and keep walking its siblings.
+			report(err)
+
+			return nil
 		}
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 
-		appendFile(path, info)
+		if !matchesAnyPattern(info.Name(), patterns) {
+			return nil
+		}
+
+		addCandidate(path, info)
 
 		return nil
 	})
@@ -1228,7 +1318,10 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	if err != nil {
 		return outcome, fmt.Errorf("failed to open file: %w", err)
 	}
-	defer func() { _ = file.Close() }()
+	// The handle is bound by value: `file` is reassigned by the reopen below, so a
+	// closure that captured the variable would close the wrong handle and stop
+	// guarding the one it was registered for.
+	defer func(opened *os.File) { _ = opened.Close() }(file)
 
 	fileInfo, err := file.Stat()
 	if err != nil {
@@ -1284,7 +1377,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 			Fingerprint:       fingerprint,
 			OperationID:       operationID,
 			Action:            sourceCleanupAction(config.PostImportAction),
-			MoveTargetPath:    moveTargetPathForConfig(filePath, config),
+			MoveTargetPath:    moveTargetPathForConfig(ctx, filePath, config),
 			FailureDirectory:  failureDirectory,
 			MaxAttempts:       config.MaxPostImportActionRetryCount,
 			RetryInitialDelay: config.PostImportActionRetryInitialDelay,
@@ -1318,6 +1411,10 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	if err != nil {
 		return outcome, fmt.Errorf("failed to reopen file for import: %w", err)
 	}
+	// The reopening is a second handle the first defer cannot see, so it needs its
+	// own release: without it the many error returns below leak the descriptor
+	// until the process exits.
+	defer func(opened *os.File) { _ = opened.Close() }(file)
 
 	var fileKey string
 	if idempotent, ok := w.storagePool.(core.IdempotentStoragePool); ok {
@@ -1370,7 +1467,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 		PostImportAction:        config.PostImportAction,
 	}
 	if config.PostImportAction == core.PostImportActionMove {
-		pending.MoveTargetPath, _ = resolveMoveTargetPath(filePath, config.MoveToDirectory)
+		pending.MoveTargetPath, _ = resolveMoveTargetPath(ctx, filePath, config.MoveToDirectory)
 		if pending.MoveTargetPath == "" {
 			// Preserve the durable pending-action record even when the move
 			// directory itself is invalid; the action retry path will report and
@@ -1390,7 +1487,7 @@ func (w *fileWatcher) importFile(ctx context.Context, tenant core.TenantContext,
 	}
 
 	if err := w.removeImportedStateSync(filePath, config); err != nil {
-		w.emit(ctx, slog.LevelWarn, "history_save_failed", "Failed to remove completed post-import state", errorTypeAttr(err))
+		w.emit(ctx, slog.LevelWarn, "post_import_state_remove_failed", "Failed to remove completed post-import state", errorTypeAttr(err))
 	}
 
 	w.emit(ctx, slog.LevelInfo, "file_imported", "Imported watched file",
@@ -1424,11 +1521,11 @@ func sourceCleanupAction(action core.PostImportAction) SourceCleanupAction {
 	}
 }
 
-func moveTargetPathForConfig(filePath string, config *core.FileWatcherConfiguration) string {
+func moveTargetPathForConfig(ctx context.Context, filePath string, config *core.FileWatcherConfiguration) string {
 	if config == nil || config.PostImportAction != core.PostImportActionMove || config.MoveToDirectory == "" {
 		return ""
 	}
-	target, err := resolveMoveTargetPath(filePath, config.MoveToDirectory)
+	target, err := resolveMoveTargetPath(ctx, filePath, config.MoveToDirectory)
 	if err == nil && target != "" {
 		return target
 	}
@@ -1665,7 +1762,24 @@ func isCrossDeviceRenameError(err error) bool {
 		strings.Contains(message, "different disk drive")
 }
 
-func resolveMoveTargetPath(filePath string, targetDir string) (string, error) {
+// maxMoveTargetNameAttempts bounds the collision probe for a move target name.
+// Every other loop in the package is bounded and cancellation-aware; an
+// unbounded probe would keep stat-ing candidates for as long as the target
+// directory kept collecting same-named files.
+const maxMoveTargetNameAttempts = 1000
+
+// resolveMoveTargetPath returns a free name for a file moved into targetDir,
+// suffixing "_<n>" on collision.
+//
+// The probe observes ctx so a cancelled scan stops early, and it is capped by
+// maxMoveTargetNameAttempts so a directory full of collisions fails loudly
+// instead of spinning. The returned error never embeds the candidate physical
+// path, because it reaches the caller through the scan result.
+func resolveMoveTargetPath(ctx context.Context, filePath string, targetDir string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	if targetInfo, err := os.Stat(targetDir); err == nil {
 		if !targetInfo.IsDir() {
 			return "", fmt.Errorf("move target %q is not a directory", targetDir)
@@ -1677,7 +1791,11 @@ func resolveMoveTargetPath(filePath string, targetDir string) (string, error) {
 	fileName := filepath.Base(filePath)
 	extension := filepath.Ext(fileName)
 	nameWithoutExt := strings.TrimSuffix(fileName, extension)
-	for counter := 0; ; counter++ {
+	for counter := 0; counter < maxMoveTargetNameAttempts; counter++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
 		candidateName := fileName
 		if counter > 0 {
 			candidateName = fmt.Sprintf("%s_%d%s", nameWithoutExt, counter, extension)
@@ -1690,6 +1808,8 @@ func resolveMoveTargetPath(filePath string, targetDir string) (string, error) {
 			return "", fmt.Errorf("failed to inspect move target %q: %w", candidate, err)
 		}
 	}
+
+	return "", fmt.Errorf("no unused move target name found after %d attempts", maxMoveTargetNameAttempts)
 }
 
 func (w *fileWatcher) tryProcessPendingPostImportAction(
@@ -1764,20 +1884,35 @@ func (w *fileWatcher) recordPostImportActionFailure(
 }
 
 func postImportActionRetryDelay(config *core.FileWatcherConfiguration, failureCount int) time.Duration {
-	delay := config.PostImportActionRetryInitialDelay
-	if delay <= 0 {
+	return cappedExponentialDelay(
+		config.PostImportActionRetryInitialDelay,
+		config.PostImportActionRetryMaxDelay,
+		failureCount,
+	)
+}
+
+// cappedExponentialDelay is the one retry backoff in the package: the delay
+// starts at initial and doubles per attempt, capped by maximum. A non-positive
+// initial means "no delay"; a non-positive maximum is treated as initial.
+//
+// Both the watcher's post-import action retries and the durable source cleanup
+// worker use it, so the two schedules cannot drift apart.
+func cappedExponentialDelay(initial, maximum time.Duration, attempt int) time.Duration {
+	if initial <= 0 {
 		return 0
 	}
-	maximum := config.PostImportActionRetryMaxDelay
 	if maximum <= 0 {
-		maximum = delay
+		maximum = initial
 	}
-	for attempt := 1; attempt < failureCount; attempt++ {
+
+	delay := initial
+	for i := 1; i < attempt; i++ {
 		if delay >= maximum || delay > maximum/2 {
 			return maximum
 		}
 		delay *= 2
 	}
+
 	return min(delay, maximum)
 }
 
@@ -2031,12 +2166,15 @@ func waitForStabilityDelay(ctx context.Context, delay time.Duration) error {
 }
 
 // normalizeFilePatterns trims patterns, drops blanks and duplicates, validates
-// each glob and falls back to "*" when nothing usable remains.
+// each glob, lower-cases it and falls back to "*" when nothing usable remains.
+//
+// Matching is case-insensitive, so storing the prepared form lower-cased keeps
+// the per-file hot path from lower-casing every pattern for every candidate.
 func normalizeFilePatterns(patterns []string) ([]string, error) {
 	normalized := make([]string, 0, len(patterns))
 
 	for _, pattern := range patterns {
-		trimmed := strings.TrimSpace(pattern)
+		trimmed := strings.ToLower(strings.TrimSpace(pattern))
 		if trimmed == "" {
 			continue
 		}
@@ -2065,6 +2203,23 @@ func normalizeFilePatterns(patterns []string) ([]string, error) {
 	return normalized, nil
 }
 
+// lowerFilePatterns returns the patterns in the form matchPattern expects:
+// lower-cased. A configured watcher already stores them that way; a
+// configuration assembled directly by a caller is normalized here, once per
+// discovery call instead of once per pattern per file.
+func lowerFilePatterns(patterns []string) []string {
+	if len(patterns) == 0 {
+		return nil
+	}
+
+	lowered := make([]string, len(patterns))
+	for i, pattern := range patterns {
+		lowered[i] = strings.ToLower(pattern)
+	}
+
+	return lowered
+}
+
 // matchesAnyPattern reports whether name matches any configured pattern. An
 // empty pattern list matches everything; matching is case-insensitive so the
 // configured watcher behaves consistently across platforms.
@@ -2083,15 +2238,15 @@ func matchesAnyPattern(name string, patterns []string) bool {
 }
 
 // matchPattern matches a filename against a glob pattern.
+//
+// pattern must already be lower-cased (see normalizeFilePatterns and
+// lowerFilePatterns); only the candidate name is lower-cased here.
 func matchPattern(name, pattern string) bool {
 	if pattern == "" || pattern == wildcardPattern {
 		return true
 	}
 
-	name = strings.ToLower(name)
-	pattern = strings.ToLower(pattern)
-
-	matched, err := filepath.Match(pattern, name)
+	matched, err := filepath.Match(pattern, strings.ToLower(name))
 	if err != nil {
 		return false
 	}
@@ -2294,12 +2449,17 @@ func (w *fileWatcher) loadImportedFilesHistory() error {
 	pruned := 0
 
 	for filePath, record := range history {
-		if _, err := os.Stat(filePath); err != nil {
-			pruned++
+		// Only a confirmed-absent source is pruned. Any other stat failure (a
+		// transient permission or sharing violation, an unreadable parent) says
+		// nothing about the file and must not drop the record, because dropping
+		// it makes the file importable again.
+		if _, err := os.Stat(filePath); !errors.Is(err, fs.ErrNotExist) {
+			live = append(live, importedRecord{path: filePath, record: record})
+
 			continue
 		}
 
-		live = append(live, importedRecord{path: filePath, record: record})
+		pruned++
 	}
 
 	trimmed := 0
@@ -2331,15 +2491,6 @@ func (w *fileWatcher) storeImportedStateLoaded(filePath string, record importedF
 	w.importedFiles.Store(filePath, record)
 	w.importedCount++
 	w.evictOldestImportedRecordsLocked()
-}
-
-// storeImportedRecordSync is retained for focused history tests and simple
-// non-pending entries.
-func (w *fileWatcher) storeImportedRecordSync(filePath, fingerprint string, importedAt time.Time) {
-	w.storeImportedStateLoaded(filePath, importedFileRecord{
-		Fingerprint:    fingerprint,
-		ImportedAtUnix: importedAt.Unix(),
-	})
 }
 
 // saveImportedFilesHistory persists the history atomically, dropping the oldest
@@ -2638,6 +2789,7 @@ func (w *fileWatcher) storeImportedStateSync(filePath string, record importedFil
 		w.importedCount++
 	}
 	w.importedFiles.Store(filePath, record)
+	w.evictOldestImportedRecordsLocked()
 	w.importedFilesMu.Unlock()
 	return w.persistImportedState(config)
 }
@@ -2671,14 +2823,6 @@ func (w *fileWatcher) incrementImportedCount() {
 	w.importedFilesMu.Lock()
 	w.importedCount++
 	w.importedFilesMu.Unlock()
-}
-
-// importedEntryCount returns the current number of history entries.
-func (w *fileWatcher) importedEntryCount() int {
-	w.importedFilesMu.Lock()
-	defer w.importedFilesMu.Unlock()
-
-	return w.importedCount
 }
 
 // pruneStaleImportedRecords drops history entries whose source path no longer
@@ -2736,7 +2880,10 @@ func (w *fileWatcher) pruneStaleImportedRecords(ctx context.Context, config *cor
 			return true
 		}
 
-		if _, err := os.Stat(filePath); err == nil {
+		// A record is pruned only when its source is confirmed absent. Deleting
+		// it on any other stat failure would let a transient permission or
+		// sharing violation make the same file importable again.
+		if _, err := os.Stat(filePath); !errors.Is(err, fs.ErrNotExist) {
 			return true
 		}
 
@@ -2773,8 +2920,13 @@ func pathWithinRoot(root, target string) bool {
 		!filepath.IsAbs(relative)
 }
 
-// pruneDue reports whether the history prune may run now, recording the run so
-// the next throttled prune waits for the full interval.
+// pruneDue reports whether the history prune may run now for this watcher,
+// recording the run so that watcher waits for the full interval before its next
+// throttled prune.
+//
+// The throttle is keyed by watcher ID because the knob and the prune scope are
+// per watcher: a single watcher-global window would let the first watcher to
+// scan consume it and leave every other throttle-enabled watcher unpruned.
 func (w *fileWatcher) pruneDue(config *core.FileWatcherConfiguration) bool {
 	if config == nil || !config.EnableImportedFilesPruneThrottle {
 		return true
@@ -2790,12 +2942,11 @@ func (w *fileWatcher) pruneDue(config *core.FileWatcherConfiguration) bool {
 	w.pruneMu.Lock()
 	defer w.pruneMu.Unlock()
 
-	if w.prunedOnce && now.Sub(w.lastPrunedAt) < interval {
+	if last, ok := w.pruneRuns[config.WatcherID]; ok && now.Sub(last) < interval {
 		return false
 	}
 
-	w.prunedOnce = true
-	w.lastPrunedAt = now
+	w.pruneRuns[config.WatcherID] = now
 
 	return true
 }
@@ -2977,30 +3128,6 @@ func errorTypeText(err error) string {
 		return "none"
 	}
 	return fmt.Sprintf("%T", err)
-}
-
-// validateWatcherID rejects a watcher ID that cannot safely become a directory
-// segment or a state-file name: empty values, path separators, traversal
-// segments, NUL bytes and control characters.
-func validateWatcherID(watcherID string) error {
-	if watcherID == "" {
-		return fmt.Errorf("watcher ID cannot be empty: %w", core.ErrInvalidArgument)
-	}
-	if strings.ContainsAny(watcherID, `/\`) {
-		return fmt.Errorf("watcher ID must not contain path separators: %w", core.ErrInvalidArgument)
-	}
-	if watcherID == "." || watcherID == ".." {
-		return fmt.Errorf("watcher ID must not be a relative path segment: %w", core.ErrInvalidArgument)
-	}
-	if strings.ContainsRune(watcherID, 0) {
-		return fmt.Errorf("watcher ID contains a NUL byte: %w", core.ErrInvalidArgument)
-	}
-	for _, r := range watcherID {
-		if r < 32 || r == 127 {
-			return fmt.Errorf("watcher ID contains a control character: %w", core.ErrInvalidArgument)
-		}
-	}
-	return nil
 }
 
 // durableImportKey is the in-flight registry key of one durable source-cleanup

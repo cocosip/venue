@@ -52,7 +52,6 @@ func sqliteRepositoryOptions(runtimeConfig *config.Config) *metadata.SQLiteRepos
 		RecoverCorruptedDatabase:    runtimeConfig.Sqlite.RecoverCorruptedDatabase,
 		CorruptedDatabaseRetention:  runtimeConfig.Sqlite.CorruptedDatabaseRetention,
 		BackupDirectory:             runtimeConfig.Sqlite.BackupDirectory,
-		BackupRetention:             runtimeConfig.Sqlite.BackupRetention,
 		AutoRestoreFromBackup:       runtimeConfig.Sqlite.AutoRestoreFromBackup,
 		SkipBackupVerification:      runtimeConfig.Sqlite.SkipBackupVerification,
 		OptimizeIdleTenantDatabases: runtimeConfig.Sqlite.OptimizeIdleTenantDatabases,
@@ -206,9 +205,12 @@ func (s *MetadataBackupService) Start() {
 	s.stopCh = make(chan struct{})
 	stopCh := s.stopCh
 	s.running = true
+	// Register the goroutine while the lock still excludes Stop: a concurrent
+	// Stop that observed running == true may otherwise reach wg.Wait before this
+	// Add, see a zero counter, and return with the loop still running.
+	s.wg.Add(1)
 	s.mu.Unlock()
 
-	s.wg.Add(1)
 	go s.run(stopCh)
 }
 

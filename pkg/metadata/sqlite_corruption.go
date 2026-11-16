@@ -86,6 +86,10 @@ func removeDatabaseSidecars(path string, now func() time.Time) {
 // pruneCorruptedDatabaseFiles removes quarantine files of path that outlived the
 // retention.
 //
+// The database file and both of its quarantined sidecars are pruned together:
+// they are the artifacts removeDatabaseSidecars produces, so leaving the sidecars
+// out would let them accumulate indefinitely.
+//
 // It is best-effort by design: a quarantined file is a rescue copy, and failing
 // to prune it must never stop a database from opening. A negative retention
 // disables pruning entirely; zero selects the default.
@@ -98,7 +102,7 @@ func pruneCorruptedDatabaseFiles(path string, retention time.Duration, now func(
 	}
 
 	parent := filepath.Dir(path)
-	prefix := filepath.Base(path) + corruptedDatabaseSuffix
+	base := filepath.Base(path)
 	cutoff := now().Add(-retention)
 
 	entries, err := os.ReadDir(parent)
@@ -106,15 +110,11 @@ func pruneCorruptedDatabaseFiles(path string, retention time.Duration, now func(
 		return
 	}
 	for _, entry := range entries {
-		// The quarantine object is a file, not a directory: only the plain
-		// database file and its sidecars are renamed, so the IsDir test is
-		// inverted compared with the Badger quarantine of a database directory.
-		// A sidecar of the main database is included because it carries the same
-		// base name.
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
-			continue
-		}
-		if !isCorruptedDatabaseFileName(entry.Name()) && !isCorruptedDatabaseSidecarName(entry.Name()) {
+		// The quarantine object is a file, not a directory: the plain database
+		// file and each of its sidecars are renamed individually, so the IsDir
+		// test is inverted compared with the Badger quarantine of a database
+		// directory.
+		if entry.IsDir() || !isQuarantinedDatabaseName(base, entry.Name()) {
 			continue
 		}
 		info, err := entry.Info()
@@ -128,21 +128,18 @@ func pruneCorruptedDatabaseFiles(path string, retention time.Duration, now func(
 	}
 }
 
-// isCorruptedDatabaseFileName reports whether name is a quarantine sibling of
-// the metadata database itself.
-func isCorruptedDatabaseFileName(name string) bool {
-	return !strings.ContainsRune(name, filepath.Separator) &&
-		strings.HasPrefix(name, metadataDatabaseFileName+corruptedDatabaseSuffix)
-}
-
-// isCorruptedDatabaseSidecarName reports whether name is a quarantined
-// write-ahead log or shared-memory sidecar of the metadata database.
-func isCorruptedDatabaseSidecarName(name string) bool {
+// isQuarantinedDatabaseName reports whether name is a quarantine sibling of the
+// database file base: the database itself or one of its WAL/SHM sidecars.
+//
+// A sidecar is renamed to <db>-wal.corrupted.<stamp>, so matching only the
+// database's own "<db>.corrupted." prefix would leave every sidecar behind and
+// accumulate them forever.
+func isQuarantinedDatabaseName(base string, name string) bool {
 	if strings.ContainsRune(name, filepath.Separator) {
 		return false
 	}
-	for _, suffix := range []string{walSuffix, shmSuffix} {
-		if strings.HasPrefix(name, metadataDatabaseFileName+suffix+corruptedDatabaseSuffix) {
+	for _, suffix := range []string{"", walSuffix, shmSuffix} {
+		if strings.HasPrefix(name, base+suffix+corruptedDatabaseSuffix) {
 			return true
 		}
 	}

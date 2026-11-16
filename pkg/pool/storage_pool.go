@@ -39,7 +39,12 @@ type StoragePoolOptions struct {
 	Volumes map[string]core.StorageVolume
 
 	// PathGenerator generates storage paths for files.
-	// If nil, uses default date-based path generator.
+	//
+	// Nil is the normal configuration: the pool then prefers the selected
+	// volume's own core.StorageVolumePathBuilder (which is what a local volume
+	// provides, so paths follow the volume's configured sharding), and falls back
+	// to DateBasedPathGenerator only for a volume that cannot build a path
+	// itself. A non-nil generator replaces both and is used for every write.
 	PathGenerator PathGenerator
 
 	// TenantQuotaManager manages tenant-level quotas.
@@ -83,9 +88,9 @@ type PathGenerator interface {
 
 // storagePool implements the StoragePool interface.
 //
-// volumes, pathGenerator and volumeSelector are construction-time dependencies:
-// NewStoragePool assigns them once and they are never replaced afterwards, so
-// the volumes map can be read without synchronization.
+// volumes and pathGenerator are construction-time dependencies: NewStoragePool
+// assigns them once and they are never replaced afterwards, so the volumes map
+// can be read without synchronization.
 type storagePool struct {
 	tenantManager  core.TenantManager
 	metadataRepo   core.MetadataRepository
@@ -94,7 +99,6 @@ type storagePool struct {
 	pathGenerator  PathGenerator
 	tenantQuotaMgr core.TenantQuotaManager
 	dirQuotaMgr    core.DirectoryQuotaManager
-	volumeSelector VolumeSelector
 
 	// statistics optionally receives operation statistics. Nil disables
 	// recording, so every call site goes through recordStatistic.
@@ -111,6 +115,13 @@ type storagePool struct {
 	// retaining operation IDs. The fixed array keeps memory bounded while the
 	// SQLite unique index remains the durable source of truth.
 	idempotentWriteGuards [idempotentWriteGuardCount]sync.Mutex
+
+	// idempotentClaims records the idempotent writes this process is running
+	// right now, so a concurrent duplicate of one operation waits for that write
+	// instead of copying the payload again. Entries exist only while a write is
+	// in flight, so the map stays bounded by in-flight work.
+	idempotentClaimsMu sync.Mutex
+	idempotentClaims   map[idempotentWriteKey]*idempotentWriteClaim
 }
 
 // capacitySnapshot is the cached aggregate capacity of the healthy volumes.
@@ -181,7 +192,6 @@ func NewStoragePool(opts *StoragePoolOptions) (core.StoragePool, error) {
 		pathGenerator:  opts.PathGenerator,
 		tenantQuotaMgr: opts.TenantQuotaManager,
 		dirQuotaMgr:    opts.DirectoryQuotaManager,
-		volumeSelector: &MostAvailableSpaceSelector{},
 		statistics:     opts.StatisticsRecorder,
 	}
 
@@ -218,9 +228,27 @@ func (p *storagePool) WriteFile(ctx context.Context, tenant core.TenantContext, 
 	return p.writeFile(ctx, tenant, content, originalFileName, "/", "")
 }
 
+// idempotentWriteKey identifies one logical write: an operation ID is scoped to
+// the tenant that supplied it.
+type idempotentWriteKey struct {
+	tenantID    string
+	operationID string
+}
+
+// idempotentWriteClaim is one in-flight idempotent write. done is closed when the
+// owner released the claim, so a duplicate waiting on it can re-check the durable
+// record (or take the work over) instead of observing a half-written operation.
+type idempotentWriteClaim struct {
+	done chan struct{}
+}
+
 // WriteFileIdempotently stores one logical write at most once for a tenant.
+//
 // SQLite owns the durable mapping; the fixed striped lock only closes the
-// in-process check/write race and never grows with the number of imports.
+// in-process check/claim race and never grows with the number of imports. An
+// in-flight claim makes a concurrent duplicate of the same operation wait for the
+// write already running and reuse its result, while the payload copy itself runs
+// outside the guard so unrelated operations never serialize behind it.
 func (p *storagePool) WriteFileIdempotently(
 	ctx context.Context,
 	tenant core.TenantContext,
@@ -236,17 +264,55 @@ func (p *storagePool) WriteFileIdempotently(
 		return "", fmt.Errorf("metadata repository does not support import operation lookup: %w", core.ErrInvalidArgument)
 	}
 
+	key := idempotentWriteKey{tenantID: tenant.ID, operationID: operationID}
 	guard := p.idempotentWriteGuard(tenant.ID, operationID)
-	guard.Lock()
-	defer guard.Unlock()
 
-	existing, err := operationRepo.GetByImportOperationID(ctx, tenant.ID, operationID)
-	if err == nil {
-		return existing.FileKey, nil
+	// The guarded section is only the lookup plus the claim of this operation
+	// id: holding the stripe across the payload copy would make two unrelated
+	// operations that hash to the same stripe serialize whole copies.
+	var claim *idempotentWriteClaim
+	for {
+		guard.Lock()
+		p.idempotentClaimsMu.Lock()
+		inFlightClaim, inFlight := p.idempotentClaims[key]
+		p.idempotentClaimsMu.Unlock()
+		if inFlight {
+			guard.Unlock()
+			select {
+			case <-inFlightClaim.done:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			// The owner released the claim: either its write is durable and the
+			// lookup below returns it, or it failed and this caller does the work.
+			continue
+		}
+
+		existing, err := operationRepo.GetByImportOperationID(ctx, tenant.ID, operationID)
+		if err == nil {
+			guard.Unlock()
+			return existing.FileKey, nil
+		}
+		if !errors.Is(err, core.ErrFileNotFound) {
+			guard.Unlock()
+			return "", err
+		}
+
+		claim = &idempotentWriteClaim{done: make(chan struct{})}
+		p.idempotentClaimsMu.Lock()
+		if p.idempotentClaims == nil {
+			p.idempotentClaims = make(map[idempotentWriteKey]*idempotentWriteClaim)
+		}
+		p.idempotentClaims[key] = claim
+		p.idempotentClaimsMu.Unlock()
+		guard.Unlock()
+		break
 	}
-	if !errors.Is(err, core.ErrFileNotFound) {
-		return "", err
-	}
+
+	// The claim is released on every path, including a panic raised by the
+	// caller's reader: a leaked claim would make every later duplicate of this
+	// operation wait forever.
+	defer p.releaseIdempotentClaim(key, claim)
 
 	fileKey, err := p.writeFile(ctx, tenant, content, originalFileName, "/", operationID)
 	if err == nil {
@@ -261,6 +327,19 @@ func (p *storagePool) WriteFileIdempotently(
 		return existing.FileKey, nil
 	}
 	return "", err
+}
+
+// releaseIdempotentClaim hands an operation id back to the callers waiting on
+// it. The claim is removed before done is closed, so a waiter that wakes up
+// either finds the durable record or claims the work itself.
+func (p *storagePool) releaseIdempotentClaim(key idempotentWriteKey, claim *idempotentWriteClaim) {
+	p.idempotentClaimsMu.Lock()
+	if p.idempotentClaims[key] == claim {
+		delete(p.idempotentClaims, key)
+	}
+	p.idempotentClaimsMu.Unlock()
+
+	close(claim.done)
 }
 
 func (p *storagePool) idempotentWriteGuard(tenantID string, operationID string) *sync.Mutex {
@@ -300,7 +379,8 @@ func (p *storagePool) writeFile(
 	logicalDirectoryPath string,
 	operationID string,
 ) (fileKey string, err error) {
-	// Validate tenant is enabled
+	// Validate tenant is enabled. This snapshot check is the cheap fast path; the
+	// authoritative check is the tenant-manager resolution below.
 	if !tenant.IsEnabled() {
 		return "", core.ErrTenantDisabled
 	}
@@ -309,6 +389,15 @@ func (p *storagePool) writeFile(
 	// unsafe value before it can take any quota, volume, or metadata resource.
 	if err := core.ValidateTenantID(tenant.ID); err != nil {
 		return "", fmt.Errorf("invalid tenant identifier: %w", err)
+	}
+
+	// tenant.Status is a caller-supplied snapshot, and core.TenantStatusEnabled is
+	// the Go zero value: a disabled or never-created tenant that was not resolved
+	// through the manager still looks enabled. Resolve it so the documented
+	// contract holds — ErrTenantNotFound when auto-create is off, ErrTenantDisabled
+	// for a disabled tenant — before anything is acquired for the write.
+	if err := p.requireEnabledTenant(ctx, tenant.ID); err != nil {
+		return "", err
 	}
 
 	// Generate unique file key
@@ -426,6 +515,26 @@ func (p *storagePool) writeFile(
 	p.recordStatistic(core.StatisticStorageWriteBytes, fileSize, dimensions)
 
 	return fileKey, nil
+}
+
+// requireEnabledTenant resolves tenantID through the tenant manager and reports
+// whether the write may proceed.
+//
+// GetTenant is the documented gate: it creates the tenant when auto-create is
+// configured and otherwise fails with core.ErrTenantNotFound, and it returns the
+// tenant's current status so a disabled tenant is rejected even though the
+// caller's snapshot still says enabled. The manager caches the lookup, so the
+// check costs one in-memory read per write rather than one per request.
+func (p *storagePool) requireEnabledTenant(ctx context.Context, tenantID string) error {
+	resolved, err := p.tenantManager.GetTenant(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("tenant %s is not usable: %w", tenantID, err)
+	}
+	if !resolved.IsEnabled() {
+		return fmt.Errorf("tenant %s: %w", tenantID, core.ErrTenantDisabled)
+	}
+
+	return nil
 }
 
 // writeToVolumes writes content to the first candidate volume that accepts it.
@@ -548,23 +657,12 @@ func (p *storagePool) rollbackWrite(
 // selectWriteCandidates resolves the ordered list of volumes to try. A
 // requiredBytes > 0 constrains the selection to volumes that can hold the
 // payload.
+//
+// The most-available-space policy is the only selection policy: it is applied
+// directly instead of through an injectable selector, whose single-product
+// interface bought nothing.
 func (p *storagePool) selectWriteCandidates(ctx context.Context, requiredBytes int64) ([]core.StorageVolume, error) {
-	if selector, ok := p.volumeSelector.(VolumeCandidateSelector); ok {
-		candidates, err := selector.SelectVolumeCandidates(ctx, p.volumes, requiredBytes)
-		if err != nil {
-			return nil, err
-		}
-		if len(candidates) == 0 {
-			return nil, fmt.Errorf("no writable volumes available: %w", core.ErrInsufficientStorage)
-		}
-		return candidates, nil
-	}
-
-	volume, err := p.volumeSelector.SelectVolume(ctx, p.volumes)
-	if err != nil {
-		return nil, err
-	}
-	return []core.StorageVolume{volume}, nil
+	return (&MostAvailableSpaceSelector{}).SelectVolumeCandidates(ctx, p.volumes, requiredBytes)
 }
 
 // remainingContentSize reports how many bytes are left in a seekable reader
@@ -638,7 +736,7 @@ func (p *storagePool) ReadFile(ctx context.Context, tenant core.TenantContext, f
 	// Get storage volume
 	volume, exists := p.volumes[metadata.VolumeID]
 	if !exists {
-		return nil, fmt.Errorf("storage volume %s not found", metadata.VolumeID)
+		return nil, fmt.Errorf("storage volume %s not found: %w", metadata.VolumeID, core.ErrStorageVolumeUnavailable)
 	}
 
 	// Read file from volume
@@ -828,7 +926,15 @@ func (p *storagePool) MarkAsFailed(ctx context.Context, lease core.FileProcessin
 }
 
 // GetFileStatus returns the current processing status of a file.
+//
+// It applies the same disabled-tenant guard as every other caller-visible
+// method, so DisableTenant's documented promise ("all subsequent operations on
+// this tenant fail with ErrTenantDisabled") holds here too.
 func (p *storagePool) GetFileStatus(ctx context.Context, tenant core.TenantContext, fileKey string) (core.FileProcessingStatus, error) {
+	if !tenant.IsEnabled() {
+		return 0, core.ErrTenantDisabled
+	}
+
 	return p.scheduler.GetFileStatus(ctx, tenant, fileKey)
 }
 
@@ -836,16 +942,24 @@ func (p *storagePool) GetFileStatus(ctx context.Context, tenant core.TenantConte
 // volumes. Unhealthy volumes and volumes that fail to report capacity are
 // skipped, so the result may be a partial sum. The aggregate is cached for a
 // short window.
+//
+// The capacity alongside the error is the partial sum reached so far; the error
+// is the caller's context error when the computation was aborted.
 func (p *storagePool) GetTotalCapacity(ctx context.Context) (int64, error) {
-	return p.capacitySnapshot(ctx).total, nil
+	snapshot, err := p.capacitySnapshot(ctx)
+	return snapshot.total, err
 }
 
 // GetAvailableSpace returns the available space across all healthy mounted
 // volumes. Unhealthy volumes and volumes that fail to report space are skipped,
 // so the result may be a partial sum. The aggregate is cached for a short
 // window.
+//
+// The space alongside the error is the partial sum reached so far; the error is
+// the caller's context error when the computation was aborted.
 func (p *storagePool) GetAvailableSpace(ctx context.Context) (int64, error) {
-	return p.capacitySnapshot(ctx).available, nil
+	snapshot, err := p.capacitySnapshot(ctx)
+	return snapshot.available, err
 }
 
 // capacitySnapshot returns the cached aggregate capacity of the healthy
@@ -856,23 +970,29 @@ func (p *storagePool) GetAvailableSpace(ctx context.Context) (int64, error) {
 // serialize behind one slow volume. The lock only guards the cached aggregate,
 // which is published in a short critical section. p.volumes is immutable after
 // construction, so iterating it needs no synchronization.
-func (p *storagePool) capacitySnapshot(ctx context.Context) capacitySnapshot {
+//
+// A computation that aborts because the caller's context ended returns the
+// partial aggregate with ctx.Err(): reporting a cancelled aggregate as a
+// complete one would hide that the numbers describe only part of the pool.
+func (p *storagePool) capacitySnapshot(ctx context.Context) (capacitySnapshot, error) {
 	p.mu.Lock()
 	now := p.timeNow()
 	if p.capacity.valid && now.Before(p.capacity.expiresAt) {
 		cached := p.capacity
 		p.mu.Unlock()
-		return cached
+		return cached, nil
 	}
 	p.mu.Unlock()
 
 	snapshot := capacitySnapshot{expiresAt: now.Add(p.capacityCacheDuration()), valid: true}
 
 	complete := true
+	var abortErr error
 	for _, volume := range p.volumes {
 		if err := ctx.Err(); err != nil {
 			// Report the partial sum but never cache a cancelled computation.
 			complete = false
+			abortErr = err
 			break
 		}
 		if !volume.IsHealthy(ctx) {
@@ -896,7 +1016,7 @@ func (p *storagePool) capacitySnapshot(ctx context.Context) capacitySnapshot {
 		p.mu.Unlock()
 	}
 
-	return snapshot
+	return snapshot, abortErr
 }
 
 // invalidateCapacityCache discards the cached aggregate so the next capacity or

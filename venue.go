@@ -104,8 +104,11 @@ func NewVenue(cfg *config.Config) (*Venue, error) {
 	// Initialize all components
 	if err := v.initialize(); err != nil {
 		// NewVenue owns every resource it opened before the failure; release
-		// them so a failed construction cannot strand a database lock.
-		v.closeRepositories()
+		// them so a failed construction cannot strand a database lock. The close
+		// failure is joined onto the construction error rather than dropped.
+		if closeErr := v.closeRepositories(); closeErr != nil {
+			return nil, errors.Join(fmt.Errorf("failed to initialize venue: %w", err), closeErr)
+		}
 		return nil, fmt.Errorf("failed to initialize venue: %w", err)
 	}
 
@@ -707,7 +710,6 @@ func (v *Venue) initialize() error {
 		bgFileWatcherService, err := watcher.NewBackgroundFileWatcherService(&watcher.BackgroundFileWatcherServiceOptions{
 			FileWatcher:          fileWatcherCore,
 			Logging:              v.logger,
-			Enabled:              v.config.FileWatcherService.Enabled,
 			ConfigurationRootDir: v.config.FileWatcherConfigurationDirectory,
 			InitialEnabled:       &watcherServiceEnabled,
 			ServiceOptions: core.FileWatcherServiceOptions{
@@ -841,10 +843,6 @@ func (v *Venue) initialize() error {
 	return nil
 }
 
-// quotaReconcilePageSize bounds how many metadata records a quota recount keeps
-// in memory at once.
-const quotaReconcilePageSize = 500
-
 // ReconcileQuotaCounts rebuilds the tenant and directory file counts from
 // persisted metadata.
 //
@@ -863,46 +861,6 @@ func (v *Venue) ReconcileQuotaCounts(ctx context.Context) error {
 	return v.reconcileQuotaCounts(ctx, true)
 }
 
-// forEachCountedRecord visits every metadata record that consumes quota for one
-// tenant, in bounded pages when the repository supports paging.
-func (v *Venue) forEachCountedRecord(ctx context.Context, tenantID string, visit func(*core.FileMetadata) error) error {
-	for _, status := range quotaCountedStatuses {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if reader, ok := v.metadataRepo.(core.StatusPageReader); ok {
-			cursor := ""
-			for {
-				page, err := reader.GetByStatusPage(ctx, tenantID, status, cursor, quotaReconcilePageSize)
-				if err != nil {
-					return fmt.Errorf("failed to page status %s for tenant %s: %w", status, tenantID, err)
-				}
-				for _, record := range page.Records {
-					if err := visit(record); err != nil {
-						return err
-					}
-				}
-				if page.NextCursor == "" {
-					break
-				}
-				cursor = page.NextCursor
-			}
-			continue
-		}
-
-		files, err := v.metadataRepo.GetByStatus(ctx, tenantID, status, 0)
-		if err != nil {
-			return fmt.Errorf("failed to list status %s for tenant %s: %w", status, tenantID, err)
-		}
-		for _, record := range files {
-			if err := visit(record); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // reconcileQuotaCounts rebuilds both quota counters from one metadata scan per
 // tenant: the tenant count is the sum of the per-directory counts, so the old
 // separate COUNT and GROUP BY passes are now one GROUP BY.
@@ -915,14 +873,23 @@ func (v *Venue) reconcileQuotaCounts(ctx context.Context, directoryPass bool) er
 	if err != nil {
 		return fmt.Errorf("failed to list tenants: %w", err)
 	}
-	counter, hasCounter := v.metadataRepo.(core.MetadataQuotaCounter)
-	setter, hasSetter := v.dirQuotaRepo.(core.DirectoryQuotaCountSetter)
+	// Both capabilities are required, not optional: NewVenue always wires the
+	// SQLite repositories, which provide them, so a scan-every-record fallback
+	// would be unreachable code. Failing loudly keeps the wiring invariant honest
+	// if the repository choice ever changes.
+	counter, ok := v.metadataRepo.(core.MetadataQuotaCounter)
+	if !ok {
+		return fmt.Errorf("metadata repository does not support quota counting: %w", core.ErrDatabaseError)
+	}
+	setter, ok := v.dirQuotaRepo.(core.DirectoryQuotaCountSetter)
+	if !ok {
+		return fmt.Errorf("directory quota repository does not support bulk count writes: %w", core.ErrDatabaseError)
+	}
 	for _, tenantContext := range tenants {
 		counts := make(map[string]int)
 		total := 0
-		switch {
-		case hasCounter && directoryPass:
-			usage, countErr := counter.CountByDirectory(ctx, tenantContext.ID, quotaCountedStatuses[:])
+		if directoryPass {
+			usage, countErr := counter.CountByDirectory(ctx, tenantContext.ID, quotaCountedStatuses)
 			if countErr != nil {
 				return fmt.Errorf("failed to count directory usage for tenant %s: %w", tenantContext.ID, countErr)
 			}
@@ -930,20 +897,12 @@ func (v *Venue) reconcileQuotaCounts(ctx context.Context, directoryPass bool) er
 				counts[directorypath.Normalize(directoryPath)] += count
 				total += count
 			}
-		case hasCounter:
-			aggregate, countErr := counter.CountByStatuses(ctx, tenantContext.ID, quotaCountedStatuses[:])
+		} else {
+			aggregate, countErr := counter.CountByStatuses(ctx, tenantContext.ID, quotaCountedStatuses)
 			if countErr != nil {
 				return fmt.Errorf("failed to count files for tenant %s: %w", tenantContext.ID, countErr)
 			}
 			total = int(aggregate)
-		default:
-			if err := v.forEachCountedRecord(ctx, tenantContext.ID, func(record *core.FileMetadata) error {
-				counts[directorypath.Normalize(record.DirectoryPath)]++
-				total++
-				return nil
-			}); err != nil {
-				return fmt.Errorf("failed to count files for tenant %s: %w", tenantContext.ID, err)
-			}
 		}
 
 		if err := v.tenantQuotaManager.SetFileCount(ctx, tenantContext.ID, total); err != nil {
@@ -966,23 +925,25 @@ func (v *Venue) reconcileQuotaCounts(ctx context.Context, directoryPass bool) er
 			}
 		}
 
-		if hasSetter {
-			// One transaction per tenant instead of two statements per directory.
-			if err := setter.SetFileCounts(ctx, tenantContext.ID, counts); err != nil {
-				return fmt.Errorf("failed to set directory counts for tenant %s: %w", tenantContext.ID, err)
-			}
-			continue
-		}
-		for directoryPath, count := range counts {
-			if err := v.dirQuotaManager.SetFileCount(ctx, tenantContext.ID, directoryPath, count); err != nil {
-				return fmt.Errorf("failed to set directory count for tenant %s: %w", tenantContext.ID, err)
-			}
+		// One transaction per tenant instead of two statements per directory.
+		if err := setter.SetFileCounts(ctx, tenantContext.ID, counts); err != nil {
+			return fmt.Errorf("failed to set directory counts for tenant %s: %w", tenantContext.ID, err)
 		}
 	}
 	return nil
 }
 
-var quotaCountedStatuses = [...]core.FileProcessingStatus{
+// quotaCountedStatuses is the set of file statuses whose records consume a
+// tenant's file quota. DeadLettered is absent because cleanup releases a
+// dead-lettered payload from both quotas; DeleteSucceeded is absent because no
+// runtime path produces it.
+//
+// This set is deliberately not the same as the cleanup service's orphaned-
+// metadata sweep: that sweep inspects statuses whose physical payload should
+// still exist, so it also excludes Completed (cleanup deletes those files as a
+// normal step) and DeadLettered (the payload lives in the dead-letter area, not
+// under the volume path).
+var quotaCountedStatuses = []core.FileProcessingStatus{
 	core.FileStatusPending,
 	core.FileStatusProcessing,
 	core.FileStatusCompleted,
@@ -1087,23 +1048,33 @@ func (v *Venue) Start() error {
 // Stop is idempotent and safe in a deferred shutdown path: calling it without
 // Start still releases the repositories, and calling it again returns nil.
 // After Stop the synchronous accessors must not be used.
+//
+// A failure to stop a service or to close a repository is returned instead of
+// only logged, because a repository that could not be closed still holds its
+// database lock and logging is silent by default.
+//
+// The shutdown itself runs outside v.mu: shutting a service down can join a
+// worker that is inside a long operation (a VACUUM or a backup), and holding the
+// instance lock for that long would block every IsRunning/Start probe. The lock
+// is held only long enough to claim the shutdown by setting closed, which also
+// makes a concurrent Stop return immediately and a concurrent Start fail.
 func (v *Venue) Stop() error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-
 	if v.closed {
+		v.mu.Unlock()
 		return nil
 	}
+	v.closed = true
+	wasRunning := v.running
+	v.running = false
+	ctx, cancel := v.ctx, v.cancel
+	v.cancel = nil
 
-	if v.running {
-		v.emit(v.ctx, slog.LevelInfo, "services_stopping", "Stopping Venue services")
-
-		// Stop services in reverse start order.
-		toStop := []struct {
-			name    string
-			failed  string
-			service backgroundService
-		}{
+	// Snapshot the services to stop in reverse start order while the lock is
+	// held, so the order cannot change under us during shutdown.
+	var toStop []backgroundServiceStop
+	if wasRunning {
+		toStop = []backgroundServiceStop{
 			{"statistics output", "statistics_output_stop_failed", v.statisticsOutputService()},
 			{"metadata backup", "metadata_backup_stop_failed", v.metadataBackupService()},
 			{"source cleanup", "source_cleanup_stop_failed", v.sourceCleanupService()},
@@ -1112,28 +1083,46 @@ func (v *Venue) Stop() error {
 			{"cleanup", "cleanup_stop_failed", v.cleanupService},
 			{"health check", "health_check_stop_failed", v.healthCheckService},
 		}
+	}
+	v.mu.Unlock()
+
+	var stopErrs []error
+
+	if wasRunning {
+		v.emit(ctx, slog.LevelInfo, "services_stopping", "Stopping Venue services")
 		for _, entry := range toStop {
 			if isNilService(entry.service) {
 				continue
 			}
 			if err := entry.service.Stop(); err != nil {
-				v.emit(v.ctx, slog.LevelError, entry.failed, "Failed to stop background service", errorTypeAttr(err))
+				v.emit(ctx, slog.LevelError, entry.failed, "Failed to stop background service", errorTypeAttr(err))
+				stopErrs = append(stopErrs, fmt.Errorf("failed to stop %s service: %w", entry.name, err))
 			}
 		}
-
-		v.running = false
 	}
 
-	v.closeRepositories()
-
-	if v.cancel != nil {
-		v.cancel()
-		v.cancel = nil
+	if err := v.closeRepositories(); err != nil {
+		stopErrs = append(stopErrs, err)
 	}
-	v.closed = true
 
-	v.emit(v.ctx, slog.LevelInfo, "services_stopped", "Venue services stopped and resources released")
-	return nil
+	if cancel != nil {
+		cancel()
+	}
+
+	v.emit(ctx, slog.LevelInfo, "services_stopped", "Venue services stopped and resources released")
+	// Stop reports every failure it met instead of returning nil unconditionally:
+	// a repository that could not be closed still holds its database lock, and the
+	// caller has to be able to see that even when logging is disabled.
+	return errors.Join(stopErrs...)
+}
+
+// backgroundServiceStop pairs a background service with the names used to report
+// its shutdown, so Stop can build the list under the instance lock and execute
+// it outside.
+type backgroundServiceStop struct {
+	name    string
+	failed  string
+	service backgroundService
 }
 
 // metadataBackupService adapts the optional periodic backup runner to the
@@ -1214,12 +1203,18 @@ type enabledWatcherReporter interface {
 
 // closeRepositories releases every repository opened by NewVenue. It is
 // idempotent so it can run on both the construction-failure and the Stop path.
-func (v *Venue) closeRepositories() {
+//
+// Every failure is returned rather than only logged: a repository that could not
+// be closed still holds its database lock, and logging is silent by default.
+func (v *Venue) closeRepositories() error {
+	var closeErrs []error
+
 	// The scheduler owns background timed-out reclaim passes that write to the
 	// metadata repository, so it must stop before that repository is closed.
 	if v.fileScheduler != nil {
 		if err := scheduler.CloseFileScheduler(v.fileScheduler); err != nil {
 			v.emit(v.ctx, slog.LevelError, "file_scheduler_close_failed", "Failed to close file scheduler", errorTypeAttr(err))
+			closeErrs = append(closeErrs, fmt.Errorf("failed to close file scheduler: %w", err))
 		}
 		v.fileScheduler = nil
 	}
@@ -1231,6 +1226,7 @@ func (v *Venue) closeRepositories() {
 		if closer, ok := v.fileWatcherCore.(interface{ Close() error }); ok {
 			if err := closer.Close(); err != nil {
 				v.emit(v.ctx, slog.LevelError, "file_watcher_close_failed", "Failed to close file watcher", errorTypeAttr(err))
+				closeErrs = append(closeErrs, fmt.Errorf("failed to close file watcher: %w", err))
 			}
 		}
 		v.fileWatcherCore = nil
@@ -1238,6 +1234,7 @@ func (v *Venue) closeRepositories() {
 	if v.sourceCleanupStore != nil {
 		if err := v.sourceCleanupStore.Close(); err != nil {
 			v.emit(v.ctx, slog.LevelError, "source_cleanup_store_close_failed", "Failed to close source cleanup store", errorTypeAttr(err))
+			closeErrs = append(closeErrs, fmt.Errorf("failed to close source cleanup store: %w", err))
 		}
 		v.sourceCleanupStore = nil
 	}
@@ -1245,6 +1242,7 @@ func (v *Venue) closeRepositories() {
 	if v.metadataRepo != nil {
 		if err := v.metadataRepo.Close(); err != nil {
 			v.emit(v.ctx, slog.LevelError, "metadata_close_failed", "Failed to close metadata repository", errorTypeAttr(err))
+			closeErrs = append(closeErrs, fmt.Errorf("failed to close metadata repository: %w", err))
 		}
 		v.metadataRepo = nil
 	}
@@ -1252,9 +1250,12 @@ func (v *Venue) closeRepositories() {
 	if v.dirQuotaRepo != nil {
 		if err := v.dirQuotaRepo.Close(); err != nil {
 			v.emit(v.ctx, slog.LevelError, "quota_close_failed", "Failed to close directory quota repository", errorTypeAttr(err))
+			closeErrs = append(closeErrs, fmt.Errorf("failed to close directory quota repository: %w", err))
 		}
 		v.dirQuotaRepo = nil
 	}
+
+	return errors.Join(closeErrs...)
 }
 
 // quarantineReporter returns the callback that reports a database directory the

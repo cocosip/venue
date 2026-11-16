@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/cocosip/venue/pkg/core"
 )
 
 // TestPruneTerminalKeepsKeptTombstoneWhileSourceExists pins the Keep dedup
@@ -70,15 +73,23 @@ func TestPruneTerminalKeepsKeptTombstoneWhileSourceExists(t *testing.T) {
 }
 
 // TestWatcherIDValidationRejectsUnsafeSegments pins the path-safety rule for
-// watcher IDs: they become directory segments below the failure directory, so
-// separators and traversal segments must be rejected at registration.
+// watcher IDs: they become directory segments below the failure directory and
+// state-file names, so separators, traversal segments, reserved filename
+// characters, device names, over-long values and control characters must be
+// rejected at registration.
+//
+// Registration delegates to core.ValidateWatcherID; this test pins that boundary
+// so a weaker local duplicate cannot come back.
 func TestWatcherIDValidationRejectsUnsafeSegments(t *testing.T) {
-	for _, watcherID := range []string{"a/b", `a\b`, "..", ".", "a\x00b"} {
-		if err := validateWatcherID(watcherID); err == nil {
-			t.Errorf("validateWatcherID(%q) = nil, want an error", watcherID)
+	for _, watcherID := range []string{
+		"a/b", `a\b`, "..", ".", "a\x00b",
+		"a:b", "bad*name", "CON", strings.Repeat("a", core.MaxWatcherIDLength+1),
+	} {
+		if err := core.ValidateWatcherID(watcherID); err == nil {
+			t.Errorf("core.ValidateWatcherID(%q) = nil, want an error", watcherID)
 		}
 	}
-	if err := validateWatcherID("watcher-1"); err != nil {
-		t.Errorf("validateWatcherID(watcher-1) error = %v, want nil", err)
+	if err := core.ValidateWatcherID("watcher-1"); err != nil {
+		t.Errorf("core.ValidateWatcherID(watcher-1) error = %v, want nil", err)
 	}
 }

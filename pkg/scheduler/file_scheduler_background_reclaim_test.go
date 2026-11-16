@@ -594,8 +594,10 @@ func TestBackgroundTimedOutReclaimCooldownSuppressesSecondPass(t *testing.T) {
 }
 
 // TestBackgroundTimedOutReclaimDisabledPerformsNoWork pins every off switch: a
-// disabled flag, a non-positive batch size, or a non-positive processing timeout
-// leaves the crashed worker's file untouched after a successful claim.
+// disabled flag or a non-positive batch size leaves the crashed worker's file
+// untouched after a successful claim. A negative ProcessingTimeout is no longer a
+// disable switch: NewFileScheduler rejects it (see
+// TestNewFileSchedulerRejectsNegativeProcessingTimeout).
 func TestBackgroundTimedOutReclaimDisabledPerformsNoWork(t *testing.T) {
 	tenant := createTestTenant()
 
@@ -614,10 +616,6 @@ func TestBackgroundTimedOutReclaimDisabledPerformsNoWork(t *testing.T) {
 		{
 			name:   "background batch size negative",
 			mutate: func(o *FileSchedulerOptions) { o.BackgroundTimedOutReclaimBatchSize = -1 },
-		},
-		{
-			name:   "processing timeout negative",
-			mutate: func(o *FileSchedulerOptions) { o.ProcessingTimeout = -time.Second },
 		},
 	}
 

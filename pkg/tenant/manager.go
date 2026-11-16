@@ -417,21 +417,46 @@ func (m *TenantManager) getCached(tenantID string) (core.TenantContext, bool) {
 // explicit invalidation, so probing many unknown tenant IDs grew the map
 // without bound; with it, entries for IDs that stop being refreshed are
 // eventually reclaimed.
+//
+// The sweep scans under a read lock and only takes the write lock to delete, so
+// a large cache does not stall every read for the duration of a full map pass.
 func (m *TenantManager) putCache(tenantID string, tenant core.TenantContext) {
 	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
-
 	m.cache[tenantID] = &cacheEntry{
 		context:   tenant,
 		expiresAt: time.Now().Add(m.opts.CacheTTL),
 	}
-
 	m.putCount++
-	if m.putCount%cacheSweepInterval == 0 {
-		for id, entry := range m.cache {
-			if entry.isExpired() {
-				delete(m.cache, id)
-			}
+	sweep := m.putCount%cacheSweepInterval == 0
+	m.cacheMu.Unlock()
+
+	if sweep {
+		m.sweepExpiredCache()
+	}
+}
+
+// sweepExpiredCache deletes the expired cache entries. Expiry is re-checked
+// after the write lock is taken, because a concurrent refresh may have replaced
+// an entry between the scan and the delete.
+func (m *TenantManager) sweepExpiredCache() {
+	m.cacheMu.RLock()
+	expired := make([]string, 0, len(m.cache)/8)
+	for id, entry := range m.cache {
+		if entry.isExpired() {
+			expired = append(expired, id)
+		}
+	}
+	m.cacheMu.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	for _, id := range expired {
+		if entry, ok := m.cache[id]; ok && entry.isExpired() {
+			delete(m.cache, id)
 		}
 	}
 }

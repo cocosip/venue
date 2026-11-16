@@ -169,11 +169,14 @@ func TestDatabaseHealthChecker_HealthyLayout(t *testing.T) {
 	}
 }
 
-func TestDatabaseHealthChecker_IgnoresLegacyBadgerDatabasePaths(t *testing.T) {
+// TestDatabaseHealthChecker_IgnoresLegacyBadgerLayout pins the incentive to
+// migrate: a pre-migration Badger directory left below a root is not a SQLite
+// database, contains no metadata.db, and must not be counted or reported.
+func TestDatabaseHealthChecker_IgnoresLegacyBadgerLayout(t *testing.T) {
 	volume, tenantID := newHealthySQLiteLayout(t)
 
-	// The pre-migration wiring passed the two Badger database directories. They
-	// are still accepted, but the roots are what the checker derives from.
+	// The pre-migration wiring kept Badger databases here. The checker derives
+	// every path from the roots, so these directories must be inert.
 	legacyMetadataPath := filepath.Join(volume.metadataRoot, "shared", "metadata")
 	legacyQuotaPath := filepath.Join(volume.quotaRoot, "quota")
 
@@ -188,10 +191,8 @@ func TestDatabaseHealthChecker_IgnoresLegacyBadgerDatabasePaths(t *testing.T) {
 	}
 
 	checker := newChecker(t, &DatabaseHealthCheckerOptions{
-		MetadataDataPath:           volume.metadataRoot,
-		DirectoryQuotaDataPath:     volume.quotaRoot,
-		MetadataDatabasePath:       legacyMetadataPath,
-		DirectoryQuotaDatabasePath: legacyQuotaPath,
+		MetadataDataPath:       volume.metadataRoot,
+		DirectoryQuotaDataPath: volume.quotaRoot,
 	})
 
 	report, err := checker.CheckAllDatabases(context.Background())
@@ -204,10 +205,10 @@ func TestDatabaseHealthChecker_IgnoresLegacyBadgerDatabasePaths(t *testing.T) {
 			report.HealthyDatabases, describeStatuses(report.CorruptedDatabases), report.AllHealthy)
 	}
 
-	// Nothing is reported for the ignored legacy paths.
+	// Nothing is reported for the legacy directories.
 	for _, legacyPath := range []string{legacyMetadataPath, legacyQuotaPath} {
 		if _, ok := report.DatabaseSizes[legacyPath]; ok {
-			t.Fatalf("DatabaseSizes = %v, want no entry for the ignored legacy path", report.DatabaseSizes)
+			t.Fatalf("DatabaseSizes = %v, want no entry for the legacy path", report.DatabaseSizes)
 		}
 	}
 
@@ -219,16 +220,6 @@ func TestDatabaseHealthChecker_IgnoresLegacyBadgerDatabasePaths(t *testing.T) {
 func TestNewDatabaseHealthChecker_RequiresAMetadataRoot(t *testing.T) {
 	if _, err := NewDatabaseHealthChecker(nil); err == nil {
 		t.Fatalf("NewDatabaseHealthChecker(nil) error = nil, want error")
-	}
-
-	checker, err := NewDatabaseHealthChecker(&DatabaseHealthCheckerOptions{
-		MetadataDatabasePath: filepath.Join(t.TempDir(), "shared", "metadata"),
-	})
-	if err != nil {
-		t.Fatalf("NewDatabaseHealthChecker() with only the legacy path error = %v, want nil for compatibility", err)
-	}
-	if checker == nil {
-		t.Fatalf("checker = nil, want a checker")
 	}
 
 	if _, err := NewDatabaseHealthChecker(&DatabaseHealthCheckerOptions{}); err == nil {

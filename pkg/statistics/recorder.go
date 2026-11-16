@@ -741,14 +741,6 @@ func emptySnapshot() core.StatisticsSnapshot {
 	return core.StatisticsSnapshot{Measurements: []core.StatisticsMeasurement{}}
 }
 
-// optionsWithMaxSeries returns a copy of opts with the series bound replaced.
-// It exists for the internal series-bound tests.
-func optionsWithMaxSeries(opts Options, maxSeries int) Options {
-	opts.MaxSeries = maxSeries
-
-	return opts
-}
-
 // NoopRecorder is a disabled statistics recorder.
 //
 // It drops every record without allocating and always reports an empty

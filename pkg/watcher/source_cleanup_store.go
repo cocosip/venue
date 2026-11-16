@@ -392,9 +392,16 @@ func (s *sqliteSourceCleanupStore) ClaimDue(ctx context.Context, now time.Time, 
 			return nil, fmt.Errorf("scan due source cleanup job: %w", scanErr)
 		}
 		job.LeaseToken, job.LeaseUntil = uuid.NewString(), now.Add(leaseDuration)
-		if _, err := tx.ExecContext(ctx, `UPDATE source_cleanup_jobs SET lease_until_unix_nano = ?, lease_token = ?, updated_unix_nano = ? WHERE id = ? AND (lease_until_unix_nano = 0 OR lease_until_unix_nano <= ?)`, job.LeaseUntil.UnixNano(), job.LeaseToken, now.UnixNano(), job.JobID, now.UnixNano()); err != nil {
+		result, leaseErr := tx.ExecContext(ctx, `UPDATE source_cleanup_jobs SET lease_until_unix_nano = ?, lease_token = ?, updated_unix_nano = ? WHERE id = ? AND (lease_until_unix_nano = 0 OR lease_until_unix_nano <= ?)`, job.LeaseUntil.UnixNano(), job.LeaseToken, now.UnixNano(), job.JobID, now.UnixNano())
+		if leaseErr != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("lease source cleanup job: %w", err)
+			return nil, fmt.Errorf("lease source cleanup job: %w", leaseErr)
+		}
+		// A zero row count means the lease was not taken (another worker owns
+		// it), so the job must not be handed to this worker: the action would
+		// run and then fail with ErrSourceCleanupLeaseLost.
+		if affected, _ := result.RowsAffected(); affected == 0 {
+			continue
 		}
 		jobs = append(jobs, job)
 	}

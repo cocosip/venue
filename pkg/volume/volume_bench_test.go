@@ -43,17 +43,6 @@ func BenchmarkPathSanitizer_SanitizeAndJoin(b *testing.B) {
 	}
 }
 
-// BenchmarkPathSanitizer_ValidateRelativePath benchmarks path validation.
-func BenchmarkPathSanitizer_ValidateRelativePath(b *testing.B) {
-	sanitizer := NewPathSanitizer("/tmp/test")
-	relativePath := "a/b/c/file.txt"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = sanitizer.ValidateRelativePath(relativePath)
-	}
-}
-
 // BenchmarkBuildShardedPath benchmarks sharded path building with different depths.
 func BenchmarkBuildShardedPath(b *testing.B) {
 	fileKey := "550e8400e29b41d4a716446655440000"
@@ -178,28 +167,6 @@ func BenchmarkLocalFileSystemVolume_FileExists(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		_, _ = volume.FileExists(ctx, relativePath)
-	}
-}
-
-// BenchmarkLocalFileSystemVolume_GetFileSize benchmarks file size retrieval.
-func BenchmarkLocalFileSystemVolume_GetFileSize(b *testing.B) {
-	ctx := context.Background()
-	volume, tempDir, err := createBenchVolume(0)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tempDir) }()
-
-	// Create a test file
-	relativePath := "bench-size.txt"
-	content := strings.Repeat("A", 10000)
-	reader := bytes.NewReader([]byte(content))
-	_, _ = volume.WriteFile(ctx, relativePath, reader)
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, _ = volume.GetFileSize(ctx, relativePath)
 	}
 }
 
@@ -358,26 +325,4 @@ func BenchmarkLocalFileSystemVolume_ConcurrentReads(b *testing.B) {
 			i++
 		}
 	})
-}
-
-// BenchmarkSanitizeFilename benchmarks filename sanitization.
-func BenchmarkSanitizeFilename(b *testing.B) {
-	filename := "my-file.with.dots.txt"
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, _ = SanitizeFilename(filename)
-	}
-}
-
-// BenchmarkExtractExtension benchmarks extension extraction.
-func BenchmarkExtractExtension(b *testing.B) {
-	filename := "document.tar.gz"
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		_ = ExtractExtension(filename)
-	}
 }

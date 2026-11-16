@@ -453,6 +453,13 @@ func TestRecorderPrunesExpiredBucketsOnSnapshot(t *testing.T) {
 	}
 }
 
+// optionsWithMaxSeries returns a copy of opts with the series bound replaced. It
+// lives beside its only caller: production code never needs it.
+func optionsWithMaxSeries(opts Options, maxSeries int) Options {
+	opts.MaxSeries = maxSeries
+	return opts
+}
+
 func TestRecorderBoundsSeriesWithInternalLimit(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0).UTC()
 

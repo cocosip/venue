@@ -19,19 +19,29 @@ var ErrSectionNotFound = errors.New("configuration section not found")
 // The result is seeded from config.DefaultConfig() and unmarshalled with
 // ZeroFields disabled, so a source only has to carry the keys it wants to
 // override: the defaults do not need to be registered on the source first.
+//
+// Collections are the exception, and they are why the seeded volume list is
+// cleared before decoding. The decoder merges a decoded slice element into the
+// element already at that index, so leaving the seeded default volume in place
+// copies its unset fields into the caller's first entry only: two volumes
+// specified identically in a file would load with different EnableFsync and
+// ShardingDepth. The seeded default is restored when the source carries no
+// volumes at all, which keeps "the defaults do not need to be registered".
 func Load(source *viper.Viper) (*config.Config, error) {
 	if source == nil {
 		return nil, fmt.Errorf("viper instance cannot be nil")
 	}
 
 	result := config.DefaultConfig()
+	result.Volumes = nil
 	if err := source.Unmarshal(result, func(decoder *mapstructure.DecoderConfig) {
 		decoder.ZeroFields = false
 	}); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
-	// Logging contains a runtime slog.Handler and is never file-bound.
-	result.Logging = nil
+	if len(result.Volumes) == 0 {
+		result.Volumes = config.DefaultConfig().Volumes
+	}
 	result.ApplyDefaults()
 	if err := result.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)

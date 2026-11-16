@@ -217,11 +217,11 @@ func TestBackgroundFileWatcherService_EnabledByDefault(t *testing.T) {
 		Enabled:   true,
 	})
 
-	// Zero-valued ServiceEnabled must not silently disable the service.
+	// A zero-valued construction must not silently disable the service.
 	service := newBackgroundService(t, watcher, nil)
 
 	if !service.IsEnabled() {
-		t.Fatalf("IsEnabled() = false, want true when ServiceEnabled is left at its zero value")
+		t.Fatalf("IsEnabled() = false, want true when no construction-time disable was requested")
 	}
 }
 
@@ -251,8 +251,8 @@ func TestBackgroundFileWatcherService_StartActuallyScans(t *testing.T) {
 
 	registerWatcher(t, concrete, newConfig("w1", watchPath, nil))
 
-	// ServiceEnabled is intentionally left at its zero value: the service must
-	// still scan, which is the regression this covers.
+	// No construction-time enable/disable input is given: the service must still
+	// scan, which is the regression this covers.
 	service, err := NewBackgroundFileWatcherService(&BackgroundFileWatcherServiceOptions{
 		FileWatcher:            coreWatcher,
 		Logging:                logging.Disabled(),

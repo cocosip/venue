@@ -49,21 +49,6 @@ var quarantinedDatabaseFileNames = []string{
 	"quotas.db-shm",
 }
 
-// isQuarantinedDatabaseName reports whether a base name follows the quarantine
-// naming "<dbFile>.corrupted.<stamp>", optionally with the numeric collision
-// suffix of a second quarantine in the same second.
-//
-// The check is deliberately strict, because a match is deleted: the prefix
-// before the marker must be one of quarantinedDatabaseFileNames and the tail
-// must be a parseable stamp. A tenant identifier may contain interior dots, so a
-// tenant directory such as "acme.corrupted.prod" contains the marker without
-// being a quarantine. Case is ignored, as Locus does
-// (StorageCleanupService.cs:2544).
-func isQuarantinedDatabaseName(name string) bool {
-	_, ok := quarantineStamp(name)
-	return ok
-}
-
 // quarantineStamp returns the UTC quarantine instant encoded in a quarantine
 // base name.
 //

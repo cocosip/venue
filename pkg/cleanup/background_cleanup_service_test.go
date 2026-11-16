@@ -185,10 +185,11 @@ func TestBackgroundCleanupService_StartStop(t *testing.T) {
 		t.Error("Service should not be running after stop")
 	}
 
-	// Test double stop
+	// Test double stop: Stop is idempotent across every background service, so a
+	// deferred shutdown path can call it unconditionally.
 	err = bgSvc.Stop()
-	if err == nil {
-		t.Error("Expected error when stopping already stopped service")
+	if err != nil {
+		t.Errorf("second Stop() error = %v, want nil", err)
 	}
 }
 

@@ -819,7 +819,7 @@ func TestResolveMoveTargetPath_ReturnsFilesystemErrors(t *testing.T) {
 		t.Fatalf("write target blocker: %v", err)
 	}
 
-	if _, err := resolveMoveTargetPath(filepath.Join(t.TempDir(), "source.csv"), targetDir); err == nil {
+	if _, err := resolveMoveTargetPath(context.Background(), filepath.Join(t.TempDir(), "source.csv"), targetDir); err == nil {
 		t.Fatal("resolveMoveTargetPath() error = nil, want an error for a non-directory target")
 	}
 }
@@ -874,7 +874,7 @@ func TestDiscoverFiles_IncludeSubdirectories(t *testing.T) {
 	recursive, err := w.discoverFiles(context.Background(), watchPath, &core.FileWatcherConfiguration{
 		IncludeSubdirectories: true,
 		MinFileAge:            time.Millisecond,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("discoverFiles(recursive) error = %v", err)
 	}
@@ -885,7 +885,7 @@ func TestDiscoverFiles_IncludeSubdirectories(t *testing.T) {
 	topLevel, err := w.discoverFiles(context.Background(), watchPath, &core.FileWatcherConfiguration{
 		IncludeSubdirectories: false,
 		MinFileAge:            time.Millisecond,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("discoverFiles(top-level) error = %v", err)
 	}
@@ -1094,7 +1094,7 @@ func TestScanNow_PatternMatching(t *testing.T) {
 	files, err := w.discoverFiles(context.Background(), watchPath, &core.FileWatcherConfiguration{
 		FilePatterns: []string{"*.csv"},
 		MinFileAge:   time.Millisecond,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("discoverFiles() error = %v", err)
 	}
@@ -1305,7 +1305,7 @@ func TestScanNow_MaxFileSizeSkipsLargeFiles(t *testing.T) {
 	files, err := w.discoverFiles(context.Background(), watchPath, &core.FileWatcherConfiguration{
 		MaxFileSizeBytes: 128,
 		MinFileAge:       time.Millisecond,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("discoverFiles() error = %v", err)
 	}

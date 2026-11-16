@@ -10,6 +10,20 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// syncDirectory is a no-op on Windows.
+//
+// A directory name is made durable by the filesystem when the handle that
+// created the entry is closed, and Windows exposes no directory-fsync operation:
+// os.Open on a directory needs FILE_FLAG_BACKUP_SEMANTICS and
+// FlushFileBuffers rejects a directory handle with ERROR_ACCESS_DENIED. Calling
+// through to the Unix implementation would therefore issue a syscall that can
+// only fail, on every durable write; the caller treats a directory sync failure
+// as a lost optimization anyway, so the honest implementation is this no-op.
+// File contents are still synced by WriteFile through its file handle.
+func syncDirectory(string) error {
+	return nil
+}
+
 // isNotSameDeviceErrno reports whether err is the Windows
 // ERROR_NOT_SAME_DEVICE status that a rename across drives returns. Go does not
 // map that status onto syscall.EXDEV, so it has to be recognised by value; the

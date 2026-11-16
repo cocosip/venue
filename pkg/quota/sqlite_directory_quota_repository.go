@@ -360,9 +360,9 @@ func NewSQLiteDirectoryQuotaRepository(opts *SQLiteDirectoryQuotaRepositoryOptio
 	if opts.OpenDatabaseIdleTimeout < 0 {
 		return nil, fmt.Errorf("quota open database idle timeout cannot be negative: %w", core.ErrInvalidArgument)
 	}
-	if opts.CorruptedDatabaseRetention < 0 {
-		return nil, fmt.Errorf("quota corrupted database retention cannot be negative: %w", core.ErrInvalidArgument)
-	}
+	// CorruptedDatabaseRetention follows the project's negative-form convention:
+	// zero selects the documented default, a negative value disables pruning, so
+	// it is deliberately not rejected here.
 
 	sqliteOptions := opts.Sqlite
 	if sqliteOptions == (sqlite.Options{}) {
@@ -453,6 +453,10 @@ func (r *sqliteDirectoryQuotaRepository) Get(ctx context.Context, tenantID strin
 // observable side effect. A quota whose directory has no row yet is created with
 // the defaults GetOrCreate would have written, and the absolute write is then
 // retried once, so Update never becomes a silent no-op.
+//
+// The whole update-create-update sequence runs in one transaction: a failure in
+// the retry cannot persist the defaults row, and another process can never
+// observe the intermediate state.
 func (r *sqliteDirectoryQuotaRepository) Update(ctx context.Context, tenantID string, quota *core.DirectoryQuota) error {
 	if quota == nil {
 		return fmt.Errorf("quota cannot be nil: %w", core.ErrInvalidArgument)
@@ -477,35 +481,39 @@ func (r *sqliteDirectoryQuotaRepository) Update(ctx context.Context, tenantID st
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 
-	affected, err := execQuotaStatement(ctx, handle,
-		sqliteQuotaUpdateSQL,
+	tx, err := handle.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin the directory quota update: %w: %w", err, core.ErrDatabaseError)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	updateArgs := []any{
 		sql.Named("current_count", quota.CurrentCount),
 		sql.Named("max_count", quota.MaxCount),
 		sql.Named("enabled", enabled),
 		sql.Named("last_updated", now),
-		sql.Named("directory_path", quota.DirectoryPath))
+		sql.Named("directory_path", quota.DirectoryPath),
+	}
+
+	affected, err := execQuotaStatement(ctx, tx, sqliteQuotaUpdateSQL, updateArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to update directory quota: %w", err)
 	}
-	if affected > 0 {
-		return nil
+	if affected == 0 {
+		if _, err := execQuotaStatement(ctx, tx,
+			sqliteQuotaCreateDefaultsSQL,
+			sql.Named("directory_path", quota.DirectoryPath),
+			sql.Named("last_updated", now),
+			sql.Named("created_at", now)); err != nil {
+			return fmt.Errorf("failed to create the missing directory quota: %w", err)
+		}
+		if _, err := execQuotaStatement(ctx, tx, sqliteQuotaUpdateSQL, updateArgs...); err != nil {
+			return fmt.Errorf("failed to update the recreated directory quota: %w", err)
+		}
 	}
 
-	if _, err := execQuotaStatement(ctx, handle,
-		sqliteQuotaCreateDefaultsSQL,
-		sql.Named("directory_path", quota.DirectoryPath),
-		sql.Named("last_updated", now),
-		sql.Named("created_at", now)); err != nil {
-		return fmt.Errorf("failed to create the missing directory quota: %w", err)
-	}
-	if _, err := execQuotaStatement(ctx, handle,
-		sqliteQuotaUpdateSQL,
-		sql.Named("current_count", quota.CurrentCount),
-		sql.Named("max_count", quota.MaxCount),
-		sql.Named("enabled", enabled),
-		sql.Named("last_updated", now),
-		sql.Named("directory_path", quota.DirectoryPath)); err != nil {
-		return fmt.Errorf("failed to update the recreated directory quota: %w", err)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit the directory quota update: %w: %w", err, core.ErrDatabaseError)
 	}
 	return nil
 }
@@ -530,7 +538,7 @@ func (r *sqliteDirectoryQuotaRepository) IncrementCount(ctx context.Context, ten
 	defer handle.mu.Unlock()
 
 	now := timeToNanos(r.now())
-	if _, err := execQuotaStatement(ctx, handle,
+	if _, err := execQuotaStatement(ctx, handle.db,
 		sqliteQuotaIncrementCreateSQL,
 		sql.Named("directory_path", directoryPath),
 		sql.Named("last_updated", now),
@@ -652,7 +660,7 @@ func (r *sqliteDirectoryQuotaRepository) DecrementCount(ctx context.Context, ten
 	}
 	defer r.release(handle)
 
-	if _, err := execQuotaStatement(ctx, handle,
+	if _, err := execQuotaStatement(ctx, handle.db,
 		sqliteQuotaDecrementSQL,
 		sql.Named("last_updated", timeToNanos(r.now())),
 		sql.Named("directory_path", directoryPath)); err != nil {
@@ -1188,10 +1196,17 @@ func applyQuotaSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// quotaStatementExecutor is the write surface shared by a tenant handle's pool and
+// one of its transactions, so a multi-statement sequence reuses the same wrapper
+// inside its own transaction.
+type quotaStatementExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // execQuotaStatement runs one write statement of a tenant handle and reports how
 // many rows it changed.
-func execQuotaStatement(ctx context.Context, handle *sqliteQuotaTenantDatabase, statement string, args ...any) (int64, error) {
-	result, err := handle.db.ExecContext(ctx, statement, args...)
+func execQuotaStatement(ctx context.Context, executor quotaStatementExecutor, statement string, args ...any) (int64, error) {
+	result, err := executor.ExecContext(ctx, statement, args...)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %w", err, core.ErrDatabaseError)
 	}

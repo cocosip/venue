@@ -166,6 +166,73 @@ venue:
 	}
 }
 
+// TestLoadDoesNotBleedTheSeededDefaultVolume guards the decoder merge
+// behaviour: a decoded slice element is merged into the element already at that
+// index, so a seeded default volume would copy its unset fields into the first
+// entry only. Two volumes specified identically must load identically.
+func TestLoadDoesNotBleedTheSeededDefaultVolume(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "identical-volumes.yaml")
+	content := `
+venue:
+  metadataDirectory: ./data/metadata
+  quotaDirectory: ./data/quota
+  volumes:
+    - volumeId: vol-001
+      mountPath: ./data/storage/one
+    - volumeId: vol-002
+      mountPath: ./data/storage/two
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	cfg, err := LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("LoadFromFile() error = %v", err)
+	}
+	if len(cfg.Volumes) != 2 {
+		t.Fatalf("volumes = %d, want 2", len(cfg.Volumes))
+	}
+
+	first, second := cfg.Volumes[0], cfg.Volumes[1]
+	if first.EnableFsync != second.EnableFsync {
+		t.Errorf("EnableFsync = %v/%v; identically specified volumes must load identically", first.EnableFsync, second.EnableFsync)
+	}
+	if first.ShardingDepth != second.ShardingDepth {
+		t.Errorf("ShardingDepth = %d/%d; identically specified volumes must load identically", first.ShardingDepth, second.ShardingDepth)
+	}
+	if first.InitialDelay != second.InitialDelay {
+		t.Errorf("InitialDelay = %v/%v; identically specified volumes must load identically", first.InitialDelay, second.InitialDelay)
+	}
+	if first.CopyBufferSize != second.CopyBufferSize {
+		t.Errorf("CopyBufferSize = %d/%d; identically specified volumes must load identically", first.CopyBufferSize, second.CopyBufferSize)
+	}
+}
+
+// TestLoadKeepsTheDefaultVolumeWhenTheSourceSetsNone preserves the documented
+// "a source only has to carry the keys it wants to override" behaviour for the
+// one collection that DefaultConfig seeds.
+func TestLoadKeepsTheDefaultVolumeWhenTheSourceSetsNone(t *testing.T) {
+	source := viper.New()
+	source.SetConfigType("yaml")
+	if err := source.ReadConfig(strings.NewReader(`
+venue:
+  metadataDirectory: ./data/metadata
+  quotaDirectory: ./data/quota
+`)); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+
+	cfg, err := LoadSection(source, "venue")
+	if err != nil {
+		t.Fatalf("LoadSection() error = %v", err)
+	}
+	if len(cfg.Volumes) != 1 || cfg.Volumes[0].VolumeID != "default-volume" {
+		t.Fatalf("volumes = %+v, want the single seeded default volume", cfg.Volumes)
+	}
+}
+
 func TestLoadRejectsNilSource(t *testing.T) {
 	if _, err := Load(nil); err == nil {
 		t.Fatal("Load(nil) error = nil")

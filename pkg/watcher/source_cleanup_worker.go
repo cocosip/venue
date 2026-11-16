@@ -125,19 +125,21 @@ func (w *SourceCleanupWorker) Start(parent context.Context) {
 
 // Stop cancels the worker and waits for all in-flight actions. It is safe to
 // call without a prior Start and safe to repeat.
+//
+// The mutex is held across the join: Start adds to the same WaitGroup under it,
+// so releasing the lock first would let a concurrent Start call wg.Add while
+// wg.Wait is in flight, which is WaitGroup misuse and can let the new loop
+// outlive the Stop that was supposed to join it. The run loop never takes this
+// mutex, so holding it only delays a concurrent Start/Stop as intended.
 func (w *SourceCleanupWorker) Stop() {
 	w.mu.Lock()
-	cancel := w.cancel
+	defer w.mu.Unlock()
+
+	if w.cancel != nil {
+		w.cancel()
+	}
 	w.cancel = nil
 	w.running = false
-	// The mutex is released before the join: the run loop never takes it, so
-	// holding it across Wait would only delay the caller, but Start must not
-	// run while Wait is in flight, which the same lock serializes.
-	w.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
 	w.wg.Wait()
 }
 
@@ -195,18 +197,26 @@ func (w *SourceCleanupWorker) processPass(ctx context.Context) {
 		}
 		sem := make(chan struct{}, w.options.MaxConcurrentActions)
 		var actions sync.WaitGroup
-		for _, job := range jobs {
-			select {
-			case <-ctx.Done():
-				return
-			case sem <- struct{}{}:
-			}
+		spawn := func(job SourceCleanupJob) {
 			actions.Add(1)
-			go func(job SourceCleanupJob) {
+			go func() {
 				defer actions.Done()
 				defer func() { <-sem }()
 				w.processJob(ctx, job)
-			}(job)
+			}()
+		}
+		for _, job := range jobs {
+			select {
+			case <-ctx.Done():
+				// A cancellation is not a reason to abandon the actions already
+				// running: Stop only joins the run loop, so returning here would
+				// let them outlive the pass (and the store their caller closes).
+				actions.Wait()
+
+				return
+			case sem <- struct{}{}:
+				spawn(job)
+			}
 		}
 		actions.Wait()
 	}
@@ -337,25 +347,5 @@ func (w *SourceCleanupWorker) retryDelay(job SourceCleanupJob, attempt int) time
 	if maximum <= 0 {
 		maximum = w.options.RetryMaxDelay
 	}
-	return retryDelay(initial, maximum, attempt)
-}
-
-func retryDelay(initial, maximum time.Duration, attempt int) time.Duration {
-	if initial <= 0 {
-		return 0
-	}
-	if maximum <= 0 {
-		maximum = initial
-	}
-	delay := initial
-	for i := 1; i < attempt; i++ {
-		if delay >= maximum || delay > maximum/2 {
-			return maximum
-		}
-		delay *= 2
-	}
-	if delay > maximum {
-		return maximum
-	}
-	return delay
+	return cappedExponentialDelay(initial, maximum, attempt)
 }

@@ -33,8 +33,6 @@ Locus-Code/
 *.swo
 *~
 
-.claude/
-
 # OS
 .DS_Store
 Thumbs.db
@@ -60,4 +58,3 @@ CHANGELOG.md
 .kilo/
 docs/superpowers/
 .superpowers/
-.cache/

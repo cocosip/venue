@@ -232,8 +232,10 @@ func (s *OrphanRecoveryService) Stop() error {
 
 	s.mu.Lock()
 	if !s.running {
+		// Stop is idempotent across every background service: a deferred shutdown
+		// path calls it unconditionally, so "already stopped" is not an error.
 		s.mu.Unlock()
-		return fmt.Errorf("orphan recovery service is not running")
+		return nil
 	}
 	cancel := s.cancel
 	s.running = false
@@ -328,7 +330,7 @@ func (s *OrphanRecoveryService) RecoverNow(ctx context.Context) (*core.OrphanRec
 		}
 		volume := s.volumes[volumeID]
 		if err := s.recoverVolume(ctx, volumeID, volume, "", report); err != nil {
-			report.AddError("volume %s: %v", volumeID, err)
+			report.AddError("volume %s: %s", volumeID, errorTypeName(err))
 		}
 	}
 
@@ -384,7 +386,7 @@ func (s *OrphanRecoveryService) RecoverOrphanedFilesForTenant(ctx context.Contex
 		}
 		volume := s.volumes[volumeID]
 		if err := s.recoverVolume(ctx, volumeID, volume, tenantID, report); err != nil {
-			report.AddError("volume %s: %v", volumeID, err)
+			report.AddError("volume %s: %s", volumeID, errorTypeName(err))
 		}
 	}
 
@@ -650,7 +652,7 @@ func (s *OrphanRecoveryService) rebuildPending(
 	recovered, err := s.rebuild(ctx, volumeID, entry.fullPath, entry.relativePath, entry.tenantID, entry.fileKey, entry.info)
 	if err != nil {
 		report.FilesFailed++
-		report.AddError("recover failed for tenant %s: %v", entry.tenantID, err)
+		report.AddError("recover failed for tenant %s: %s", entry.tenantID, errorTypeName(err))
 		return nil
 	}
 	if !recovered {

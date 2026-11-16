@@ -9,6 +9,19 @@ import (
 // DateBasedPathGenerator generates paths based on the current date.
 // Format: {tenantID}/{YYYY}/{MM}/{DD}/{fileKey}{ext}
 // Example: tenant1/2024/01/22/abc123.pdf
+//
+// It is only a fallback for a volume that cannot build a path itself (see
+// StoragePoolOptions.PathGenerator); a local volume's own builder is preferred.
+//
+// Caveat: the generator is not deterministic. It reads the wall clock on every
+// call, so the same (tenantID, fileKey, extension) produces a different path
+// after a date boundary, which violates the PathGenerator contract. That
+// matters because the pool rebuilds a canonical path to correct a drifted
+// physical path (tryCorrectPhysicalPath): for a file written just before
+// midnight the rebuilt path points into the next day's directory, the correction
+// finds no bytes there, and the read reports the original failure. A deployment
+// that relies on physical-path correction must configure a deterministic
+// PathGenerator (or a volume that implements core.StorageVolumePathBuilder).
 type DateBasedPathGenerator struct{}
 
 // GeneratePath generates a date-based storage path.
@@ -21,38 +34,6 @@ func (g *DateBasedPathGenerator) GeneratePath(tenantID string, fileKey string, f
 	// Build path: tenantID/YYYY/MM/DD/fileKey.ext
 	fileName := fileKey + fileExtension
 	path := filepath.Join(tenantID, year, month, day, fileName)
-
-	return path
-}
-
-// FlatPathGenerator generates flat paths without date hierarchy.
-// Format: {tenantID}/{fileKey}{ext}
-// Example: tenant1/abc123.pdf
-type FlatPathGenerator struct{}
-
-// GeneratePath generates a flat storage path.
-func (g *FlatPathGenerator) GeneratePath(tenantID string, fileKey string, fileExtension string) string {
-	fileName := fileKey + fileExtension
-	path := filepath.Join(tenantID, fileName)
-	return path
-}
-
-// HourBasedPathGenerator generates paths based on date and hour.
-// Format: {tenantID}/{YYYY}/{MM}/{DD}/{HH}/{fileKey}{ext}
-// Example: tenant1/2024/01/22/14/abc123.pdf
-type HourBasedPathGenerator struct{}
-
-// GeneratePath generates an hour-based storage path.
-func (g *HourBasedPathGenerator) GeneratePath(tenantID string, fileKey string, fileExtension string) string {
-	now := time.Now()
-	year := itoa4(now.Year())
-	month := itoa2(int(now.Month()))
-	day := itoa2(now.Day())
-	hour := itoa2(now.Hour())
-
-	// Build path: tenantID/YYYY/MM/DD/HH/fileKey.ext
-	fileName := fileKey + fileExtension
-	path := filepath.Join(tenantID, year, month, day, hour, fileName)
 
 	return path
 }

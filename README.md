@@ -879,9 +879,10 @@ With `backupDirectory` set and a positive `backupInterval`, the runtime starts a
 backup runner with the other background services and writes one consistent
 online backup per tenant into that tenant's own directory, named
 `{backupDirectory}/{tenantId}/metadata.<yyyyMMddTHHmmssZ>.bak`; the run does not
-stop the queue or block writers. `backupRetention` (default `168h`; `0` disables
-pruning) removes backups older than the window per tenant directory on the next
-cycle, and `autoRestoreFromBackup` restores the newest readable backup of a
+stop the queue or block writers. `backupRetention` (default `168h`; `0` selects
+the default, a negative value disables pruning) removes backups older than the window
+per tenant directory on the next cycle, and `autoRestoreFromBackup` restores the
+newest readable backup of a
 tenant whose database had to be quarantined instead of leaving it empty.
 `autoRestoreFromBackup` requires `recoverCorruptedDatabase: true` and a
 non-empty `backupDirectory`, and the restored state is only as new as the newest

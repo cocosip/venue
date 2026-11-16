@@ -1,7 +1,9 @@
 package sqlite
 
 import (
+	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -184,5 +186,63 @@ func TestOptionsDSNAcceptsRelativePath(t *testing.T) {
 	}
 	if !strings.HasPrefix(dsn, "file:tenant-1/metadata.db?mode=rwc") {
 		t.Fatalf("DSN() = %q, want the relative path preserved", dsn)
+	}
+}
+
+// TestOpenKeepsAPercentEncodedPathLiteral guards the URI escaping: the driver
+// opens a file: name with SQLITE_OPEN_URI, so an unescaped "%2E%2E" segment
+// would be percent-decoded to ".." and resolve out of the directory the caller
+// named. A tenant directory containing a literal "%2E%2E" must keep its own
+// database file (tenant isolation), not reach the parent's.
+func TestOpenKeepsAPercentEncodedPathLiteral(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	tenantDir := filepath.Join(root, "%2E%2E")
+	if err := os.MkdirAll(tenantDir, 0o755); err != nil {
+		t.Fatalf("mkdir tenant directory: %v", err)
+	}
+	path := filepath.Join(tenantDir, "metadata.db")
+
+	db, err := Open(context.Background(), path, DefaultOptions())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	rows, err := db.Query("PRAGMA database_list")
+	if err != nil {
+		t.Fatalf("PRAGMA database_list error = %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var opened string
+	for rows.Next() {
+		var sequence int
+		var name, file string
+		if err := rows.Scan(&sequence, &name, &file); err != nil {
+			t.Fatalf("scan database_list: %v", err)
+		}
+		if name == "main" {
+			opened = file
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate database_list: %v", err)
+	}
+
+	wantDirectory, err := filepath.EvalSymlinks(tenantDir)
+	if err != nil {
+		t.Fatalf("resolve the tenant directory: %v", err)
+	}
+	gotDirectory, err := filepath.EvalSymlinks(filepath.Dir(opened))
+	if err != nil {
+		t.Fatalf("resolve the opened directory: %v", err)
+	}
+	if gotDirectory != wantDirectory {
+		t.Fatalf("database opened in %q, want the tenant's own directory %q", gotDirectory, wantDirectory)
+	}
+	if _, err := os.Stat(filepath.Join(root, "metadata.db")); !os.IsNotExist(err) {
+		t.Fatalf("a database file was created in the parent directory: err = %v", err)
 	}
 }

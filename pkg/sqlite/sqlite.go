@@ -192,6 +192,13 @@ func (o Options) Validate() error {
 // converted to forward slashes and a leading slash is added so that the URI
 // path stays absolute instead of being read as a drive-relative one.
 //
+// The path is percent-escaped before it enters the URI, because the driver opens
+// a file: name with SQLITE_OPEN_URI and SQLite percent-decodes the result. A
+// literal path such as {root}/%2E%2E/metadata.db would therefore resolve to
+// {root}/metadata.db, i.e. out of the directory the caller named, and "?", "#"
+// would truncate the path at the query or fragment separator. Escaping keeps
+// every byte of the caller's path literal.
+//
 // Every pragma travels in the DSN, so database/sql configures each connection
 // of the pool identically before any statement runs:
 //
@@ -219,6 +226,7 @@ func (o Options) DSN(path string) (string, error) {
 	if isWindowsDrivePath(name) {
 		name = "/" + name
 	}
+	name = uriPathEscaper.Replace(name)
 
 	var b strings.Builder
 	b.WriteString("file:")
@@ -233,6 +241,14 @@ func (o Options) DSN(path string) (string, error) {
 	b.WriteString("&_txlock=immediate")
 	return b.String(), nil
 }
+
+// uriPathEscaper escapes the bytes that would change the meaning of a file: URI.
+//
+// "%" is replaced first and becomes "%25", so the replacements are not applied
+// to the escapes this function itself introduces. "?" would start the DSN's
+// parameter list and "#" would start a fragment, so both are escaped; every
+// other byte is passed through unchanged and decoded back to itself.
+var uriPathEscaper = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
 
 // isWindowsDrivePath reports whether name starts with a drive designator such
 // as "C:/" or "C:". A file: URI without a leading slash would otherwise treat

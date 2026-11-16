@@ -80,15 +80,17 @@ venue:
     # instead of failing startup. Destructive: the quarantined copy is never
     # re-imported automatically. Lock/permission failures are never treated as corruption.
     recoverCorruptedDatabase: false
-    # Retention of quarantined copies; 0 selects the 72h default, a negative value never prunes.
+    # Retention of quarantined copies; 0 selects the 72h default, and a negative
+    # value disables pruning.
     corruptedDatabaseRetention: 72h
     # Backup root. Each tenant writes {backupDirectory}/{tenantId}/metadata.<stamp>.bak.
     # An empty value disables both periodic backups and automatic restore.
     backupDirectory: ""
-    # Backup interval.
+    # Backup interval. 0 selects the 1h default; a negative value keeps the
+    # periodic runner from starting.
     backupInterval: 1h
     # Backup retention, computed independently inside each tenant directory.
-    # A non-positive value disables pruning.
+    # 0 selects the 168h default; a negative value disables pruning.
     backupRetention: 168h
     # After a database file is quarantined, try to restore from that tenant's newest
     # readable backup.
@@ -298,8 +300,9 @@ venue:
     maximumPollingInterval: 1h
     # How often a disabled service rechecks whether it should resume
     disabledCheckInterval: 1m
-    # How many watchers one cycle scans in parallel (0 = runtime default,
-    # negative = sequential scanning)
+    # How many watchers one cycle scans in parallel (0 = runtime default 4,
+    # negative values are rejected). Sequential scanning is a runtime decision
+    # made through Venue.FileWatcherService().UpdateOptions.
     maxParallelWatcherScans: 4
 
   # The watcher service writes every source cleanup job to its own SQLite

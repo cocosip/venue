@@ -153,6 +153,11 @@ func removeQuotaDatabaseSidecars(path string) {
 // pruneQuotaCorruptedDatabaseFiles removes quarantine files of path that outlived
 // the retention.
 //
+// The quota database and both of its quarantined sidecars are pruned together:
+// removeQuotaDatabaseSidecars renames a sidecar to <db>-wal.corrupted.<stamp>, so
+// matching only the database's own "<db>.corrupted." prefix would leave every
+// sidecar behind.
+//
 // It is best-effort by design: a quarantined file is a rescue copy, and failing to
 // prune it must never stop a database from opening. A negative retention disables
 // pruning entirely; zero selects the default.
@@ -165,7 +170,7 @@ func pruneQuotaCorruptedDatabaseFiles(path string, retention time.Duration, now 
 	}
 
 	parent := filepath.Dir(path)
-	prefix := filepath.Base(path) + quotaCorruptedDatabaseSuffix
+	base := filepath.Base(path)
 	cutoff := now().Add(-retention)
 
 	entries, err := os.ReadDir(parent)
@@ -173,10 +178,10 @@ func pruneQuotaCorruptedDatabaseFiles(path string, retention time.Duration, now 
 		return
 	}
 	for _, entry := range entries {
-		// The quarantine object is a file, not a directory: only the plain
-		// database file is renamed, so the IsDir test is inverted compared with
-		// the Badger quarantine of a database directory.
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+		// The quarantine object is a file, not a directory: the database file and
+		// each of its sidecars are renamed individually, so the IsDir test is
+		// inverted compared with the Badger quarantine of a directory.
+		if entry.IsDir() || !isQuarantinedQuotaDatabaseName(base, entry.Name()) {
 			continue
 		}
 		info, err := entry.Info()
@@ -188,4 +193,19 @@ func pruneQuotaCorruptedDatabaseFiles(path string, retention time.Duration, now 
 		}
 		_ = os.Remove(filepath.Join(parent, entry.Name()))
 	}
+}
+
+// isQuarantinedQuotaDatabaseName reports whether name is a quarantine sibling of
+// the quota database file base: the database itself or one of its WAL/SHM
+// sidecars, which removeQuotaDatabaseSidecars quarantines with the same naming.
+func isQuarantinedQuotaDatabaseName(base string, name string) bool {
+	if strings.ContainsRune(name, filepath.Separator) {
+		return false
+	}
+	for _, suffix := range []string{"", quotaWalSuffix, quotaShmSuffix} {
+		if strings.HasPrefix(name, base+suffix+quotaCorruptedDatabaseSuffix) {
+			return true
+		}
+	}
+	return false
 }

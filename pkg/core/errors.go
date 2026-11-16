@@ -14,12 +14,6 @@ var ErrTenantNotFound = errors.New("tenant not found")
 // ErrTenantDisabled is returned when attempting to operate on a disabled tenant.
 var ErrTenantDisabled = errors.New("tenant is disabled")
 
-// ErrTenantSuspended is retained for source compatibility.
-//
-// Deprecated: the runtime has no suspended tenant state and never returns this
-// error. Tenant lifecycle is Enable/Disable, reported through ErrTenantDisabled.
-var ErrTenantSuspended = errors.New("tenant is suspended")
-
 // ErrTenantAlreadyExists is returned when attempting to create a tenant that already exists.
 var ErrTenantAlreadyExists = errors.New("tenant already exists")
 
@@ -39,47 +33,13 @@ var ErrInsufficientStorage = errors.New("insufficient storage space")
 // ErrStorageVolumeUnavailable is returned when a storage volume is not healthy or not mounted.
 var ErrStorageVolumeUnavailable = errors.New("storage volume unavailable")
 
-// ErrVolumeAlreadyMounted is retained for source compatibility.
-//
-// Deprecated: the runtime never mounts a volume at request time; volumes are
-// configured once at construction, so nothing returns this error.
-var ErrVolumeAlreadyMounted = errors.New("volume already mounted")
-
 // File-related errors
 
 // ErrFileNotFound is returned when a file doesn't exist.
 var ErrFileNotFound = errors.New("file not found")
 
-// ErrFileAlreadyProcessing is retained for source compatibility.
-//
-// Deprecated: the runtime never returns this error. A claim that loses the CAS
-// race is reported as ErrFileNotClaimable, and a stale lease as
-// ErrProcessingLeaseMismatch.
-var ErrFileAlreadyProcessing = errors.New("file is already being processed")
-
-// ErrNoFilesAvailable is retained for compatibility.
-//
-// Deprecated: the runtime no longer returns this error. Queue allocation
-// reports an empty queue as (nil, nil) and an empty slice respectively; use
-// ErrFileNotClaimable to detect that a specific candidate could not be claimed.
-var ErrNoFilesAvailable = errors.New("no files available for processing")
-
 // ErrWatcherNotFound is returned when a file watcher ID is unknown.
 var ErrWatcherNotFound = errors.New("file watcher not found")
-
-// ErrInvalidFileKey is retained for source compatibility.
-//
-// Deprecated: the runtime never returns this error. A malformed file key is
-// rejected as ErrInvalidArgument, because every key is system-generated and a
-// caller-supplied key is an argument error rather than a distinct condition.
-var ErrInvalidFileKey = errors.New("invalid file key")
-
-// ErrFileAlreadyExists is retained for source compatibility.
-//
-// Deprecated: the runtime generates every file key and never rejects a write as
-// a duplicate. Idempotent imports are resolved by ImportOperationRepository
-// lookup instead, which returns the owning record rather than an error.
-var ErrFileAlreadyExists = errors.New("file already exists")
 
 // ErrFileNotClaimable is returned when a candidate file cannot be claimed
 // because it is no longer Pending or is not yet available for processing.
@@ -136,13 +96,6 @@ func (e *FileProcessingLeaseMismatchError) Unwrap() error {
 
 // ErrInvalidArgument is returned when an argument is invalid.
 var ErrInvalidArgument = errors.New("invalid argument")
-
-// ErrOperationCanceled is retained for source compatibility.
-//
-// Deprecated: cancellation is reported with the context's own error, so callers
-// must use errors.Is(err, context.Canceled) or
-// errors.Is(err, context.DeadlineExceeded) rather than this sentinel.
-var ErrOperationCanceled = errors.New("operation canceled")
 
 // ErrDatabaseError is returned when a database operation fails.
 var ErrDatabaseError = errors.New("database error")

@@ -1183,7 +1183,11 @@ func (s *cleanupService) CleanupOrphanedMetadata(ctx context.Context) (*core.Cle
 		ctx = context.Background()
 	}
 
-	// Get all file metadata (we'll scan by status)
+	// Statuses whose physical payload is expected to still exist. Completed is
+	// excluded because cleanup deletes those files as a normal step, so a
+	// Completed record with no file is expected rather than orphaned; the same
+	// holds for DeadLettered, whose payload lives in the dead-letter area rather
+	// than under the volume path. This is deliberately not the quota-counted set.
 	allStatuses := []core.FileProcessingStatus{
 		core.FileStatusPending,
 		core.FileStatusProcessing,
